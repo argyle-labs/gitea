@@ -1,0 +1,67 @@
+[package]
+name = "gitea"
+version = "0.1.0"
+edition = "2024"
+description = "Gitea plugin for orca — full REST API surface + dual-substrate (lxc|docker) deploy + gitea-dump backup/restore"
+build = "build.rs"
+
+[package.metadata.orca]
+category = "infra"
+
+[lib]
+name = "gitea"
+path = "src/lib.rs"
+# `rlib` retains the in-crate `#[cfg(test)]` harness + lets the workspace use it
+# as a normal Rust lib. The plugin artifact is the `[[bin]]` below — a dynamic
+# subprocess orca's loader spawns over a Unix socket, not a dlopened cdylib.
+crate-type = ["rlib"]
+
+[[bin]]
+name = "gitea"
+path = "src/main.rs"
+
+# Gitea plugin. Typed client codegenned by progenitor from the vendored upstream
+# spec (`specs/gitea.openapi.json`, converted from Gitea's Swagger 2.0
+# `/swagger.v1.json` to OpenAPI 3.0). `build.rs` runs
+# `plugin_toolkit_build::openapi::generate_all_with_options` over the whole spec,
+# then `surface::openapi::generate` emits the `gitea.*` orca tool surface.
+#
+# Beyond its tool surface, this plugin owns dual-substrate deploy
+# (`gitea.deploy substrate=lxc|docker`) and substrate-portable backup/restore
+# (`gitea.backup`/`gitea.restore`) wrapping `gitea dump`.
+
+[dependencies]
+# The SOLE orca dependency (see proxmox for the full rationale). The committed
+# `[patch]` in `.cargo/config.toml` overrides this to the local in-tree toolkit
+# for development. Thin profile: `delegated-http` retargets the generated client
+# onto orca's `http.request` capability (no reqwest/rustls/hyper linked); `tools`
+# (orca_tool anchors) + `db` (endpoint_resource CRUD over db_op) + `containers`
+# (docker-substrate deploy) round it out.
+plugin-toolkit = { git = "https://github.com/argyle-labs/orca", branch = "main", default-features = false, features = ["tools", "db", "containers", "delegated-http"] }
+
+serde       = { version = "1", features = ["derive"] }
+serde_json  = "1"
+thiserror   = "2"
+
+schemars    = { version = "1", features = ["derive"] }
+anyhow      = "1"
+tracing     = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tokio       = { version = "1", features = ["full"] }
+
+[dev-dependencies]
+tokio    = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+[build-dependencies]
+plugin-toolkit-build = { git = "https://github.com/argyle-labs/orca", branch = "main" }
+
+# Prototype spec→orca-surface generator inputs (same as proxmox).
+syn         = { version = "2", features = ["full", "extra-traits", "parsing", "printing"] }
+quote       = "1"
+proc-macro2 = "1"
+prettyplease = "0.2"
+regex       = "1"
+anyhow      = "1"
+
+[lints.clippy]
+let_underscore_must_use = "deny"
