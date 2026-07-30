@@ -32,6 +32,12 @@ pub mod surface {
     include!(concat!(env!("OUT_DIR"), "/gitea_surface.rs"));
 }
 
+/// No-op the `[[bin]]` entrypoint calls so rustc links this lib crate — and with
+/// it, every `#[orca_tool]` inventory item in [`surface`], [`tools`], [`deploy`],
+/// and [`backup`]. Without a reference from the bin, the whole rlib (and its tool
+/// surface) is dropped at link time. See `src/main.rs`.
+pub fn link_anchor() {}
+
 use plugin_toolkit::reqwest;
 use thiserror::Error;
 
