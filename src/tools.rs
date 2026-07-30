@@ -20,9 +20,9 @@ use crate::generated;
 // gitea.{list,detail,create,update,delete} — endpoint registry CRUD.
 // ═══════════════════════════════════════════════════════════════════════════
 
-// `addresses` is a built-in column on every `#[endpoint_resource]` — an ordered
-// fallback list (`--address kind=url`, repeatable) resolved by
-// `address::resolve_reachable`. Each entry's free-form `kind` (`fqdn` / `lan` /
+// `routes` is a built-in column on every `#[endpoint_resource]` — an ordered
+// fallback list (`--route kind=url`, repeatable) resolved by
+// `route::resolve_reachable`. Each entry's free-form `kind` (`fqdn` / `lan` /
 // `tailscale`) doubles as the locality class the fewest-hop router consumes.
 #[endpoint_resource(plugin = "gitea")]
 pub struct GiteaEndpoint {
@@ -47,12 +47,12 @@ fn resolve_token(name: &str, row: &GiteaEndpoint) -> Result<String> {
 // ── client resolution ──────────────────────────────────────────────────────
 
 /// Resolve a registered endpoint into a ready [`Config`]: the first reachable
-/// base URL (`resolve_reachable` over the endpoint's `addresses` fallback list)
+/// base URL (`resolve_reachable` over the endpoint's `routes` fallback list)
 /// promoted to the Gitea API root (`.../api/v1`), plus the secure-first token.
 pub(crate) async fn resolve_config(name: &str) -> Result<Config> {
     let row = endpoint_db::require(name)?;
     let token = resolve_token(name, &row)?;
-    let reachable = address::resolve_reachable(name, &row.addresses, row.insecure).await?;
+    let reachable = route::resolve_reachable(name, &row.routes, row.insecure).await?;
     let base_url = api_root(&reachable);
     Ok(Config::new(base_url, token).insecure(row.insecure))
 }
