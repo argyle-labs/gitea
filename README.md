@@ -1,29 +1,171 @@
-# gitea — orca plugin
+<p align="center">
+  <img src="assets/icon-256.png" width="120" alt="gitea" />
+</p>
+
+# gitea
 
 First-party [orca](https://github.com/argyle-labs/orca) plugin for
-[Gitea](https://gitea.io): the **full Gitea REST API** as `gitea.*` tools, plus
-**dual-substrate deploy** (LXC or Docker) and **substrate-portable
-backup/restore** wrapping `gitea dump`.
+[Gitea](https://gitea.io), the self-hostable Git service: it exposes the **full
+Gitea REST API** as `gitea.*` tools, does **dual-substrate deploy** (LXC or
+Docker), and does **substrate-portable backup/restore** wrapping `gitea dump`.
 
-## Surface
+Gitea runs perfectly well on its own — you can stand it up by hand with Docker
+Compose or in an LXC container, and orca will happily manage an instance you
+deployed yourself. Both paths are documented below.
 
-- **`gitea.*` REST surface** — 279 tools generated at build time by
-  `plugin_toolkit_build::openapi` + `surface::openapi` from the vendored spec
-  (`specs/gitea.openapi.json`). Covers repos, orgs, users, teams, issues, PRs,
-  mirrors, actions/runners, packages, admin, etc. Reads are `role = "read"`;
-  writes (POST/PUT/PATCH/DELETE) are `data_mutation = true` + `role = "admin"`.
-- **`gitea.{list,detail,create,update,delete}`** — endpoint registry CRUD
-  (`#[endpoint_resource]`). Register an instance with its base URL + a `#[secret]`
-  API token; every `gitea.*` call takes an `--endpoint` and resolves it here.
-- **`gitea.deploy`** — `substrate = lxc | docker`. Dispatches to a
-  `GiteaSubstrate` provider: the LXC provider drives the proxmox plugin (create
-  LXC, nesting) + Gitea/Postgres; the Docker provider drives the docker/dockge
-  plugin (`gitea/gitea` + `postgres` compose). *(Provider execution wiring over
-  `plugin.invoke` is landing incrementally; the trait + dispatch + spec are the
-  stable seam.)*
-- **`gitea.backup` / `gitea.restore`** — wrap `gitea dump`; the archive is
-  **portable between substrates** (an LXC dump restores into a Docker deploy and
-  vice-versa), which also makes LXC↔Docker migration a backup+restore.
+---
+
+## Run it without orca (standalone)
+
+Gitea is a single Go binary plus a data directory. The plugin deploys it two
+ways — a `gitea/gitea` + `postgres` compose stack (docker substrate) or a
+Gitea + Postgres pair inside an LXC container (lxc substrate). You can reproduce
+either by hand.
+
+### Docker Compose
+
+The docker substrate brings up the `gitea/gitea` image against a `postgres`
+backend. A minimal equivalent:
+
+```yaml
+services:
+  gitea:
+    image: gitea/gitea:latest
+    environment:
+      - USER_UID=1000
+      - USER_GID=1000
+      - GITEA__database__DB_TYPE=postgres
+      - GITEA__database__HOST=db:5432
+      - GITEA__database__NAME=gitea
+      - GITEA__database__USER=gitea
+      - GITEA__database__PASSWD=gitea
+      - GITEA__server__ROOT_URL=https://gitea.example/
+    restart: unless-stopped
+    volumes:
+      - ./gitea/data:/data                 # repos, LFS, config, DB dumps
+      - /etc/timezone:/etc/timezone:ro
+      - /etc/localtime:/etc/localtime:ro
+    ports:
+      - "3000:3000"                        # web UI + REST API
+      - "2222:22"                          # git-over-SSH (host 2222 -> container 22)
+    depends_on:
+      - db
+
+  db:
+    image: postgres:16
+    environment:
+      - POSTGRES_USER=gitea
+      - POSTGRES_PASSWORD=gitea
+      - POSTGRES_DB=gitea
+    restart: unless-stopped
+    volumes:
+      - ./postgres:/var/lib/postgresql/data
+```
+
+```sh
+docker compose up -d
+docker compose ps
+```
+
+Gitea serves the web UI and REST API on port **3000** and git-over-SSH on
+container port **22** (mapped to host **2222** above so it never collides with
+the host's own sshd). All persistent state — repositories, LFS objects, the app
+config, and `gitea dump` archives — lives under **`/data`** in the container.
+
+### LXC
+
+The lxc substrate provisions a Proxmox LXC (with `nesting=1`, `keyctl=1`) and
+installs Gitea + Postgres inside it. By hand:
+
+```sh
+# on the Proxmox host — create an unprivileged container with nesting enabled
+pct create 200 local:vztmpl/debian-12-standard_amd64.tar.zst \
+  --hostname gitea --features nesting=1,keyctl=1 \
+  --net0 name=eth0,bridge=vmbr0,ip=dhcp --unprivileged 1
+pct start 200
+
+# inside the container — install Postgres + the Gitea binary, then run it as a service
+pct exec 200 -- apt-get install -y postgresql
+# create the gitea DB/role, drop the Gitea binary at /usr/local/bin/gitea,
+# point app.ini at postgres, and run it under systemd.
+```
+
+See the [Gitea docs](https://docs.gitea.com/installation/install-from-binary)
+for the full binary-install walkthrough. Whichever way you run it, `gitea dump`
+produces the portable archive orca's backup verbs use (below).
+
+---
+
+## With orca
+
+Register your instance, then drive it through the `gitea.*` tools. orca resolves
+each endpoint's reachable base URL and secure-first API token for you.
+
+### Endpoint registry — `gitea.{list,detail,create,update,delete}`
+
+Generated by `#[endpoint_resource]`. Register an instance with its base URL +
+a `#[secret]` API token; every `gitea.*` REST call takes an `--endpoint` and
+resolves through here.
+
+```sh
+# register an instance (token is stored as a secret)
+gitea.create --name home --route fqdn=https://gitea.example --token <api-token>
+gitea.list
+```
+
+### REST surface — `gitea.*`
+
+279 tools generated at build time by `plugin_toolkit_build::openapi` +
+`surface::openapi` from the vendored spec (`specs/gitea.openapi.json`). Covers
+repos, orgs, users, teams, issues, PRs, mirrors, actions/runners, packages,
+admin, and more. Reads are `role = "read"`; writes (POST/PUT/PATCH/DELETE) are
+`data_mutation = true` + `role = "admin"`. Every call takes `--endpoint`.
+
+### Deploy — `gitea.deploy`
+
+`substrate = lxc | docker`. Dispatches to a `GiteaSubstrate` provider: the LXC
+provider drives the proxmox plugin (create LXC with nesting) + Gitea/Postgres;
+the Docker provider drives the docker/dockge plugin (`gitea/gitea` + `postgres`
+compose).
+
+```sh
+gitea.deploy --substrate docker --host dockge@host --root-url https://gitea.example/
+gitea.deploy --substrate lxc --host pve-node --ip-cidr 10.0.0.20/24
+```
+
+*(Provider execution wiring over `plugin.invoke` is landing incrementally; the
+trait + dispatch + spec validation are the stable seam.)*
+
+### Backup / restore — `gitea.backup` / `gitea.restore`
+
+Both wrap `gitea dump`, which produces one app-consistent archive (DB + repos +
+LFS + config). Because the archive is **portable between substrates**, an LXC
+dump restores into a Docker deploy and vice-versa — so an LXC↔Docker migration
+is just a backup followed by a restore. Archives default to
+`/var/lib/gitea/backups` on the target host.
+
+```sh
+gitea.backup  --endpoint home
+gitea.restore --endpoint home --archive /var/lib/gitea/backups/gitea-dump-<ts>.tar.zst
+```
+
+---
+
+## Layout
+
+- `src/` — the plugin (pure Rust):
+  - `tools.rs` — the `gitea.{list,detail,create,update,delete}` endpoint
+    registry (`#[endpoint_resource]`) + client/token resolution.
+  - `deploy.rs` — the `Substrate` abstraction and the `gitea.deploy` verb.
+  - `backup.rs` — the `gitea.backup` / `gitea.restore` verbs wrapping `gitea dump`.
+  - `lib.rs`, `main.rs` — plugin wiring and the `serve_tool_plugin!` entrypoint.
+- `specs/` — the vendored Gitea API spec (`gitea.swagger2.json` and the
+  converted `gitea.openapi.json` the REST surface is generated from).
+- `spec-tools/prep_spec.py` — spec-normalization transforms applied on refresh.
+- `build.rs` — generates the `gitea.*` REST surface at build time.
+- `assets/` — plugin icon.
+
+---
 
 ## ABI
 
