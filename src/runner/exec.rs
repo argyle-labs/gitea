@@ -207,7 +207,15 @@ impl Executor<'_> {
                 runner_file,
             } => {
                 let mut state = state.clone();
-                if let (Some(_), Some(disk)) = (runner_file, RunnerState::read(path)) {
+                if runner_file.is_some() {
+                    // The account flags on disk are the reconciled ones; the
+                    // planned flags may overstate what exists.
+                    let disk = RunnerState::read(path).ok_or_else(|| {
+                        anyhow!(
+                            "no readable state record at {} to update after register",
+                            path.display()
+                        )
+                    })?;
                     state.created_account = disk.created_account;
                     state.added_docker_group = disk.added_docker_group;
                 }
@@ -529,6 +537,44 @@ mod tests {
         assert!(err.is_none(), "{err:?}");
         assert_eq!(after.runner_id, Some(77));
         assert!(!after.created_account && !after.added_docker_group);
+    }
+
+    #[tokio::test]
+    async fn post_registration_record_needs_the_earlier_record() {
+        let home = scratch("norecord");
+        let host = LocalHost {
+            init: Init::Launchd,
+            home: home.clone(),
+            uid: 501,
+        };
+        let exec = Executor {
+            host: &host,
+            gitea: None,
+        };
+        let runner_file = home.join(".runner");
+        std::fs::write(&runner_file, r#"{"id":77,"name":"r1","labels":[]}"#).unwrap();
+        let path = home.join(".orca/r1.json");
+        let (_, err) = exec
+            .run(&[Step::RecordState {
+                path: path.clone(),
+                state: RunnerState {
+                    scope: "instance".into(),
+                    version: "4.1.0".into(),
+                    runner_id: None,
+                    created_account: true,
+                    added_docker_group: true,
+                },
+                runner_file: Some(runner_file),
+            }])
+            .await;
+        let written = path.exists();
+        std::fs::remove_dir_all(&home).ok();
+        let err = err.expect("must refuse to fall back to the planned flags");
+        assert!(
+            format!("{err:#}").contains("no readable state record"),
+            "{err:#}"
+        );
+        assert!(!written);
     }
 
     #[tokio::test]

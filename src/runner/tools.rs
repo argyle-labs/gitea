@@ -294,7 +294,7 @@ fn join(locals: Vec<LocalInstall>, gitea: &[GiteaRunnerView]) -> Vec<RunnerView>
 }
 
 /// Runners Gitea knows, joined with the installs on this host.
-#[orca_tool(domain = "gitea", verb = "runner.list")]
+#[orca_tool(domain = "gitea", verb = "runner.list", role = "read")]
 pub async fn gitea_runner_list(args: RunnerListArgs, _ctx: &ToolCtx) -> Result<RunnerListOutput> {
     let host = LocalHost::current()?;
     let mut locals = Vec::new();
@@ -414,7 +414,7 @@ fn observe(local: &LocalInstall, snap: &GiteaSnapshot) -> (Observation, Option<G
 
 /// Classify each runner on this host: service state, Gitea liveness, task
 /// starvation, launchd priority, and host-executor capacity.
-#[orca_tool(domain = "gitea", verb = "runner.health")]
+#[orca_tool(domain = "gitea", verb = "runner.health", role = "read")]
 pub async fn gitea_runner_health(
     args: RunnerHealthArgs,
     _ctx: &ToolCtx,
@@ -1250,6 +1250,26 @@ mod tests {
                 Some("admin"),
                 "{name}"
             );
+        }
+    }
+
+    #[test]
+    fn read_verbs_have_their_roles_and_mutate_nothing() {
+        let mutations = plugin_toolkit::dispatch::data_mutation_names();
+        for (name, role) in [
+            ("gitea.runner.list", "read"),
+            ("gitea.runner.health", "read"),
+            // Instance-wide metadata (private repos, PR titles, actors),
+            // read with the endpoint's admin token.
+            ("gitea.ci.status", "admin"),
+            ("gitea.pr.list", "admin"),
+        ] {
+            assert_eq!(
+                plugin_toolkit::dispatch::required_role(name),
+                Some(role),
+                "{name}"
+            );
+            assert!(!mutations.contains(&name), "{name}");
         }
     }
 

@@ -5,9 +5,10 @@
 //! OpenAPI 3.0). The `gitea.*` tool surface in [`surface`] wraps each generated
 //! method as an `#[orca_tool]`; endpoint CRUD + client resolution live in
 //! [`tools`]; dual-substrate deploy in [`deploy`]; backup/restore in [`backup`];
-//! Actions runner management in [`runner`].
+//! Actions runner management in [`runner`]; CI and PR state in [`ci`].
 
 pub mod backup;
+pub mod ci;
 pub mod deploy;
 pub mod runner;
 pub mod tools;
@@ -36,7 +37,7 @@ pub mod surface {
 
 /// No-op the `[[bin]]` entrypoint calls so rustc links this lib crate — and with
 /// it, every `#[orca_tool]` inventory item in [`surface`], [`tools`], [`deploy`],
-/// [`backup`] and [`runner`]. Without a reference from the bin, the whole rlib
+/// [`backup`], [`runner`] and [`ci`]. Without a reference from the bin, the whole rlib
 /// (and its tool surface) is dropped at link time. See `src/main.rs`.
 pub fn link_anchor() {}
 
