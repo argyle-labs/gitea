@@ -149,6 +149,42 @@ gitea.backup  --endpoint home
 gitea.restore --endpoint home --archive /var/lib/gitea/backups/gitea-dump-<ts>.tar.zst
 ```
 
+### Actions runners — `gitea.runner.*`
+
+Installs, registers, supervises, health-checks, heals, upgrades and removes
+Gitea Actions runners. Every verb acts on **the orca host the call runs on**;
+to manage a runner elsewhere, route the call to that host (`--peer <host>`).
+Mutating verbs are dry-run by default: they return an `ExecutionPlan` listing
+every file, command and API call, and apply only with `--execute`.
+
+| verb | does |
+|---|---|
+| `gitea.runner.list` | Gitea's runner list (online, busy, labels) joined with this host's installs |
+| `gitea.runner.health` | classifies each local runner: service down, offline-while-running, starved (idle while a matching job waits), launchd throttled priority, host-executor capacity > 1 |
+| `gitea.runner.install` | download + sha256-verify the runner release, render `config.yaml`, mint a registration token, register, install the supervised service |
+| `gitea.runner.heal` | applies the health findings' remedies (restart, reload, rewrite unit/config) and reports why |
+| `gitea.runner.upgrade` | swap in a verified release binary and restart |
+| `gitea.runner.uninstall` | stop and remove the service, deregister from Gitea, delete files |
+
+Service units: launchd agents set `ProcessType=Interactive` (otherwise macOS
+schedules the runner at background priority), `KeepAlive` and `RunAtLoad`.
+systemd units use `Restart=always` with no start limit; docker-mode units wait
+for the Docker socket to answer before starting. OpenRC scripts run under
+`supervise-daemon` so a crash respawns. Host-executor runners are pinned to
+capacity 1 because all jobs share one work tree.
+
+```sh
+gitea.runner.install --endpoint home --name mint-macos --execute
+gitea.runner.health  --endpoint home
+gitea.runner.heal    --endpoint home --name mint-macos          # plan
+gitea.runner.heal    --endpoint home --name mint-macos --execute
+```
+
+The registration token, list and delete calls need an admin-scoped Gitea token
+for `scope=instance` (the default); `scope=org:<org>` needs org admin. On Linux
+the runner layout lives under `/etc` and `/var/lib`, so execution needs the
+plugin to run as root.
+
 ---
 
 ## Layout
@@ -158,6 +194,8 @@ gitea.restore --endpoint home --archive /var/lib/gitea/backups/gitea-dump-<ts>.t
     registry (`#[endpoint_resource]`) + client/token resolution.
   - `deploy.rs` — the `Substrate` abstraction and the `gitea.deploy` verb.
   - `backup.rs` — the `gitea.backup` / `gitea.restore` verbs wrapping `gitea dump`.
+  - `runner/` — `gitea.runner.*`: layout, renderers, release verification,
+    health classification, step plans, the local executor, and the verbs.
   - `lib.rs`, `main.rs` — plugin wiring and the `serve_tool_plugin!` entrypoint.
 - `specs/` — the vendored Gitea API spec (`gitea.swagger2.json` and the
   converted `gitea.openapi.json` the REST surface is generated from).
