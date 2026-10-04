@@ -292,16 +292,18 @@ const NSS_MAX_BUF: usize = 1 << 20;
 
 /// Run a reentrant `get*nam_r` lookup through NSS (so LDAP/sssd accounts
 /// count) without spawning a subprocess, growing the scratch buffer on
-/// `ERANGE`. `Ok(None)` means NSS answered "no such entry"; any other failure
-/// (an sssd/LDAP outage reporting `EIO`, the buffer cap) is an error, so a
-/// caller never mistakes an unreachable directory for a missing account.
+/// `ERANGE`. `Ok(None)` means NSS answered "no such entry" with rc 0. glibc
+/// also reports a miss as ENOENT/ESRCH/EBADF/EPERM, but it returns the same
+/// codes when a directory source (sssd, LDAP) is unreachable, so those are
+/// errors: install must not create a local shadow of a directory account.
 fn nss_lookup<T>(
+    what: &str,
     name: &str,
     initial_buf: usize,
     call: impl Fn(*const libc::c_char, &mut [libc::c_char]) -> (libc::c_int, Option<T>),
 ) -> Result<Option<T>> {
     let cname = std::ffi::CString::new(name)
-        .map_err(|_| anyhow!("account/group name {name:?} contains a NUL byte"))?;
+        .map_err(|_| anyhow!("{what} name {name:?} contains a NUL byte"))?;
     let mut buf = vec![0 as libc::c_char; initial_buf.max(1)];
     loop {
         let (rc, found) = call(cname.as_ptr(), &mut buf);
@@ -311,9 +313,10 @@ fn nss_lookup<T>(
                 let next = (buf.len() * 2).min(NSS_MAX_BUF);
                 buf.resize(next, 0);
             }
-            libc::ERANGE => bail!("NSS entry for '{name}' exceeds {NSS_MAX_BUF} bytes"),
+            libc::ERANGE => bail!("NSS entry for {what} '{name}' exceeds {NSS_MAX_BUF} bytes"),
             rc => bail!(
-                "NSS lookup of '{name}' failed: {}",
+                "{what} lookup of '{name}' failed ({}): is sssd or the directory behind \
+                 /etc/nsswitch.conf running? Refusing to treat this as a missing {what}",
                 std::io::Error::from_raw_os_error(rc)
             ),
         }
@@ -326,7 +329,7 @@ pub fn lookup_user(user: &str) -> Result<Option<(u32, u32)>> {
 }
 
 pub(crate) fn lookup_user_with_buf(user: &str, initial_buf: usize) -> Result<Option<(u32, u32)>> {
-    nss_lookup(user, initial_buf, |name, buf| {
+    nss_lookup("user", user, initial_buf, |name, buf| {
         // SAFETY: `pwd` and `buf` outlive the call; on success `result` points
         // at `pwd`, whose numeric fields are read before `buf` is reused.
         unsafe {
@@ -347,7 +350,7 @@ pub(crate) fn lookup_group_with_buf(
     group: &str,
     initial_buf: usize,
 ) -> Result<Option<(u32, Vec<String>)>> {
-    nss_lookup(group, initial_buf, |name, buf| {
+    nss_lookup("group", group, initial_buf, |name, buf| {
         // SAFETY: as in `lookup_user_with_buf`; `gr_mem` is a NULL-terminated
         // array of C strings inside `buf`, copied out before returning.
         unsafe {
@@ -368,13 +371,46 @@ pub(crate) fn lookup_group_with_buf(
     })
 }
 
-/// Whether `user` belongs to `group`, as a listed member or by primary gid.
+/// Whether `user` belongs to `group`. Uses `getgrouplist`, which asks every
+/// NSS source (including sssd/LDAP initgroups), not just `/etc/group` members.
 pub fn user_in_group(user: &str, group: &str) -> Result<bool> {
-    let Some((gid, members)) = lookup_group(group)? else {
+    let Some((gid, _)) = lookup_group(group)? else {
         return Ok(false);
     };
-    Ok(members.iter().any(|m| m == user)
-        || lookup_user(user)?.is_some_and(|(_, primary)| primary == gid))
+    let Some((_, primary)) = lookup_user(user)? else {
+        return Ok(false);
+    };
+    Ok(group_list(user, primary)?.contains(&gid))
+}
+
+/// Every gid `user` belongs to, `primary` included.
+// The gid casts are identity on Linux (`gid_t`) but not on macOS (`c_int`).
+#[allow(clippy::unnecessary_cast)]
+fn group_list(user: &str, primary: u32) -> Result<Vec<u32>> {
+    #[cfg(target_os = "macos")]
+    type Gid = libc::c_int;
+    #[cfg(not(target_os = "macos"))]
+    type Gid = libc::gid_t;
+    let cuser = std::ffi::CString::new(user)
+        .map_err(|_| anyhow!("user name {user:?} contains a NUL byte"))?;
+    let mut cap: libc::c_int = 64;
+    loop {
+        let mut groups: Vec<Gid> = vec![0; cap as usize];
+        let mut n = cap;
+        // SAFETY: `groups` holds `n` entries and outlives the call; on return
+        // `n` is the count written (or needed, when the call returns -1).
+        let rc = unsafe {
+            libc::getgrouplist(cuser.as_ptr(), primary as Gid, groups.as_mut_ptr(), &mut n)
+        };
+        if rc >= 0 {
+            groups.truncate(n.max(0) as usize);
+            return Ok(groups.into_iter().map(|g| g as u32).collect());
+        }
+        if cap >= 1 << 16 {
+            bail!("user '{user}' belongs to more than {cap} groups");
+        }
+        cap = (cap * 2).max(n);
+    }
 }
 
 /// Effective uid (second field) of `/proc/self/status`'s `Uid:` line.
@@ -571,6 +607,13 @@ mod tests {
     }
 
     #[test]
+    fn group_list_includes_the_primary_gid() {
+        let (_, primary) = lookup_user("root").unwrap().unwrap();
+        assert!(group_list("root", primary).unwrap().contains(&primary));
+        assert!(!user_in_group("root", "no-such-orca-test-group").unwrap());
+    }
+
+    #[test]
     fn nss_buffer_grows_from_one_byte() {
         assert_eq!(
             lookup_user_with_buf("root", 1).unwrap().map(|(uid, _)| uid),
@@ -591,12 +634,15 @@ mod tests {
 
     #[test]
     fn nss_errors_are_errors_not_misses() {
-        let eio = nss_lookup::<u32>("x", 8, |_, _| (libc::EIO, None));
+        let eio = nss_lookup::<u32>("user", "x", 8, |_, _| (libc::EIO, None));
         assert!(eio.is_err(), "EIO must not read as 'no such account'");
-        let capped = nss_lookup::<u32>("x", 8, |_, _| (libc::ERANGE, None));
+        let enoent = nss_lookup::<u32>("user", "x", 8, |_, _| (libc::ENOENT, None));
+        let msg = enoent.unwrap_err().to_string();
+        assert!(msg.contains("sssd") && msg.contains("user lookup"), "{msg}");
+        let capped = nss_lookup::<u32>("user", "x", 8, |_, _| (libc::ERANGE, None));
         assert!(capped.unwrap_err().to_string().contains("exceeds"));
         let calls = std::cell::Cell::new(0);
-        let grown = nss_lookup("x", 1, |_, buf| {
+        let grown = nss_lookup("user", "x", 1, |_, buf| {
             calls.set(calls.get() + 1);
             if buf.len() < 64 {
                 (libc::ERANGE, None)
@@ -606,7 +652,10 @@ mod tests {
         });
         assert_eq!(grown.unwrap(), Some(64));
         assert_eq!(calls.get(), 7);
-        assert_eq!(nss_lookup::<u32>("x", 8, |_, _| (0, None)).unwrap(), None);
+        assert_eq!(
+            nss_lookup::<u32>("user", "x", 8, |_, _| (0, None)).unwrap(),
+            None
+        );
     }
 
     #[test]
