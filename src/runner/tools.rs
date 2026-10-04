@@ -21,7 +21,7 @@ use super::health::{
     self, DEFAULT_STALL_AFTER_SECS, Finding, GiteaRunnerView, GiteaSide, HealthStatus,
     LaunchdPriority, Observation, WaitingJob, mode_from_labels,
 };
-use super::host::{LocalHost, LocalInstall, lookup_group, lookup_user};
+use super::host::{LocalHost, LocalInstall, lookup_group, lookup_user, user_in_group};
 use super::layout::{self, Init, Layout, Mode};
 use super::plan::{self, Rerender, RunnerState, Scope, Step};
 use super::release::{self, DEFAULT_VERSION, Source};
@@ -583,15 +583,16 @@ pub async fn gitea_runner_install(args: RunnerInstallArgs, ctx: &ToolCtx) -> Res
         labels: &labels,
     });
     let unit = render::render_service(&l, mode, &host.home, &path_env);
-    let create_user = match &l.user {
-        Some(u) if lookup_user(u).await.is_none() => plan::user_steps(
-            host.init,
-            u,
-            &l.data,
-            mode == Mode::Docker,
-            lookup_group(u).await.is_some(),
+    let docker = mode == Mode::Docker;
+    let (account_steps, created_account) = match &l.user {
+        Some(u) if lookup_user(u).is_none() => (
+            plan::user_steps(host.init, u, &l.data, docker, lookup_group(u).is_some()),
+            true,
         ),
-        _ => Vec::new(),
+        Some(u) if docker && !user_in_group(u, "docker") => {
+            (plan::docker_group_steps(host.init, u), false)
+        }
+        _ => (Vec::new(), false),
     };
     let summary = format!(
         "install runner '{}' {} ({} executor, capacity {}, {}) from {} registering with {instance_url} as {}",
@@ -612,7 +613,8 @@ pub async fn gitea_runner_install(args: RunnerInstallArgs, ctx: &ToolCtx) -> Res
         labels: labels.clone(),
         instance_url,
         scope,
-        create_user,
+        account_steps,
+        created_account,
     });
     let exec = Executor {
         host: &host,
@@ -711,6 +713,7 @@ pub async fn gitea_runner_uninstall(
         &scope,
         scope_known,
         args.keep_files,
+        recorded.as_ref().is_some_and(|r| r.created_account),
     );
     let mut notes = Vec::new();
     if runner_id.is_none() {
