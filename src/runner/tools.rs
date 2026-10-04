@@ -1254,17 +1254,19 @@ mod tests {
     }
 
     #[test]
-    fn read_verbs_need_only_read_and_mutate_nothing() {
+    fn read_verbs_have_their_roles_and_mutate_nothing() {
         let mutations = plugin_toolkit::dispatch::data_mutation_names();
-        for name in [
-            "gitea.runner.list",
-            "gitea.runner.health",
-            "gitea.ci.status",
-            "gitea.pr.list",
+        for (name, role) in [
+            ("gitea.runner.list", "read"),
+            ("gitea.runner.health", "read"),
+            // Instance-wide metadata (private repos, PR titles, actors),
+            // read with the endpoint's admin token.
+            ("gitea.ci.status", "admin"),
+            ("gitea.pr.list", "admin"),
         ] {
             assert_eq!(
                 plugin_toolkit::dispatch::required_role(name),
-                Some("read"),
+                Some(role),
                 "{name}"
             );
             assert!(!mutations.contains(&name), "{name}");

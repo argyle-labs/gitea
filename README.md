@@ -209,12 +209,14 @@ gitea.runner.heal    --endpoint home --name mint-macos --execute
 
 ### CI and PR state — `gitea.ci.status` / `gitea.pr.list`
 
-Read-only (role `read`), instance-wide, one call each:
+Read-only, instance-wide, one call each. Both need role `admin`: they return
+metadata from every repository the endpoint's token can see, private ones
+included.
 
 | verb | answers |
 |---|---|
 | `gitea.ci.status` | runner counts and list; queued (waiting for a runner), blocked (waiting on `needs`) and running jobs; jobs stuck past `--stall-after-secs` (default 600) or `--long-running-secs` (default 3600) with the likely cause (no runner has the labels, matching runners offline or all busy, an idle matching runner not picking it up); the newest `--limit` workflow runs |
-| `gitea.pr.list` | open PRs (all repos the token can see, or `--owner` / `--repo owner/name`) with each head commit's CI state and individual checks |
+| `gitea.pr.list` | open PRs (all repos the token can see, or `--owner` / `--repo owner/name`) with each head commit's CI state and individual checks; a PR or status that cannot be read is reported on its own entry |
 
 The instance-wide job and run lists need an admin-scoped token.
 

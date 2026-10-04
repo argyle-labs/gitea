@@ -15,6 +15,7 @@ use crate::runner::health::{DEFAULT_STALL_AFTER_SECS, GiteaRunnerView};
 /// Default for how long a job may run before it is reported as stuck.
 pub const DEFAULT_LONG_RUNNING_SECS: i64 = 3600;
 const JOB_PAGE: i64 = 50;
+const CHECKS_PAGE: i64 = 50;
 const MAX_LIMIT: u32 = 100;
 
 fn clamp_limit(limit: Option<u32>, default: u32) -> u32 {
@@ -336,6 +337,17 @@ pub struct JobPages {
     pub running: Result<(Vec<types::ActionWorkflowJob>, Option<i64>)>,
 }
 
+/// The Actions API filters behind each list. `waiting` selects jobs blocked
+/// on `needs` and `in_progress` only running ones: Gitea offers no filter for
+/// jobs being cancelled, so those are not listed.
+pub async fn fetch_job_pages(cfg: &Config) -> JobPages {
+    JobPages {
+        queued: fetch_jobs(cfg, "queued").await,
+        blocked: fetch_jobs(cfg, "waiting").await,
+        running: fetch_jobs(cfg, "in_progress").await,
+    }
+}
+
 /// Assemble the CI picture from what was fetched. A failed fetch becomes a
 /// note, never a silently empty list.
 pub fn ci_status(
@@ -402,15 +414,11 @@ pub fn ci_status(
 
 /// Instance-wide CI state: runners, queued/blocked/running jobs, jobs that
 /// look stuck and why, and the most recent workflow runs.
-#[orca_tool(domain = "gitea", verb = "ci.status", role = "read")]
+#[orca_tool(domain = "gitea", verb = "ci.status", role = "admin")]
 pub async fn gitea_ci_status(args: CiStatusArgs, _ctx: &ToolCtx) -> Result<CiStatusOutput> {
     let cfg = crate::tools::resolve_config(&args.endpoint).await?;
     let runners = runner_api::list_runners(&cfg).await;
-    let pages = JobPages {
-        queued: fetch_jobs(&cfg, "queued").await,
-        blocked: fetch_jobs(&cfg, "waiting").await,
-        running: fetch_jobs(&cfg, "in_progress").await,
-    };
+    let pages = fetch_job_pages(&cfg).await;
     let runs = fetch_runs(&cfg, clamp_limit(args.limit, 20)).await;
     Ok(ci_status(
         runners,
@@ -434,6 +442,9 @@ pub struct PrCi {
     /// `none` when nothing has reported on the head commit.
     pub state: String,
     pub checks: Vec<PrCheck>,
+    /// Set when Gitea has more checks than one page holds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -447,8 +458,8 @@ pub struct PrCheck {
     pub url: Option<String>,
 }
 
-/// The combined-status body, read loosely: Gitea answers `"state": ""` for a
-/// commit with no statuses, which the generated enum cannot parse.
+/// The combined-status body. For a commit nothing has reported on, Gitea
+/// answers `pending` with a null list, which reads as `none` here.
 #[derive(Debug, Default, Deserialize)]
 pub struct RawCombinedStatus {
     #[serde(default)]
@@ -469,7 +480,9 @@ pub struct RawCommitStatus {
     pub target_url: Option<String>,
 }
 
-pub fn pr_ci(raw: RawCombinedStatus) -> PrCi {
+/// `total` is Gitea's `X-Total-Count`: the body's own count is only the page
+/// length, and its `state` is rolled up from that page alone.
+pub fn pr_ci(raw: RawCombinedStatus, total: Option<i64>) -> PrCi {
     let checks: Vec<PrCheck> = raw
         .statuses
         .unwrap_or_default()
@@ -485,7 +498,17 @@ pub fn pr_ci(raw: RawCombinedStatus) -> PrCi {
         Some(s) if !checks.is_empty() => s,
         _ => "none".to_string(),
     };
-    PrCi { state, checks }
+    let note = total.filter(|t| *t > checks.len() as i64).map(|t| {
+        format!(
+            "showing {} of {t} checks; the state covers only these",
+            checks.len()
+        )
+    });
+    PrCi {
+        state,
+        checks,
+        note,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -507,6 +530,10 @@ pub struct PrView {
     pub ci: Option<PrCi>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ci_error: Option<String>,
+    /// Set when the PR itself could not be read; only the search fields are
+    /// filled in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 pub fn pr_view(repo: &str, pr: &types::PullRequest, now: i64) -> PrView {
@@ -524,13 +551,47 @@ pub fn pr_view(repo: &str, pr: &types::PullRequest, now: i64) -> PrView {
         url: pr.html_url.clone(),
         ci: None,
         ci_error: None,
+        error: None,
+    }
+}
+
+/// A PR found by listing or search, and its full record or why that could
+/// not be read.
+pub struct FetchedPr {
+    pub repo: String,
+    pub number: i64,
+    pub title: Option<String>,
+    pub url: Option<String>,
+    pub pr: std::result::Result<types::PullRequest, String>,
+}
+
+pub fn fetched_view(f: &FetchedPr, now: i64) -> PrView {
+    match &f.pr {
+        Ok(pr) => pr_view(&f.repo, pr, now),
+        Err(e) => PrView {
+            repo: f.repo.clone(),
+            number: f.number,
+            title: f.title.clone(),
+            author: None,
+            head_branch: None,
+            head_sha: None,
+            base_branch: None,
+            draft: false,
+            mergeable: None,
+            updated_secs_ago: None,
+            url: f.url.clone(),
+            ci: None,
+            ci_error: None,
+            error: Some(e.clone()),
+        },
     }
 }
 
 /// `(owner, repo)` of an `owner/repo` string.
 pub fn split_repo(full: &str) -> Result<(&str, &str)> {
+    let segment = |s: &str| !s.is_empty() && s != "." && s != ".." && !s.contains('/');
     match full.split_once('/') {
-        Some((o, r)) if !o.is_empty() && !r.is_empty() && !r.contains('/') => Ok((o, r)),
+        Some((o, r)) if segment(o) && segment(r) => Ok((o, r)),
         _ => bail!("repo must be 'owner/name', got {full:?}"),
     }
 }
@@ -543,7 +604,7 @@ async fn fetch_open_prs(
     repo: Option<&str>,
     owner: Option<&str>,
     limit: u32,
-) -> Result<Vec<(String, types::PullRequest)>> {
+) -> Result<Vec<FetchedPr>> {
     let client = runner_api::verified_generated_client(cfg)?;
     if let Some(full) = repo {
         let (o, r) = split_repo(full)?;
@@ -566,7 +627,16 @@ async fn fetch_open_prs(
                 None => anyhow!("list PRs in {full}: {e}"),
             })?
             .into_inner();
-        return Ok(prs.into_iter().map(|p| (full.to_string(), p)).collect());
+        return Ok(prs
+            .into_iter()
+            .map(|p| FetchedPr {
+                repo: full.to_string(),
+                number: p.number.unwrap_or_default(),
+                title: p.title.clone(),
+                url: p.html_url.clone(),
+                pr: Ok(p),
+            })
+            .collect());
     }
     let issues = client
         .issue_search_issues(
@@ -602,21 +672,34 @@ async fn fetch_open_prs(
         ) else {
             continue;
         };
-        let (o, r) = split_repo(&full)?;
-        let pr = client
-            .repo_get_pull_request(o, r, number)
-            .await
-            .map_err(|e| anyhow!("read PR {full}#{number}: {e}"))?
-            .into_inner();
-        out.push((full, pr));
+        let pr = match split_repo(&full) {
+            Ok((o, r)) => client
+                .repo_get_pull_request(o, r, number)
+                .await
+                .map(|p| p.into_inner())
+                .map_err(|e| format!("read PR {full}#{number}: {e}")),
+            Err(e) => Err(format!("{e:#}")),
+        };
+        out.push(FetchedPr {
+            repo: full,
+            number,
+            title: issue.title.clone(),
+            url: issue.html_url.clone(),
+            pr,
+        });
     }
     Ok(out)
 }
 
-async fn fetch_combined_status(cfg: &Config, repo: &str, sha: &str) -> Result<RawCombinedStatus> {
+/// The head commit's statuses (one page) and Gitea's total count.
+async fn fetch_combined_status(
+    cfg: &Config,
+    repo: &str,
+    sha: &str,
+) -> Result<(RawCombinedStatus, Option<i64>)> {
     let (o, r) = split_repo(repo)?;
     let url = format!(
-        "{}/repos/{}/{}/commits/{}/status",
+        "{}/repos/{}/{}/commits/{}/status?limit={CHECKS_PAGE}&page=1",
         cfg.base_url.trim_end_matches('/'),
         crate::runner::plan::encode_segment(o),
         crate::runner::plan::encode_segment(r),
@@ -628,6 +711,11 @@ async fn fetch_combined_status(cfg: &Config, repo: &str, sha: &str) -> Result<Ra
         .await
         .map_err(|e| anyhow!("read CI status of {repo}@{sha}: {e}"))?;
     let status = resp.status().as_u16();
+    let total = resp
+        .headers()
+        .get("x-total-count")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<i64>().ok());
     let body = resp
         .text()
         .await
@@ -639,7 +727,33 @@ async fn fetch_combined_status(cfg: &Config, repo: &str, sha: &str) -> Result<Ra
             &body,
         ));
     }
-    Ok(plugin_toolkit::serde_json::from_str(&body)?)
+    Ok((plugin_toolkit::serde_json::from_str(&body)?, total))
+}
+
+/// Open PRs as views, each with its head commit's CI state. A PR or status
+/// that cannot be read is reported on its own entry.
+pub async fn list_open_prs(
+    cfg: &Config,
+    repo: Option<&str>,
+    owner: Option<&str>,
+    limit: u32,
+    now: i64,
+) -> Result<Vec<PrView>> {
+    let mut prs = Vec::new();
+    for f in fetch_open_prs(cfg, repo, owner, limit).await? {
+        let mut view = fetched_view(&f, now);
+        if view.error.is_none() {
+            match view.head_sha.as_deref() {
+                Some(sha) => match fetch_combined_status(cfg, &f.repo, sha).await {
+                    Ok((raw, total)) => view.ci = Some(pr_ci(raw, total)),
+                    Err(e) => view.ci_error = Some(format!("{e:#}")),
+                },
+                None => view.ci_error = Some("PR has no head commit".to_string()),
+            }
+        }
+        prs.push(view);
+    }
+    Ok(prs)
 }
 
 #[derive(clap::Args, Serialize, Deserialize, JsonSchema)]
@@ -693,32 +807,20 @@ pub struct PrListOutput {
 }
 
 /// Open pull requests with the CI state of each head commit.
-#[orca_tool(domain = "gitea", verb = "pr.list", role = "read")]
+#[orca_tool(domain = "gitea", verb = "pr.list", role = "admin")]
 pub async fn gitea_pr_list(args: PrListArgs, _ctx: &ToolCtx) -> Result<PrListOutput> {
     if args.repo.is_some() && args.owner.is_some() {
         bail!("give --repo or --owner, not both");
     }
     let cfg = crate::tools::resolve_config(&args.endpoint).await?;
-    let now = Timestamp::now().unix_seconds();
-    let fetched = fetch_open_prs(
+    let prs = list_open_prs(
         &cfg,
         args.repo.as_deref(),
         args.owner.as_deref(),
         clamp_limit(args.limit, 30),
+        Timestamp::now().unix_seconds(),
     )
     .await?;
-    let mut prs = Vec::new();
-    for (repo, pr) in &fetched {
-        let mut view = pr_view(repo, pr, now);
-        match view.head_sha.as_deref() {
-            Some(sha) => match fetch_combined_status(&cfg, repo, sha).await {
-                Ok(raw) => view.ci = Some(pr_ci(raw)),
-                Err(e) => view.ci_error = Some(format!("{e:#}")),
-            },
-            None => view.ci_error = Some("PR has no head commit".to_string()),
-        }
-        prs.push(view);
-    }
     Ok(PrListOutput {
         counts: pr_ci_counts(&prs),
         prs,
@@ -907,12 +1009,13 @@ mod tests {
     fn pr_ci_reads_an_empty_state_as_none() {
         let empty: RawCombinedStatus =
             plugin_toolkit::serde_json::from_str(r#"{"state":"","statuses":null}"#).unwrap();
-        assert_eq!(pr_ci(empty).state, "none");
+        assert_eq!(pr_ci(empty, Some(0)).state, "none");
         let raw: RawCombinedStatus = plugin_toolkit::serde_json::from_str(
             r#"{"state":"failure","statuses":[{"context":"CI / test (pull_request)","status":"failure","description":"","target_url":"https://git.test/o/r/actions/runs/2"}]}"#,
         )
         .unwrap();
-        let ci = pr_ci(raw);
+        let ci = pr_ci(raw, Some(1));
+        assert_eq!(ci.note, None);
         assert_eq!(ci.state, "failure");
         assert_eq!(ci.checks[0].context, "CI / test (pull_request)");
         assert_eq!(ci.checks[0].description, None);
@@ -935,8 +1038,10 @@ mod tests {
             ci: state.map(|s| PrCi {
                 state: s.into(),
                 checks: vec![],
+                note: None,
             }),
             ci_error: None,
+            error: None,
         };
         let c = pr_ci_counts(&[
             pr(Some("success")),
@@ -961,40 +1066,151 @@ mod tests {
     #[test]
     fn repo_argument_must_be_owner_slash_name() {
         assert_eq!(split_repo("o/r").unwrap(), ("o", "r"));
-        for bad in ["o", "o/", "/r", "o/r/x"] {
+        for bad in [
+            "o", "o/", "/r", "o/r/x", "./r", "../r", "o/.", "o/..", "../..",
+        ] {
             assert!(split_repo(bad).is_err(), "{bad}");
         }
     }
 
-    #[test]
-    fn status_and_pr_calls_hit_the_right_paths() {
-        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
-        let cap = captured.clone();
-        let body = br#"{"state":"success","statuses":[{"context":"ci","status":"success"}]}"#;
-        let reply = plugin_toolkit::serde_json::json!({"status": 200, "headers": [], "body": body.to_vec()}).to_string();
+    /// Run `f` with HTTP answered by `route(url) -> (status, headers, body)`,
+    /// returning the request URLs in order.
+    fn with_http(
+        route: impl Fn(&str) -> (u16, Vec<(&'static str, &'static str)>, String) + Send + 'static,
+        f: impl std::future::Future<Output = ()>,
+    ) -> Vec<String> {
+        let urls = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen = urls.clone();
         plugin_toolkit::capsink::with_cap_sink(
             Box::new(move |_c: &str, json: &str| {
-                cap.lock().unwrap().push(json.to_string());
-                Ok(reply.clone())
+                let req: plugin_toolkit::serde_json::Value =
+                    plugin_toolkit::serde_json::from_str(json).unwrap();
+                let url = req["url"].as_str().unwrap_or_default().to_string();
+                assert!(req["insecure"] == false, "{json}");
+                let (status, headers, body) = route(&url);
+                seen.lock().unwrap().push(url);
+                Ok(plugin_toolkit::serde_json::json!({
+                    "status": status,
+                    "headers": headers,
+                    "body": body.into_bytes(),
+                })
+                .to_string())
             }),
             || {
-                let rt = tokio::runtime::Builder::new_current_thread()
+                tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
-                    .unwrap();
-                rt.block_on(async {
-                    let cfg = Config::new("https://git.test/api/v1", "k").insecure(true);
-                    let raw = fetch_combined_status(&cfg, "o/r x", "abc").await.unwrap();
-                    assert_eq!(pr_ci(raw).state, "success");
-                });
+                    .unwrap()
+                    .block_on(f)
             },
         );
-        let reqs = captured.lock().unwrap();
-        assert!(
-            reqs[0].contains("/repos/o/r%20x/commits/abc/status"),
-            "{}",
-            reqs[0]
+        urls.lock().unwrap().clone()
+    }
+
+    fn cfg() -> Config {
+        Config::new("https://git.test/api/v1", "k").insecure(true)
+    }
+
+    #[test]
+    fn combined_status_is_paged_and_flags_truncation() {
+        let urls = with_http(
+            |_| {
+                (
+                    200,
+                    vec![("X-Total-Count", "60")],
+                    r#"{"state":"success","statuses":[{"context":"ci","status":"success"}]}"#
+                        .into(),
+                )
+            },
+            async {
+                let (raw, total) = fetch_combined_status(&cfg(), "o/r x", "abc").await.unwrap();
+                assert_eq!(total, Some(60));
+                let ci = pr_ci(raw, total);
+                assert_eq!(ci.state, "success");
+                assert!(ci.note.unwrap().contains("1 of 60"));
+            },
         );
-        assert!(reqs[0].contains("\"insecure\":false"), "{}", reqs[0]);
+        assert!(
+            urls[0].ends_with("/repos/o/r%20x/commits/abc/status?limit=50&page=1"),
+            "{}",
+            urls[0]
+        );
+    }
+
+    #[test]
+    fn job_lists_use_the_matching_gitea_filters() {
+        let urls = with_http(
+            |_| (200, vec![], r#"{"jobs":[],"total_count":0}"#.into()),
+            async {
+                let pages = fetch_job_pages(&cfg()).await;
+                assert!(pages.queued.is_ok() && pages.blocked.is_ok() && pages.running.is_ok());
+            },
+        );
+        let status = |u: &str| {
+            u.split(['?', '&'])
+                .find_map(|kv| kv.strip_prefix("status="))
+                .unwrap_or_default()
+                .to_string()
+        };
+        assert_eq!(
+            urls.iter().map(|u| status(u)).collect::<Vec<_>>(),
+            vec!["queued", "waiting", "in_progress"],
+            "{urls:?}"
+        );
+    }
+
+    #[test]
+    fn pr_list_searches_then_reads_each_pr_and_keeps_going_past_a_bad_one() {
+        let urls = with_http(
+            |url| {
+                if url.contains("/repos/issues/search") {
+                    (
+                        200,
+                        vec![],
+                        r#"[{"number":5,"title":"good","html_url":"https://git.test/o/r/pulls/5","repository":{"full_name":"o/r"}},
+                            {"number":6,"title":"gone","html_url":"https://git.test/o/r/pulls/6","repository":{"full_name":"o/r"}}]"#
+                            .into(),
+                    )
+                } else if url.ends_with("/repos/o/r/pulls/5") {
+                    (
+                        200,
+                        vec![],
+                        r#"{"number":5,"title":"good","head":{"ref":"feat","sha":"aaa"},"base":{"ref":"main"}}"#.into(),
+                    )
+                } else if url.ends_with("/repos/o/r/pulls/6") {
+                    (404, vec![], r#"{"message":"not found"}"#.into())
+                } else if url.contains("/commits/aaa/status") {
+                    (
+                        200,
+                        vec![("X-Total-Count", "1")],
+                        r#"{"state":"failure","statuses":[{"context":"ci","status":"failure"}]}"#
+                            .into(),
+                    )
+                } else {
+                    panic!("unexpected request {url}")
+                }
+            },
+            async {
+                let prs = list_open_prs(&cfg(), None, Some("o"), 30, 0).await.unwrap();
+                assert_eq!(prs.len(), 2);
+                assert_eq!(prs[0].head_branch.as_deref(), Some("feat"));
+                assert_eq!(prs[0].ci.as_ref().unwrap().state, "failure");
+                assert_eq!(prs[0].error, None);
+                assert_eq!(prs[1].number, 6);
+                assert_eq!(prs[1].title.as_deref(), Some("gone"));
+                assert!(prs[1].error.as_deref().unwrap().contains("o/r#6"));
+                assert!(prs[1].ci.is_none() && prs[1].ci_error.is_none());
+                assert_eq!(pr_ci_counts(&prs).failing, 1);
+                assert_eq!(pr_ci_counts(&prs).unknown, 1);
+            },
+        );
+        assert!(urls[0].contains("/repos/issues/search"), "{}", urls[0]);
+        assert!(
+            urls[0].contains("type=pulls") && urls[0].contains("state=open"),
+            "{}",
+            urls[0]
+        );
+        assert!(urls[0].contains("owner=o"), "{}", urls[0]);
+        assert_eq!(urls.len(), 4, "{urls:?}");
     }
 }
