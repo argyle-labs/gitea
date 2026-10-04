@@ -172,8 +172,10 @@ schedules the runner at background priority), `KeepAlive` and `RunAtLoad`.
 On Linux each runner runs as its own unprivileged account,
 `gitea-runner-<name>` (created by the plan if missing; docker mode adds it to
 the `docker` group so the runner process can start containers; uninstall
-removes the account only if the plugin created it, and `--keep-files` keeps
-it). Linux runner names must be lowercase. The account
+removes the account only if the plugin created it, revokes a `docker` grant
+it gave an existing account, and `--keep-files` keeps the account). State
+files written before these fields existed record neither, so uninstall leaves
+those accounts and grants untouched. Linux runner names must be lowercase. The account
 owns only the install's `data/` (registration, log, cache, job work); the
 binary, `config.yaml` and the unit stay root-owned, and the plugin's state
 record lives outside the install in `/var/lib/gitea-runner/.orca/`. Job

@@ -584,17 +584,18 @@ pub async fn gitea_runner_install(args: RunnerInstallArgs, ctx: &ToolCtx) -> Res
     });
     let unit = render::render_service(&l, mode, &host.home, &path_env);
     let docker = mode == Mode::Docker;
-    let (account_steps, created_account) = match &l.user {
-        Some(u) if lookup_user(u).is_none() => (
-            plan::user_steps(host.init, u, &l.data, docker, lookup_group(u).is_some()),
-            true,
-        ),
-        Some(u) if docker && !user_in_group(u, "docker") => {
-            (plan::docker_group_steps(host.init, u), false)
-        }
-        _ => (Vec::new(), false),
+    // A failed lookup (directory outage) aborts here rather than reading as
+    // "no such account" and creating a local shadow of a directory account.
+    let facts = match &l.user {
+        Some(u) => plan::AccountFacts {
+            user_exists: lookup_user(u)?.is_some(),
+            group_exists: lookup_group(u)?.is_some(),
+            in_docker_group: docker && user_in_group(u, "docker")?,
+        },
+        None => plan::AccountFacts::default(),
     };
-    let summary = format!(
+    let account = plan::account_plan(host.init, l.user.as_deref(), &l.data, docker, facts);
+    let mut summary = format!(
         "install runner '{}' {} ({} executor, capacity {}, {}) from {} registering with {instance_url} as {}",
         args.name,
         artifact.version,
@@ -604,6 +605,14 @@ pub async fn gitea_runner_install(args: RunnerInstallArgs, ctx: &ToolCtx) -> Res
         artifact.host,
         scope.label()
     );
+    if let Some(line) = l
+        .user
+        .as_deref()
+        .and_then(|u| plan::account_summary(&account, u))
+    {
+        summary.push_str("; ");
+        summary.push_str(&line);
+    }
     let steps = plan::install_steps(&plan::InstallSpec {
         layout: &l,
         uid: host.uid,
@@ -613,8 +622,7 @@ pub async fn gitea_runner_install(args: RunnerInstallArgs, ctx: &ToolCtx) -> Res
         labels: labels.clone(),
         instance_url,
         scope,
-        account_steps,
-        created_account,
+        account,
     });
     let exec = Executor {
         host: &host,
@@ -713,7 +721,7 @@ pub async fn gitea_runner_uninstall(
         &scope,
         scope_known,
         args.keep_files,
-        recorded.as_ref().is_some_and(|r| r.created_account),
+        plan::AccountRecord::from_state(recorded.as_ref()),
     );
     let mut notes = Vec::new();
     if runner_id.is_none() {
