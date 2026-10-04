@@ -105,7 +105,13 @@ pub fn managed_root(init: Init, home: &Path) -> PathBuf {
 
 /// The service account for runner `name` on Linux.
 pub fn account_for(name: &str) -> Result<String> {
-    let account = format!("{RUNNER_USER_PREFIX}{name}").to_ascii_lowercase();
+    if name.chars().any(|c| c.is_ascii_uppercase()) {
+        bail!(
+            "runner name '{name}' has uppercase letters; Linux account names are lowercase, and \
+             'A' and 'a' would otherwise share one account"
+        );
+    }
+    let account = format!("{RUNNER_USER_PREFIX}{name}");
     if account.len() > MAX_ACCOUNT_LEN || account.contains('.') {
         bail!(
             "runner name '{name}' gives account '{account}'; Linux accounts need at most {MAX_ACCOUNT_LEN} \
@@ -164,8 +170,7 @@ impl Layout {
             service,
             unit_path,
             managed: true,
-            user: (init != Init::Launchd)
-                .then(|| format!("{RUNNER_USER_PREFIX}{name}").to_ascii_lowercase()),
+            user: (init != Init::Launchd).then(|| format!("{RUNNER_USER_PREFIX}{name}")),
         }
     }
 
@@ -294,6 +299,7 @@ mod tests {
         assert_eq!(account_for("baldur").unwrap(), "gitea-runner-baldur");
         assert!(account_for("a-name-that-is-far-too-long").is_err());
         assert!(account_for("v1.2").is_err());
+        assert!(account_for("Baldur").is_err());
     }
 
     #[test]

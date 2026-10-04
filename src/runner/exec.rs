@@ -188,13 +188,11 @@ impl Executor<'_> {
                 group,
                 recursive,
             } => {
-                let gid = host::lookup_group(group)
-                    .await
+                let (gid, _) = host::lookup_group(group)
                     .ok_or_else(|| anyhow!("group '{group}' does not exist"))?;
                 let uid = match user {
                     Some(u) => Some(
                         host::lookup_user(u)
-                            .await
                             .ok_or_else(|| anyhow!("user '{u}' does not exist"))?
                             .0,
                     ),

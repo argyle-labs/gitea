@@ -287,58 +287,69 @@ fn effective_uid(home: &Path) -> Result<u32> {
         .uid())
 }
 
-/// `(uid, gid)` of `user` from passwd-format text.
-pub fn passwd_ids(passwd: &str, user: &str) -> Option<(u32, u32)> {
-    passwd.lines().find_map(|line| {
-        let mut f = line.split(':');
-        if f.next()? != user {
-            return None;
+/// Run a reentrant `get*nam_r` lookup, growing the scratch buffer on
+/// `ERANGE`. These go through NSS (so LDAP/sssd accounts count) in-process:
+/// no `getent` subprocess, which a forked child must never spawn.
+fn nss_lookup<T>(
+    name: &str,
+    call: impl Fn(*const libc::c_char, &mut [libc::c_char]) -> (libc::c_int, Option<T>),
+) -> Option<T> {
+    let name = std::ffi::CString::new(name).ok()?;
+    let mut buf = vec![0 as libc::c_char; 1024];
+    loop {
+        let (rc, found) = call(name.as_ptr(), &mut buf);
+        if rc == libc::ERANGE && buf.len() < (1 << 20) {
+            buf.resize(buf.len() * 2, 0);
+            continue;
         }
-        let _password = f.next()?;
-        Some((f.next()?.parse().ok()?, f.next()?.parse().ok()?))
-    })
-}
-
-/// gid of `group` from group-format text (`name:pw:gid:members`).
-pub fn group_id(group_db: &str, group: &str) -> Option<u32> {
-    group_db.lines().find_map(|line| {
-        let mut f = line.split(':');
-        if f.next()? != group {
-            return None;
-        }
-        let _password = f.next()?;
-        f.next()?.parse().ok()
-    })
-}
-
-/// One `getent <db> <key>` lookup through NSS, so LDAP/sssd accounts count.
-/// `Err` only when `getent` itself is unavailable; a miss is `Ok(None)`.
-async fn getent(db: &str, key: &str) -> std::result::Result<Option<String>, ()> {
-    let out = Command::new("getent")
-        .args([db, key])
-        .output()
-        .await
-        .map_err(|_| ())?;
-    Ok(out
-        .status
-        .success
-        .then(|| String::from_utf8_lossy(&out.stdout).into_owned()))
-}
-
-/// `(uid, gid)` of an account, via NSS; `/etc/passwd` only without `getent`.
-pub async fn lookup_user(user: &str) -> Option<(u32, u32)> {
-    match getent("passwd", user).await {
-        Ok(line) => passwd_ids(&line?, user),
-        Err(()) => passwd_ids(&std::fs::read_to_string("/etc/passwd").ok()?, user),
+        return if rc == 0 { found } else { None };
     }
 }
 
-/// gid of a group, via NSS; `/etc/group` only without `getent`.
-pub async fn lookup_group(group: &str) -> Option<u32> {
-    match getent("group", group).await {
-        Ok(line) => group_id(&line?, group),
-        Err(()) => group_id(&std::fs::read_to_string("/etc/group").ok()?, group),
-    }
+/// `(uid, gid)` of an account.
+pub fn lookup_user(user: &str) -> Option<(u32, u32)> {
+    nss_lookup(user, |name, buf| {
+        // SAFETY: `pwd` and `buf` outlive the call; on success `result` points
+        // at `pwd`, whose numeric fields are read before `buf` is reused.
+        unsafe {
+            let mut pwd: libc::passwd = std::mem::zeroed();
+            let mut result: *mut libc::passwd = std::ptr::null_mut();
+            let rc = libc::getpwnam_r(name, &mut pwd, buf.as_mut_ptr(), buf.len(), &mut result);
+            (rc, (!result.is_null()).then_some((pwd.pw_uid, pwd.pw_gid)))
+        }
+    })
+}
+
+/// `(gid, member names)` of a group.
+pub fn lookup_group(group: &str) -> Option<(u32, Vec<String>)> {
+    nss_lookup(group, |name, buf| {
+        // SAFETY: as in `lookup_user`; `gr_mem` is a NULL-terminated array of
+        // C strings inside `buf`, copied out before returning.
+        unsafe {
+            let mut grp: libc::group = std::mem::zeroed();
+            let mut result: *mut libc::group = std::ptr::null_mut();
+            let rc = libc::getgrnam_r(name, &mut grp, buf.as_mut_ptr(), buf.len(), &mut result);
+            if result.is_null() {
+                return (rc, None);
+            }
+            let mut members = Vec::new();
+            let mut p = grp.gr_mem;
+            while !p.is_null() && !(*p).is_null() {
+                members.push(std::ffi::CStr::from_ptr(*p).to_string_lossy().into_owned());
+                p = p.add(1);
+            }
+            (rc, Some((grp.gr_gid, members)))
+        }
+    })
+}
+
+/// Whether `user` belongs to `group`, as a listed member or by primary gid.
+pub fn user_in_group(user: &str, group: &str) -> bool {
+    let Some((gid, members)) = lookup_group(group) else {
+        return false;
+    };
+    members.iter().any(|m| m == user)
+        || lookup_user(user).is_some_and(|(_, primary)| primary == gid)
 }
 
 /// Effective uid (second field) of `/proc/self/status`'s `Uid:` line.
@@ -516,17 +527,19 @@ mod tests {
     }
 
     #[test]
-    fn group_lookup() {
-        let gr = "wheel:x:10:root\ngitea-runner-r1:x:103:\n";
-        assert_eq!(group_id(gr, "gitea-runner-r1"), Some(103));
-        assert_eq!(group_id(gr, "docker"), None);
-    }
-
-    #[test]
-    fn passwd_lookup() {
-        let pw = "root:x:0:0:root:/root:/bin/sh\ngitea-runner:x:101:102::/var/lib/gitea-runner:/sbin/nologin\n";
-        assert_eq!(passwd_ids(pw, "gitea-runner"), Some((101, 102)));
-        assert_eq!(passwd_ids(pw, "gitea"), None);
+    fn nss_lookups_resolve_root_and_miss_cleanly() {
+        assert_eq!(lookup_user("root").map(|(uid, _)| uid), Some(0));
+        let root_group = if cfg!(target_os = "macos") {
+            "wheel"
+        } else {
+            "root"
+        };
+        assert_eq!(lookup_group(root_group).map(|(gid, _)| gid), Some(0));
+        assert!(user_in_group("root", root_group));
+        assert_eq!(lookup_user("no-such-orca-test-user"), None);
+        assert_eq!(lookup_group("no-such-orca-test-group"), None);
+        assert!(!user_in_group("no-such-orca-test-user", root_group));
+        assert_eq!(lookup_user("bad\0name"), None);
     }
 
     #[test]
