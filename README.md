@@ -207,6 +207,22 @@ gitea.runner.health  --endpoint home
 gitea.runner.heal    --endpoint home --name mint-macos --execute
 ```
 
+### CI and PR state — `gitea.ci.status` / `gitea.pr.list`
+
+Read-only (role `read`), instance-wide, one call each:
+
+| verb | answers |
+|---|---|
+| `gitea.ci.status` | runner counts and list; queued (waiting for a runner), blocked (waiting on `needs`) and running jobs; jobs stuck past `--stall-after-secs` (default 600) or `--long-running-secs` (default 3600) with the likely cause (no runner has the labels, matching runners offline or all busy, an idle matching runner not picking it up); the newest `--limit` workflow runs |
+| `gitea.pr.list` | open PRs (all repos the token can see, or `--owner` / `--repo owner/name`) with each head commit's CI state and individual checks |
+
+The instance-wide job and run lists need an admin-scoped token.
+
+```sh
+gitea.ci.status --endpoint home
+gitea.pr.list   --endpoint home --owner argyle-labs
+```
+
 ---
 
 ## Layout
@@ -218,6 +234,8 @@ gitea.runner.heal    --endpoint home --name mint-macos --execute
   - `backup.rs` — the `gitea.backup` / `gitea.restore` verbs wrapping `gitea dump`.
   - `runner/` — `gitea.runner.*`: layout, renderers, release verification,
     health classification, step plans, the local executor, and the verbs.
+  - `ci.rs` — `gitea.ci.status` / `gitea.pr.list`: CI jobs, runs, stuck-job
+    causes and open PRs with their CI state.
   - `lib.rs`, `main.rs` — plugin wiring and the `serve_tool_plugin!` entrypoint.
 - `specs/` — the vendored Gitea API spec (`gitea.swagger2.json` and the
   converted `gitea.openapi.json` the REST surface is generated from).

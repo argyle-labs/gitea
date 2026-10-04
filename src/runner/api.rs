@@ -10,7 +10,7 @@ use crate::Config;
 
 /// Turn a Gitea HTTP status into an actionable message. 401/403 almost always
 /// mean the endpoint token lacks the admin scope runner administration needs.
-fn status_error(what: &str, status: u16, body: &str) -> anyhow::Error {
+pub(crate) fn status_error(what: &str, status: u16, body: &str) -> anyhow::Error {
     let hint = match status {
         401 | 403 => " — the endpoint token needs admin scope (write:admin) to manage runners",
         404 => " — not found",
@@ -50,15 +50,16 @@ pub async fn list_runners(cfg: &Config) -> Result<Vec<GiteaRunnerView>> {
 }
 
 /// Jobs Gitea is holding for a runner, newest first, with how long each has
-/// waited.
+/// waited. The API's `queued` filter is the runner queue; its `waiting` filter
+/// is jobs blocked on `needs`, which no runner can take yet.
 pub async fn waiting_jobs(cfg: &Config) -> Result<Vec<WaitingJob>> {
     let client = verified_generated_client(cfg)?;
     let resp = client
-        .list_admin_workflow_jobs(Some(50), None, None, None, Some("waiting"))
+        .list_admin_workflow_jobs(Some(50), None, None, None, Some("queued"))
         .await
         .map_err(|e| match e.status() {
-            Some(s) => status_error("list waiting jobs", s.as_u16(), ""),
-            None => anyhow!("list waiting jobs: {e}"),
+            Some(s) => status_error("list queued jobs", s.as_u16(), ""),
+            None => anyhow!("list queued jobs: {e}"),
         })?;
     let now = Timestamp::now().unix_seconds();
     Ok(resp
@@ -83,11 +84,11 @@ fn api_url(cfg: &Config, path: &str) -> String {
 /// Every runner-administration call carries an admin token, so it always
 /// verifies TLS, whatever the endpoint's `insecure` flag says for ordinary
 /// API use.
-fn verified_client(cfg: &Config) -> Result<plugin_toolkit::reqwest::Client> {
+pub(crate) fn verified_client(cfg: &Config) -> Result<plugin_toolkit::reqwest::Client> {
     Ok(cfg.clone().insecure(false).build_reqwest_client()?)
 }
 
-fn verified_generated_client(cfg: &Config) -> Result<crate::generated::Client> {
+pub(crate) fn verified_generated_client(cfg: &Config) -> Result<crate::generated::Client> {
     Ok(cfg.clone().insecure(false).build_generated_client()?)
 }
 
@@ -193,6 +194,31 @@ mod tests {
             "{}",
             reqs[0]
         );
+    }
+
+    #[test]
+    fn starvation_reads_the_runner_queue_not_blocked_jobs() {
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let cap = captured.clone();
+        let reply = plugin_toolkit::serde_json::json!({"status": 200, "headers": [], "body": b"{\"jobs\":[],\"total_count\":0}".to_vec()}).to_string();
+        plugin_toolkit::capsink::with_cap_sink(
+            Box::new(move |_c: &str, json: &str| {
+                cap.lock().unwrap().push(json.to_string());
+                Ok(reply.clone())
+            }),
+            || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                rt.block_on(async {
+                    let cfg = Config::new("https://gitea.test/api/v1", "k");
+                    assert!(waiting_jobs(&cfg).await.unwrap().is_empty());
+                });
+            },
+        );
+        let reqs = captured.lock().unwrap();
+        assert!(reqs[0].contains("status=queued"), "{}", reqs[0]);
     }
 
     #[test]
