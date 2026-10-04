@@ -10,6 +10,7 @@ use plugin_toolkit::contract::plan::PlannedChange;
 use plugin_toolkit::prelude::*;
 
 use super::health::{Finding, Remedy, ServiceState};
+use super::host::{local_group_lists, local_user_exists};
 use super::layout::{Init, Layout};
 use super::release::Artifact;
 
@@ -168,6 +169,12 @@ pub enum Step {
         state: RunnerState,
         runner_file: Option<PathBuf>,
     },
+    /// Rewrite the state record's account flags from what the local account
+    /// databases show now, right after the account steps.
+    ReconcileAccount {
+        path: PathBuf,
+        user: String,
+    },
     /// `act_runner register` with a registration token minted at run time and
     /// passed in the environment, so it appears in neither the plan nor `ps`.
     Register {
@@ -242,19 +249,29 @@ impl Step {
                 user.as_deref().unwrap_or("(owner unchanged)"),
                 if *recursive { " recursively" } else { "" }
             )),
-            Step::RecordState { state, .. } => PlannedChange::new(
-                "orca runner state".to_string(),
-                "record",
-            )
-            .with_detail(format!(
-                "scope {}, version {}, runner id {} (root-owned, mode 600)",
-                state.scope,
-                state.version,
-                state
-                    .runner_id
-                    .map(|i| i.to_string())
-                    .unwrap_or_else(|| "read from the fresh registration".to_string())
-            )),
+            Step::RecordState {
+                state, runner_file, ..
+            } => PlannedChange::new("orca runner state".to_string(), "record").with_detail(
+                format!(
+                    "scope {}, version {}, runner id {}, created account {}, added docker group {} \
+                     (root-owned, mode 600)",
+                    state.scope,
+                    state.version,
+                    match (runner_file, state.runner_id) {
+                        (Some(_), _) => "read from the fresh registration".to_string(),
+                        (None, Some(id)) => id.to_string(),
+                        (None, None) => "none yet".to_string(),
+                    },
+                    state.created_account,
+                    state.added_docker_group,
+                ),
+            ),
+            Step::ReconcileAccount { user, .. } => {
+                PlannedChange::new("orca runner state".to_string(), "reconcile-account")
+                    .with_detail(format!(
+                        "keep only the changes to {user} that /etc/passwd and /etc/group show"
+                    ))
+            }
             Step::Register {
                 name,
                 labels,
@@ -460,6 +477,16 @@ impl AccountRecord {
         }
     }
 
+    /// `still_applied` judged by the local account databases, which are what
+    /// userdel/deluser and gpasswd -d/delgroup can change: a membership that
+    /// only a directory grants is not ours to revoke.
+    pub fn observed_locally(self, user: &str, passwd: &str, groups: &str) -> AccountRecord {
+        self.still_applied(
+            local_user_exists(passwd, user),
+            local_group_lists(groups, "docker", user),
+        )
+    }
+
     /// The part of this record still in effect, so the undo steps can fail
     /// hard (and be retried) without tripping over an already-undone change.
     pub fn still_applied(self, user_exists: bool, in_docker_group: bool) -> AccountRecord {
@@ -572,6 +599,8 @@ pub struct InstallSpec<'a> {
     pub instance_url: String,
     pub scope: Scope,
     pub account: AccountPlan,
+    /// Runner id already on record, kept until registration replaces it.
+    pub runner_id: Option<i64>,
 }
 
 pub fn install_steps(spec: &InstallSpec<'_>) -> Vec<Step> {
@@ -579,7 +608,7 @@ pub fn install_steps(spec: &InstallSpec<'_>) -> Vec<Step> {
     let state = RunnerState {
         scope: spec.scope.label(),
         version: spec.artifact.version.clone(),
-        runner_id: None,
+        runner_id: spec.runner_id,
         created_account: spec.account.record.created,
         added_docker_group: spec.account.record.added_docker_group,
     };
@@ -592,6 +621,12 @@ pub fn install_steps(spec: &InstallSpec<'_>) -> Vec<Step> {
         runner_file: None,
     }];
     steps.extend(spec.account.steps.iter().cloned());
+    if let (Some(user), false) = (&l.user, spec.account.steps.is_empty()) {
+        steps.push(Step::ReconcileAccount {
+            path: l.state_file(),
+            user: user.clone(),
+        });
+    }
     // A managed Linux install dir is root:<account> 0750: the runner can read
     // its binary and config but write only `data/`.
     let dir_mode = if l.user.is_some() { 0o750 } else { 0o700 };
@@ -874,7 +909,8 @@ pub fn touched_paths(steps: &[Step]) -> Vec<&Path> {
             | Step::Remove { path, .. }
             | Step::Chmod { path, .. }
             | Step::Chown { path, .. }
-            | Step::RecordState { path, .. } => Some(path.as_path()),
+            | Step::RecordState { path, .. }
+            | Step::ReconcileAccount { path, .. } => Some(path.as_path()),
             Step::InstallBinary { dest, .. } => Some(dest.as_path()),
             _ => None,
         })
@@ -932,6 +968,7 @@ mod tests {
                 },
                 steps: account_steps,
             },
+            runner_id: None,
         }
     }
 
@@ -1267,9 +1304,14 @@ mod tests {
         );
         let userdel = removed
             .iter()
-            .position(|a| a == "run userdel gitea-runner-r1");
+            .position(|a| a == "run userdel gitea-runner-r1")
+            .expect("userdel step");
         assert!(
-            userdel < removed.iter().position(|a| a.starts_with("remove-dir ")),
+            userdel
+                < removed
+                    .iter()
+                    .position(|a| a.starts_with("remove-dir "))
+                    .expect("remove-dir step"),
             "{removed:?}"
         );
     }
@@ -1515,6 +1557,62 @@ mod tests {
         assert!(early.added_docker_group && !early.created_account);
         let (last, late, reads_runner) = records[records.len() - 1];
         assert!(last > register && reads_runner && late.added_docker_group);
+    }
+
+    #[test]
+    fn account_record_is_reconciled_right_after_the_account_steps() {
+        let l = layout(Init::Systemd);
+        let steps = install_steps(&InstallSpec {
+            runner_id: Some(42),
+            ..spec(
+                &l,
+                user_steps(Init::Systemd, "gitea-runner-r1", &l.data, true, false),
+            )
+        });
+        let a = actions(&steps);
+        assert!(a[1].starts_with("run useradd "), "{a:?}");
+        assert_eq!(a[2], "run usermod -aG docker gitea-runner-r1");
+        assert!(
+            matches!(&steps[3], Step::ReconcileAccount { user, .. } if user == "gitea-runner-r1")
+        );
+        assert!(a[4].starts_with("create-dir "), "{a:?}");
+        assert!(
+            matches!(&steps[0], Step::RecordState { state, .. } if state.runner_id == Some(42))
+        );
+        let none = install_steps(&spec(&l, vec![]));
+        assert!(
+            !none
+                .iter()
+                .any(|s| matches!(s, Step::ReconcileAccount { .. }))
+        );
+    }
+
+    #[test]
+    fn state_only_install_still_uninstalls_its_account_changes() {
+        let l = layout(Init::Systemd);
+        assert!(!l.dir.exists() && !l.config.exists());
+        let a = actions(&uninstall_steps(
+            &l,
+            0,
+            ServiceState::NotLoaded,
+            None,
+            &Scope::Instance,
+            true,
+            false,
+            AccountRecord {
+                created: false,
+                added_docker_group: true,
+            },
+        ));
+        let revoke = a
+            .iter()
+            .position(|x| x == "run gpasswd -d gitea-runner-r1 docker")
+            .expect("revoke step");
+        assert_eq!(
+            a.last().unwrap(),
+            "remove-file /var/lib/gitea-runner/.orca/r1.json"
+        );
+        assert!(revoke < a.len() - 1);
     }
 
     #[test]

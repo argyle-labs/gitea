@@ -21,7 +21,10 @@ use super::health::{
     self, DEFAULT_STALL_AFTER_SECS, Finding, GiteaRunnerView, GiteaSide, HealthStatus,
     LaunchdPriority, Observation, WaitingJob, mode_from_labels,
 };
-use super::host::{LocalHost, LocalInstall, lookup_group, lookup_user, user_in_group};
+use super::host::{
+    ETC_GROUP, ETC_PASSWD, LocalHost, LocalInstall, lookup_group, lookup_user, read_local_db,
+    user_in_group,
+};
 use super::layout::{self, Init, Layout, Mode};
 use super::plan::{self, Rerender, RunnerState, Scope, Step};
 use super::release::{self, DEFAULT_VERSION, Source};
@@ -513,21 +516,35 @@ pub fn check_host_as_root(mode: Mode, runs_as_root: bool, force: bool) -> Result
     Ok(())
 }
 
-/// The recorded account changes that are still in effect on this host.
+/// The recorded account changes still in effect, judged by the local
+/// `passwd` and `group` databases.
 fn account_still_applied(
-    l: &Layout,
+    user: Option<&str>,
+    recorded: Option<&RunnerState>,
+    passwd: &str,
+    groups: &str,
+) -> plan::AccountRecord {
+    let record = plan::AccountRecord::from_state(recorded);
+    match user {
+        Some(u) => record.observed_locally(u, passwd, groups),
+        None => record,
+    }
+}
+
+/// `account_still_applied` against this host's `/etc/passwd` and `/etc/group`.
+fn account_still_applied_here(
+    user: Option<&str>,
     recorded: Option<&RunnerState>,
 ) -> Result<plan::AccountRecord> {
-    let record = plan::AccountRecord::from_state(recorded);
-    let Some(u) = &l.user else {
-        return Ok(record);
-    };
-    if record == plan::AccountRecord::default() {
-        return Ok(record);
+    if user.is_none() || plan::AccountRecord::from_state(recorded) == plan::AccountRecord::default()
+    {
+        return Ok(plan::AccountRecord::from_state(recorded));
     }
-    Ok(record.still_applied(
-        lookup_user(u)?.is_some(),
-        record.added_docker_group && user_in_group(u, "docker")?,
+    Ok(account_still_applied(
+        user,
+        recorded,
+        &read_local_db(std::path::Path::new(ETC_PASSWD))?,
+        &read_local_db(std::path::Path::new(ETC_GROUP))?,
     ))
 }
 
@@ -544,6 +561,13 @@ pub async fn gitea_runner_install(args: RunnerInstallArgs, ctx: &ToolCtx) -> Res
     layout::validate_name(&args.name)?;
     let host = LocalHost::current()?;
     if let Some(existing) = host.find(&args.name) {
+        if existing.managed && !existing.config.exists() && !existing.runner_file.exists() {
+            bail!(
+                "runner '{}' has a partial install recorded at {} — uninstall it first",
+                args.name,
+                existing.state_file().display()
+            );
+        }
         bail!(
             "runner '{}' is already installed at {} — use gitea.runner.upgrade, or uninstall first",
             args.name,
@@ -613,9 +637,11 @@ pub async fn gitea_runner_install(args: RunnerInstallArgs, ctx: &ToolCtx) -> Res
         None => plan::AccountFacts::default(),
     };
     let mut account = plan::account_plan(host.init, l.user.as_deref(), &l.data, docker, facts);
-    account.record = account.record.union(plan::AccountRecord::from_state(
-        RunnerState::read(&l.state_file()).as_ref(),
-    ));
+    let prior = RunnerState::read(&l.state_file());
+    account.record = account.record.union(account_still_applied_here(
+        l.user.as_deref(),
+        prior.as_ref(),
+    )?);
     let mut summary = format!(
         "install runner '{}' {} ({} executor, capacity {}, {}) from {} registering with {instance_url} as {}",
         args.name,
@@ -644,6 +670,7 @@ pub async fn gitea_runner_install(args: RunnerInstallArgs, ctx: &ToolCtx) -> Res
         instance_url,
         scope,
         account,
+        runner_id: prior.and_then(|p| p.runner_id),
     });
     let exec = Executor {
         host: &host,
@@ -742,7 +769,7 @@ pub async fn gitea_runner_uninstall(
         &scope,
         scope_known,
         args.keep_files,
-        account_still_applied(&l, recorded.as_ref())?,
+        account_still_applied_here(l.user.as_deref(), recorded.as_ref())?,
     );
     let mut notes = Vec::new();
     if runner_id.is_none() {
@@ -1007,6 +1034,79 @@ pub async fn gitea_runner_heal(args: RunnerHealArgs, ctx: &ToolCtx) -> Result<Ru
 mod tests {
     use super::*;
     use crate::runner::health::ServiceState;
+
+    const PASSWD: &str = "root:x:0:0::/root:/bin/sh\ngitea-runner-r1:x:990:990::/x:/sbin/nologin\n";
+    const GROUP: &str = "root:x:0:\ndocker:x:999:gitea-runner-r1\n";
+
+    fn state(created: bool, added: bool) -> RunnerState {
+        RunnerState {
+            scope: "instance".into(),
+            version: "4.1.0".into(),
+            runner_id: Some(5),
+            created_account: created,
+            added_docker_group: added,
+        }
+    }
+
+    #[test]
+    fn account_still_applied_follows_the_local_databases() {
+        let u = Some("gitea-runner-r1");
+        let rec = |created, added| plan::AccountRecord {
+            created,
+            added_docker_group: added,
+        };
+        // (recorded, passwd, group, expected)
+        let cases = [
+            (Some(state(true, false)), PASSWD, GROUP, rec(true, false)),
+            (Some(state(true, false)), "", GROUP, rec(false, false)),
+            (Some(state(false, true)), PASSWD, GROUP, rec(false, true)),
+            (
+                Some(state(false, true)),
+                PASSWD,
+                "docker:x:999:\n",
+                rec(false, false),
+            ),
+            (Some(state(false, false)), PASSWD, GROUP, rec(false, false)),
+            (None, PASSWD, GROUP, rec(false, false)),
+        ];
+        for (recorded, passwd, group, want) in cases {
+            assert_eq!(
+                account_still_applied(u, recorded.as_ref(), passwd, group),
+                want,
+                "{recorded:?} / {passwd:?} / {group:?}"
+            );
+        }
+        assert_eq!(
+            account_still_applied(None, Some(&state(true, true)), "", ""),
+            rec(true, true)
+        );
+    }
+
+    #[test]
+    fn install_merges_the_on_disk_record_only_where_it_still_holds() {
+        let dir = std::env::temp_dir().join(format!("gitea-merge-{}", std::process::id()));
+        let path = dir.join("r1.json");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&path, state(true, true).to_json()).unwrap();
+        let prior = RunnerState::read(&path);
+        std::fs::remove_dir_all(&dir).ok();
+        let planned = plan::AccountRecord::default();
+        let u = Some("gitea-runner-r1");
+        let merged = planned.union(account_still_applied(u, prior.as_ref(), PASSWD, GROUP));
+        assert!(merged.created && merged.added_docker_group);
+        let stale = planned.union(account_still_applied(
+            u,
+            prior.as_ref(),
+            "",
+            "docker:x:999:\n",
+        ));
+        assert_eq!(
+            stale,
+            plan::AccountRecord::default(),
+            "a prior flag that no longer holds is dropped"
+        );
+        assert_eq!(prior.and_then(|p| p.runner_id), Some(5));
+    }
 
     fn local(name: &str, id: Option<i64>) -> LocalInstall {
         LocalInstall {

@@ -12,7 +12,7 @@ use plugin_toolkit::prelude::*;
 use plugin_toolkit::process::Command;
 
 use super::health::{ServiceState, mode_from_labels};
-use super::layout::{Init, Layout, Mode, managed_root};
+use super::layout::{Init, Layout, Mode, managed_root, validate_name};
 use super::plan::RunnerState;
 use super::render::{config_capacity, plist_process_type};
 
@@ -103,24 +103,43 @@ impl LocalHost {
     }
 
     /// Runner installs on this host: managed ones under the managed root, plus
-    /// hand-placed installs at the fleet's historical paths.
+    /// hand-placed installs at the fleet's historical paths. A managed name
+    /// with only a state record counts, so an install that failed before
+    /// writing its config can still be uninstalled.
     pub fn discover(&self) -> Vec<Layout> {
         let mut found = Vec::new();
-        if let Ok(entries) = std::fs::read_dir(managed_root(self.init, &self.home)) {
-            let mut names: Vec<String> = entries
-                .flatten()
-                .filter(|e| e.path().is_dir())
-                .filter_map(|e| e.file_name().to_str().map(str::to_string))
-                .filter(|n| !n.starts_with('.'))
-                .collect();
-            names.sort();
-            found.extend(
-                names
-                    .iter()
-                    .map(|n| Layout::managed(self.init, n, &self.home))
-                    .filter(|l| l.config.exists() || l.runner_file.exists()),
+        let root = managed_root(self.init, &self.home);
+        let mut names = std::collections::BTreeSet::new();
+        if let Ok(entries) = std::fs::read_dir(&root) {
+            names.extend(
+                entries
+                    .flatten()
+                    .filter(|e| e.path().is_dir())
+                    .filter_map(|e| e.file_name().to_str().map(str::to_string))
+                    .filter(|n| !n.starts_with('.')),
             );
         }
+        if let Ok(entries) = std::fs::read_dir(root.join(".orca")) {
+            names.extend(
+                entries
+                    .flatten()
+                    .filter_map(|e| {
+                        e.file_name()
+                            .to_str()
+                            .and_then(|f| f.strip_suffix(".json"))
+                            .map(str::to_string)
+                    })
+                    .filter(|n| validate_name(n).is_ok()),
+            );
+        }
+        found.extend(
+            names
+                .iter()
+                .map(|n| Layout::managed(self.init, n, &self.home))
+                .filter(|l| {
+                    l.config.exists() || l.runner_file.exists() || l.state_file().is_file()
+                }),
+        );
         for mut legacy in Layout::legacy_candidates(self.init, &self.home) {
             if legacy.runner_file.exists() || legacy.unit_path.exists() {
                 legacy.name = read_registration(&legacy.runner_file)
@@ -413,6 +432,39 @@ fn group_list(user: &str, primary: u32) -> Result<Vec<u32>> {
     }
 }
 
+pub const ETC_PASSWD: &str = "/etc/passwd";
+pub const ETC_GROUP: &str = "/etc/group";
+
+/// Contents of a local account database (`/etc/passwd`, `/etc/group`); a
+/// missing file reads as empty.
+pub fn read_local_db(path: &Path) -> Result<String> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(e) => Err(e).with_context(|| format!("read {}", path.display())),
+    }
+}
+
+/// The `:`-separated fields of `name`'s entry in a local account database.
+fn local_entry<'a>(db: &'a str, name: &str) -> Option<Vec<&'a str>> {
+    db.lines()
+        .map(|l| l.split(':').collect::<Vec<_>>())
+        .find(|f| f.first() == Some(&name))
+}
+
+/// Whether `/etc/passwd`-format `passwd` has an entry for `user`.
+pub fn local_user_exists(passwd: &str, user: &str) -> bool {
+    local_entry(passwd, user).is_some()
+}
+
+/// Whether `/etc/group`-format `groups` lists `user` as a member of `group`:
+/// the membership `gpasswd -d` / `delgroup` can remove.
+pub fn local_group_lists(groups: &str, group: &str, user: &str) -> bool {
+    local_entry(groups, group)
+        .and_then(|f| f.get(3).copied())
+        .is_some_and(|members| members.split(',').any(|m| m.trim() == user))
+}
+
 /// Effective uid (second field) of `/proc/self/status`'s `Uid:` line.
 pub fn parse_proc_euid(status: &str) -> Option<u32> {
     status
@@ -611,6 +663,39 @@ mod tests {
         let (_, primary) = lookup_user("root").unwrap().unwrap();
         assert!(group_list("root", primary).unwrap().contains(&primary));
         assert!(!user_in_group("root", "no-such-orca-test-group").unwrap());
+    }
+
+    #[test]
+    fn local_db_membership_is_what_gpasswd_can_change() {
+        let groups = "root:x:0:\ndocker:x:999:alice,gitea-runner-r1\ndockers:x:5:bob\n";
+        assert!(local_group_lists(groups, "docker", "gitea-runner-r1"));
+        assert!(!local_group_lists(groups, "docker", "bob"));
+        assert!(!local_group_lists(groups, "nope", "alice"));
+        let passwd = "root:x:0:0::/root:/bin/sh\ngitea-runner-r1:x:990:990::/x:/sbin/nologin\n";
+        assert!(local_user_exists(passwd, "gitea-runner-r1"));
+        assert!(!local_user_exists(passwd, "gitea-runner"));
+        assert_eq!(read_local_db(Path::new("/no/such/orca/db")).unwrap(), "");
+    }
+
+    #[test]
+    fn a_state_file_alone_makes_the_install_findable() {
+        let home = std::env::temp_dir().join(format!("gitea-state-only-{}", std::process::id()));
+        let host = LocalHost {
+            init: Init::Launchd,
+            home: home.clone(),
+            uid: 501,
+        };
+        let l = Layout::managed(Init::Launchd, "r1", &home);
+        assert!(host.find("r1").is_none());
+        std::fs::create_dir_all(l.state_file().parent().unwrap()).unwrap();
+        std::fs::write(l.state_file(), "{}").unwrap();
+        std::fs::write(l.state_file().with_file_name("not a name.json"), "{}").unwrap();
+        let found = host.find("r1");
+        let names: Vec<String> = host.discover().into_iter().map(|l| l.name).collect();
+        std::fs::remove_dir_all(&home).ok();
+        assert_eq!(found.map(|f| f.dir), Some(l.dir));
+        assert!(!l.config.exists());
+        assert_eq!(names, vec!["r1"]);
     }
 
     #[test]
