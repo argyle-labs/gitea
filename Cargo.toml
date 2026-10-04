@@ -31,14 +31,14 @@ path = "src/main.rs"
 # (`gitea.backup`/`gitea.restore`) wrapping `gitea dump`.
 
 [dependencies]
-# The SOLE orca dependency (see proxmox for the full rationale). Pinned to a TAG,
-# never `branch = "main"`: a moving branch changes this plugin's build with no
-# commit of ours. Host is the PUBLIC github mirror, never the Gitea instance.
+# The SOLE orca dependency (see proxmox for the full rationale). Tracks orca
+# `main` on the PUBLIC github mirror (never the Gitea instance); the committed
+# Cargo.lock pins the exact revision, so a build changes only when the lock does.
 # Thin profile: `delegated-http` retargets the generated client
 # onto orca's `http.request` capability (no reqwest/rustls/hyper linked); `tools`
 # (orca_tool anchors) + `db` (endpoint_resource CRUD over db_op) + `containers`
 # (docker-substrate deploy) round it out.
-plugin-toolkit = { git = "https://github.com/argyle-labs/orca", tag = "v0.2.1-rc.10", default-features = false, features = ["tools", "db", "containers", "delegated-http"] }
+plugin-toolkit = { git = "https://github.com/argyle-labs/orca", branch = "main", default-features = false, features = ["tools", "db", "containers", "delegated-http"] }
 
 serde       = { version = "1", features = ["derive"] }
 serde_json  = "1"
@@ -54,7 +54,7 @@ tokio       = { version = "1", features = ["full"] }
 tokio    = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 [build-dependencies]
-plugin-toolkit-build = { git = "https://github.com/argyle-labs/orca", tag = "v0.2.1-rc.10" }
+plugin-toolkit-build = { git = "https://github.com/argyle-labs/orca", branch = "main" }
 
 # Prototype spec→orca-surface generator inputs (same as proxmox).
 syn         = { version = "2", features = ["full", "extra-traits", "parsing", "printing"] }
