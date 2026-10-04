@@ -207,6 +207,10 @@ impl Executor<'_> {
                 runner_file,
             } => {
                 let mut state = state.clone();
+                if let (Some(_), Some(disk)) = (runner_file, RunnerState::read(path)) {
+                    state.created_account = disk.created_account;
+                    state.added_docker_group = disk.added_docker_group;
+                }
                 if let Some(rf) = runner_file {
                     state.runner_id = Some(
                         host::read_registration(rf)
@@ -478,6 +482,53 @@ mod tests {
         assert!(err.is_none(), "{err:?}");
         assert!(!after.created_account && !after.added_docker_group);
         assert_eq!(after.runner_id, Some(9));
+    }
+
+    #[tokio::test]
+    async fn post_registration_record_keeps_the_reconciled_account_flags() {
+        let home = scratch("rerecord");
+        let host = LocalHost {
+            init: Init::Launchd,
+            home: home.clone(),
+            uid: 501,
+        };
+        let exec = Executor {
+            host: &host,
+            gitea: None,
+        };
+        let path = home.join(".orca/r1.json");
+        let runner_file = home.join(".runner");
+        std::fs::write(&runner_file, r#"{"id":77,"name":"r1","labels":[]}"#).unwrap();
+        let planned = RunnerState {
+            scope: "instance".into(),
+            version: "4.1.0".into(),
+            runner_id: None,
+            created_account: true,
+            added_docker_group: true,
+        };
+        let (_, err) = exec
+            .run(&[
+                Step::RecordState {
+                    path: path.clone(),
+                    state: planned.clone(),
+                    runner_file: None,
+                },
+                Step::ReconcileAccount {
+                    path: path.clone(),
+                    user: "no-such-orca-test-user".into(),
+                },
+                Step::RecordState {
+                    path: path.clone(),
+                    state: planned,
+                    runner_file: Some(runner_file),
+                },
+            ])
+            .await;
+        let after = RunnerState::read(&path).unwrap();
+        std::fs::remove_dir_all(&home).ok();
+        assert!(err.is_none(), "{err:?}");
+        assert_eq!(after.runner_id, Some(77));
+        assert!(!after.created_account && !after.added_docker_group);
     }
 
     #[tokio::test]

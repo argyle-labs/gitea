@@ -163,7 +163,9 @@ pub enum Step {
     },
     /// Write the root-owned state record. With `runner_file`, the Gitea
     /// runner id is read from it at execute time, immediately after
-    /// registration and before the runner account can touch it.
+    /// registration and before the runner account can touch it, and the
+    /// account flags are kept from the record already on disk, which
+    /// `ReconcileAccount` may have corrected.
     RecordState {
         path: PathBuf,
         state: RunnerState,
@@ -253,8 +255,7 @@ impl Step {
                 state, runner_file, ..
             } => PlannedChange::new("orca runner state".to_string(), "record").with_detail(
                 format!(
-                    "scope {}, version {}, runner id {}, created account {}, added docker group {} \
-                     (root-owned, mode 600)",
+                    "scope {}, version {}, runner id {}, {} (root-owned, mode 600)",
                     state.scope,
                     state.version,
                     match (runner_file, state.runner_id) {
@@ -262,8 +263,13 @@ impl Step {
                         (None, Some(id)) => id.to_string(),
                         (None, None) => "none yet".to_string(),
                     },
-                    state.created_account,
-                    state.added_docker_group,
+                    match runner_file {
+                        Some(_) => "account flags kept from the record on disk".to_string(),
+                        None => format!(
+                            "created account {}, added docker group {}",
+                            state.created_account, state.added_docker_group
+                        ),
+                    },
                 ),
             ),
             Step::ReconcileAccount { user, .. } => {
@@ -468,15 +474,6 @@ impl AccountRecord {
             .unwrap_or_default()
     }
 
-    /// Everything either record says the plugin did, so a re-install over a
-    /// failed one keeps what the earlier attempt changed.
-    pub fn union(self, other: AccountRecord) -> AccountRecord {
-        AccountRecord {
-            created: self.created || other.created,
-            added_docker_group: self.added_docker_group || other.added_docker_group,
-        }
-    }
-
     /// `still_applied` judged by the local account databases, which are what
     /// userdel/deluser and gpasswd -d/delgroup can change: a membership that
     /// only a directory grants is not ours to revoke.
@@ -599,8 +596,6 @@ pub struct InstallSpec<'a> {
     pub instance_url: String,
     pub scope: Scope,
     pub account: AccountPlan,
-    /// Runner id already on record, kept until registration replaces it.
-    pub runner_id: Option<i64>,
 }
 
 pub fn install_steps(spec: &InstallSpec<'_>) -> Vec<Step> {
@@ -608,7 +603,7 @@ pub fn install_steps(spec: &InstallSpec<'_>) -> Vec<Step> {
     let state = RunnerState {
         scope: spec.scope.label(),
         version: spec.artifact.version.clone(),
-        runner_id: spec.runner_id,
+        runner_id: None,
         created_account: spec.account.record.created,
         added_docker_group: spec.account.record.added_docker_group,
     };
@@ -968,7 +963,6 @@ mod tests {
                 },
                 steps: account_steps,
             },
-            runner_id: None,
         }
     }
 
@@ -1562,13 +1556,10 @@ mod tests {
     #[test]
     fn account_record_is_reconciled_right_after_the_account_steps() {
         let l = layout(Init::Systemd);
-        let steps = install_steps(&InstallSpec {
-            runner_id: Some(42),
-            ..spec(
-                &l,
-                user_steps(Init::Systemd, "gitea-runner-r1", &l.data, true, false),
-            )
-        });
+        let steps = install_steps(&spec(
+            &l,
+            user_steps(Init::Systemd, "gitea-runner-r1", &l.data, true, false),
+        ));
         let a = actions(&steps);
         assert!(a[1].starts_with("run useradd "), "{a:?}");
         assert_eq!(a[2], "run usermod -aG docker gitea-runner-r1");
@@ -1577,7 +1568,7 @@ mod tests {
         );
         assert!(a[4].starts_with("create-dir "), "{a:?}");
         assert!(
-            matches!(&steps[0], Step::RecordState { state, .. } if state.runner_id == Some(42))
+            matches!(&steps[0], Step::RecordState { state, runner_file: None, .. } if state.runner_id.is_none())
         );
         let none = install_steps(&spec(&l, vec![]));
         assert!(
@@ -1637,7 +1628,7 @@ mod tests {
     }
 
     #[test]
-    fn account_record_union_and_still_applied() {
+    fn account_record_still_applied() {
         let created = AccountRecord {
             created: true,
             added_docker_group: false,
@@ -1646,18 +1637,6 @@ mod tests {
             created: false,
             added_docker_group: true,
         };
-        assert_eq!(
-            AccountRecord::default().union(granted),
-            granted,
-            "a re-install keeps an earlier attempt's grant"
-        );
-        assert_eq!(
-            created.union(granted),
-            AccountRecord {
-                created: true,
-                added_docker_group: true
-            }
-        );
         assert_eq!(granted.still_applied(true, false), AccountRecord::default());
         assert_eq!(
             created.still_applied(false, false),
