@@ -450,6 +450,24 @@ impl AccountRecord {
             })
             .unwrap_or_default()
     }
+
+    /// Everything either record says the plugin did, so a re-install over a
+    /// failed one keeps what the earlier attempt changed.
+    pub fn union(self, other: AccountRecord) -> AccountRecord {
+        AccountRecord {
+            created: self.created || other.created,
+            added_docker_group: self.added_docker_group || other.added_docker_group,
+        }
+    }
+
+    /// The part of this record still in effect, so the undo steps can fail
+    /// hard (and be retried) without tripping over an already-undone change.
+    pub fn still_applied(self, user_exists: bool, in_docker_group: bool) -> AccountRecord {
+        AccountRecord {
+            created: self.created && user_exists,
+            added_docker_group: self.added_docker_group && in_docker_group,
+        }
+    }
 }
 
 /// Account steps for an install, and what they will have done.
@@ -518,8 +536,8 @@ pub fn account_summary(plan: &AccountPlan, user: &str) -> Option<String> {
 pub fn docker_group_revoke_steps(init: Init, user: &str) -> Vec<Step> {
     match init {
         Init::Launchd => Vec::new(),
-        Init::Systemd => vec![run(&["gpasswd", "-d", user, "docker"], true)],
-        Init::Openrc => vec![run(&["delgroup", user, "docker"], true)],
+        Init::Systemd => vec![run(&["gpasswd", "-d", user, "docker"], false)],
+        Init::Openrc => vec![run(&["delgroup", user, "docker"], false)],
     }
 }
 
@@ -527,9 +545,9 @@ pub fn docker_group_revoke_steps(init: Init, user: &str) -> Vec<Step> {
 pub fn user_removal_steps(init: Init, user: &str) -> Vec<Step> {
     match init {
         Init::Launchd => Vec::new(),
-        Init::Systemd => vec![run(&["userdel", user], true)],
+        Init::Systemd => vec![run(&["userdel", user], false)],
         Init::Openrc => vec![
-            run(&["deluser", user], true),
+            run(&["deluser", user], false),
             run(&["delgroup", user], true),
         ],
     }
@@ -558,7 +576,22 @@ pub struct InstallSpec<'a> {
 
 pub fn install_steps(spec: &InstallSpec<'_>) -> Vec<Step> {
     let l = spec.layout;
-    let mut steps = spec.account.steps.clone();
+    let state = RunnerState {
+        scope: spec.scope.label(),
+        version: spec.artifact.version.clone(),
+        runner_id: None,
+        created_account: spec.account.record.created,
+        added_docker_group: spec.account.record.added_docker_group,
+    };
+    // Recorded before the account is touched (the state file lives outside
+    // the install dir), so an install that fails later still leaves uninstall
+    // what it needs to undo the account and docker grant.
+    let mut steps = vec![Step::RecordState {
+        path: l.state_file(),
+        state: state.clone(),
+        runner_file: None,
+    }];
+    steps.extend(spec.account.steps.iter().cloned());
     // A managed Linux install dir is root:<account> 0750: the runner can read
     // its binary and config but write only `data/`.
     let dir_mode = if l.user.is_some() { 0o750 } else { 0o700 };
@@ -596,13 +629,7 @@ pub fn install_steps(spec: &InstallSpec<'_>) -> Vec<Step> {
         },
         Step::RecordState {
             path: l.state_file(),
-            state: RunnerState {
-                scope: spec.scope.label(),
-                version: spec.artifact.version.clone(),
-                runner_id: None,
-                created_account: spec.account.record.created,
-                added_docker_group: spec.account.record.added_docker_group,
-            },
+            state,
             runner_file: Some(l.runner_file.clone()),
         },
     ]);
@@ -682,6 +709,16 @@ pub fn uninstall_steps(
             scope_known,
         });
     }
+    // Account changes precede the removals, and the state file goes last: a
+    // failed revoke or userdel stops here with the record intact to retry.
+    if let Some(user) = &layout.user {
+        if !keep_files && account.created {
+            steps.extend(user_removal_steps(layout.init, user));
+        }
+        if account.added_docker_group && !account.created {
+            steps.extend(docker_group_revoke_steps(layout.init, user));
+        }
+    }
     if !keep_files {
         steps.push(Step::Remove {
             path: layout.dir.clone(),
@@ -691,19 +728,6 @@ pub fn uninstall_steps(
             path: layout.state_file(),
             recursive: false,
         });
-        // With keep_files the account stays too, so `data/` is never left
-        // owned by an orphaned uid.
-        if account.created
-            && let Some(user) = &layout.user
-        {
-            steps.extend(user_removal_steps(layout.init, user));
-        }
-    }
-    if account.added_docker_group
-        && !account.created
-        && let Some(user) = &layout.user
-    {
-        steps.extend(docker_group_revoke_steps(layout.init, user));
     }
     steps
 }
@@ -959,26 +983,30 @@ mod tests {
         let l = layout(Init::Launchd);
         let steps = install_steps(&spec(&l, vec![]));
         let a = actions(&steps);
-        assert_eq!(a.len(), 9, "{a:?}");
-        assert!(matches!(steps[0], Step::CreateDir { mode: 0o700, .. }));
-        assert!(a[1].starts_with("create-dir ") && a[1].ends_with("/r1/data"));
-        assert!(a[2].starts_with("install-binary ") && a[2].ends_with("/r1/act_runner"));
-        assert!(a[3].starts_with("write ") && a[3].ends_with("config.yaml"));
-        assert_eq!(a[4], "register gitea runner r1");
-        assert!(a[5].starts_with("chmod ") && a[5].ends_with("/r1/data/.runner"));
-        assert!(matches!(steps[5], Step::Chmod { mode: 0o600, .. }));
-        assert!(a[6].starts_with("record "));
-        assert!(a[7].ends_with("com.argyle.gitea-runner.r1.plist"));
+        assert_eq!(a.len(), 10, "{a:?}");
+        assert!(matches!(
+            &steps[0],
+            Step::RecordState { runner_file: None, state, .. } if state.runner_id.is_none()
+        ));
+        assert!(matches!(steps[1], Step::CreateDir { mode: 0o700, .. }));
+        assert!(a[2].starts_with("create-dir ") && a[2].ends_with("/r1/data"));
+        assert!(a[3].starts_with("install-binary ") && a[3].ends_with("/r1/act_runner"));
+        assert!(a[4].starts_with("write ") && a[4].ends_with("config.yaml"));
+        assert_eq!(a[5], "register gitea runner r1");
+        assert!(a[6].starts_with("chmod ") && a[6].ends_with("/r1/data/.runner"));
+        assert!(matches!(steps[6], Step::Chmod { mode: 0o600, .. }));
+        assert!(a[7].starts_with("record "));
+        assert!(a[8].ends_with("com.argyle.gitea-runner.r1.plist"));
         assert_eq!(
-            a[8],
+            a[9],
             "run launchctl bootstrap gui/501 /Users/op/Library/LaunchAgents/com.argyle.gitea-runner.r1.plist"
         );
-        let register = steps[4].to_change().detail.unwrap();
+        let register = steps[5].to_change().detail.unwrap();
         assert!(
             register.contains("GITEA_RUNNER_REGISTRATION_TOKEN"),
             "{register}"
         );
-        match &steps[6] {
+        match &steps[7] {
             Step::RecordState {
                 path,
                 state,
@@ -998,7 +1026,7 @@ mod tests {
     #[test]
     fn install_plan_shows_source_url_and_host() {
         let l = layout(Init::Launchd);
-        let detail = install_steps(&spec(&l, vec![]))[2]
+        let detail = install_steps(&spec(&l, vec![]))[3]
             .to_change()
             .detail
             .unwrap();
@@ -1058,7 +1086,7 @@ mod tests {
                 runner_owned.display()
             );
         }
-        assert!(matches!(steps[0], Step::CreateDir { mode: 0o750, .. }));
+        assert!(matches!(steps[1], Step::CreateDir { mode: 0o750, .. }));
     }
 
     #[test]
@@ -1170,10 +1198,10 @@ mod tests {
                 "run rc-update del gitea-runner-r1 default",
                 "remove-file /etc/init.d/gitea-runner-r1",
                 "deregister gitea runner id 7",
-                "remove-dir /var/lib/gitea-runner/r1",
-                "remove-file /var/lib/gitea-runner/.orca/r1.json",
                 "run deluser gitea-runner-r1",
                 "run delgroup gitea-runner-r1",
+                "remove-dir /var/lib/gitea-runner/r1",
+                "remove-file /var/lib/gitea-runner/.orca/r1.json",
             ]
         );
         assert!(matches!(
@@ -1233,7 +1261,17 @@ mod tests {
                 added_docker_group: false,
             },
         ));
-        assert_eq!(removed.last().unwrap(), "run userdel gitea-runner-r1");
+        assert_eq!(
+            removed.last().unwrap(),
+            "remove-file /var/lib/gitea-runner/.orca/r1.json"
+        );
+        let userdel = removed
+            .iter()
+            .position(|a| a == "run userdel gitea-runner-r1");
+        assert!(
+            userdel < removed.iter().position(|a| a.starts_with("remove-dir ")),
+            "{removed:?}"
+        );
     }
 
     #[test]
@@ -1407,9 +1445,18 @@ mod tests {
             ))
         };
         let sysd = uninstall(Init::Systemd, false, false, true);
+        let revoke = sysd
+            .iter()
+            .position(|a| a == "run gpasswd -d gitea-runner-r1 docker")
+            .expect("revoke step");
+        assert_eq!(
+            sysd.len() - 3,
+            revoke,
+            "revoke precedes both removals: {sysd:?}"
+        );
         assert_eq!(
             sysd.last().unwrap(),
-            "run gpasswd -d gitea-runner-r1 docker"
+            "remove-file /var/lib/gitea-runner/.orca/r1.json"
         );
         assert!(!sysd.iter().any(|a| a.contains("userdel")));
         let kept = uninstall(Init::Openrc, true, false, true);
@@ -1425,6 +1472,100 @@ mod tests {
                 .iter()
                 .any(|a| a.contains("gpasswd") || a.contains("userdel"))
         );
+    }
+
+    #[test]
+    fn account_state_is_recorded_before_the_account_is_touched() {
+        let l = layout(Init::Systemd);
+        let steps = install_steps(&InstallSpec {
+            account: account_plan(
+                Init::Systemd,
+                l.user.as_deref(),
+                &l.data,
+                true,
+                AccountFacts {
+                    user_exists: true,
+                    group_exists: true,
+                    in_docker_group: false,
+                },
+            ),
+            ..spec(&l, vec![])
+        });
+        let first_account = steps
+            .iter()
+            .position(|s| matches!(s, Step::Run { argv, .. } if argv[0] == "usermod"))
+            .unwrap();
+        let register = steps
+            .iter()
+            .position(|s| matches!(s, Step::Register { .. }))
+            .unwrap();
+        let records: Vec<(usize, &RunnerState, bool)> = steps
+            .iter()
+            .enumerate()
+            .filter_map(|(i, s)| match s {
+                Step::RecordState {
+                    state, runner_file, ..
+                } => Some((i, state, runner_file.is_some())),
+                _ => None,
+            })
+            .collect();
+        let (first, early, reads_runner) = records[0];
+        assert!(first < first_account && first < register);
+        assert!(!reads_runner && early.runner_id.is_none());
+        assert!(early.added_docker_group && !early.created_account);
+        let (last, late, reads_runner) = records[records.len() - 1];
+        assert!(last > register && reads_runner && late.added_docker_group);
+    }
+
+    #[test]
+    fn account_undo_steps_fail_hard_for_retry() {
+        for s in docker_group_revoke_steps(Init::Systemd, "u")
+            .iter()
+            .chain(&docker_group_revoke_steps(Init::Openrc, "u"))
+            .chain(&user_removal_steps(Init::Systemd, "u"))
+            .chain(&user_removal_steps(Init::Openrc, "u")[..1])
+        {
+            assert!(
+                matches!(
+                    s,
+                    Step::Run {
+                        tolerate_failure: false,
+                        ..
+                    }
+                ),
+                "{s:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn account_record_union_and_still_applied() {
+        let created = AccountRecord {
+            created: true,
+            added_docker_group: false,
+        };
+        let granted = AccountRecord {
+            created: false,
+            added_docker_group: true,
+        };
+        assert_eq!(
+            AccountRecord::default().union(granted),
+            granted,
+            "a re-install keeps an earlier attempt's grant"
+        );
+        assert_eq!(
+            created.union(granted),
+            AccountRecord {
+                created: true,
+                added_docker_group: true
+            }
+        );
+        assert_eq!(granted.still_applied(true, false), AccountRecord::default());
+        assert_eq!(
+            created.still_applied(false, false),
+            AccountRecord::default()
+        );
+        assert_eq!(granted.still_applied(true, true), granted);
     }
 
     #[test]

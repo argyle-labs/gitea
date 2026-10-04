@@ -513,6 +513,24 @@ pub fn check_host_as_root(mode: Mode, runs_as_root: bool, force: bool) -> Result
     Ok(())
 }
 
+/// The recorded account changes that are still in effect on this host.
+fn account_still_applied(
+    l: &Layout,
+    recorded: Option<&RunnerState>,
+) -> Result<plan::AccountRecord> {
+    let record = plan::AccountRecord::from_state(recorded);
+    let Some(u) = &l.user else {
+        return Ok(record);
+    };
+    if record == plan::AccountRecord::default() {
+        return Ok(record);
+    }
+    Ok(record.still_applied(
+        lookup_user(u)?.is_some(),
+        record.added_docker_group && user_in_group(u, "docker")?,
+    ))
+}
+
 /// Install, register and supervise a Gitea Actions runner on this system.
 #[orca_tool(
     domain = "gitea",
@@ -594,7 +612,10 @@ pub async fn gitea_runner_install(args: RunnerInstallArgs, ctx: &ToolCtx) -> Res
         },
         None => plan::AccountFacts::default(),
     };
-    let account = plan::account_plan(host.init, l.user.as_deref(), &l.data, docker, facts);
+    let mut account = plan::account_plan(host.init, l.user.as_deref(), &l.data, docker, facts);
+    account.record = account.record.union(plan::AccountRecord::from_state(
+        RunnerState::read(&l.state_file()).as_ref(),
+    ));
     let mut summary = format!(
         "install runner '{}' {} ({} executor, capacity {}, {}) from {} registering with {instance_url} as {}",
         args.name,
@@ -721,7 +742,7 @@ pub async fn gitea_runner_uninstall(
         &scope,
         scope_known,
         args.keep_files,
-        plan::AccountRecord::from_state(recorded.as_ref()),
+        account_still_applied(&l, recorded.as_ref())?,
     );
     let mut notes = Vec::new();
     if runner_id.is_none() {
