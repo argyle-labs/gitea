@@ -7,7 +7,7 @@ use plugin_toolkit::prelude::*;
 use super::api;
 use super::host::{self, LocalHost};
 use super::layout::managed_root;
-use super::plan::Step;
+use super::plan::{AccountRecord, RunnerState, Step};
 use super::release;
 use crate::Config;
 
@@ -228,6 +228,22 @@ impl Executor<'_> {
                 write_atomic(path, contents.as_bytes(), *mode)?;
                 Ok(None)
             }
+            Step::ReconcileAccount { path, user } => {
+                let mut state = RunnerState::read(path)
+                    .ok_or_else(|| anyhow!("no readable state record at {}", path.display()))?;
+                let record = AccountRecord::from_state(Some(&state)).observed_locally(
+                    user,
+                    &host::read_local_db(Path::new(host::ETC_PASSWD))?,
+                    &host::read_local_db(Path::new(host::ETC_GROUP))?,
+                );
+                state.created_account = record.created;
+                state.added_docker_group = record.added_docker_group;
+                write_atomic(path, state.to_json().as_bytes(), 0o600)?;
+                Ok(Some(format!(
+                    "created account {}, added docker group {}",
+                    record.created, record.added_docker_group
+                )))
+            }
             Step::Register {
                 binary,
                 config,
@@ -428,6 +444,40 @@ mod tests {
     #[test]
     fn scrub_redacts_the_token() {
         assert_eq!(scrub("bad token abc123", "abc123"), "bad token <redacted>");
+    }
+
+    #[tokio::test]
+    async fn reconcile_account_keeps_only_locally_visible_changes() {
+        let home = scratch("reconcile");
+        let host = LocalHost {
+            init: Init::Launchd,
+            home: home.clone(),
+            uid: 501,
+        };
+        let exec = Executor {
+            host: &host,
+            gitea: None,
+        };
+        let path = home.join(".orca/r1.json");
+        let state = RunnerState {
+            scope: "instance".into(),
+            version: "4.1.0".into(),
+            runner_id: Some(9),
+            created_account: true,
+            added_docker_group: true,
+        };
+        write_atomic(&path, state.to_json().as_bytes(), 0o600).unwrap();
+        let (_, err) = exec
+            .run(&[Step::ReconcileAccount {
+                path: path.clone(),
+                user: "no-such-orca-test-user".into(),
+            }])
+            .await;
+        let after = RunnerState::read(&path).unwrap();
+        std::fs::remove_dir_all(&home).ok();
+        assert!(err.is_none(), "{err:?}");
+        assert!(!after.created_account && !after.added_docker_group);
+        assert_eq!(after.runner_id, Some(9));
     }
 
     #[tokio::test]
