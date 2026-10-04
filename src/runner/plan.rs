@@ -93,13 +93,15 @@ impl Scope {
     }
 }
 
-/// What the plugin records about a managed install, in the install's own
-/// directory. Deregistration uses the recorded scope rather than trusting a
-/// caller to remember it.
+/// What the plugin records about a managed install, root-owned and outside
+/// the runner's reach. Deregistration uses the recorded scope and runner id,
+/// never the runner-writable `.runner`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunnerState {
     pub scope: String,
     pub version: String,
+    #[serde(default)]
+    pub runner_id: Option<i64>,
 }
 
 impl RunnerState {
@@ -141,10 +143,22 @@ pub enum Step {
         path: PathBuf,
         mode: u32,
     },
-    /// Hand `path` and everything under it to `user`.
-    ChownTree {
+    /// Set ownership. `user: None` keeps the current owner (root) and only
+    /// sets the group, which is how the runner gets read access to the
+    /// install directory without being able to write it.
+    Chown {
         path: PathBuf,
-        user: String,
+        user: Option<String>,
+        group: String,
+        recursive: bool,
+    },
+    /// Write the root-owned state record. With `runner_file`, the Gitea
+    /// runner id is read from it at execute time, immediately after
+    /// registration and before the runner account can touch it.
+    RecordState {
+        path: PathBuf,
+        state: RunnerState,
+        runner_file: Option<PathBuf>,
     },
     /// `act_runner register` with a registration token minted at run time and
     /// passed in the environment, so it appears in neither the plan nor `ps`.
@@ -210,10 +224,29 @@ impl Step {
                 PlannedChange::new(path.display().to_string(), "chmod")
                     .with_detail(format!("{mode:o}"))
             }
-            Step::ChownTree { path, user } => {
-                PlannedChange::new(path.display().to_string(), "chown")
-                    .with_detail(format!("recursively to {user}"))
-            }
+            Step::Chown {
+                path,
+                user,
+                group,
+                recursive,
+            } => PlannedChange::new(path.display().to_string(), "chown").with_detail(format!(
+                "{}:{group}{}",
+                user.as_deref().unwrap_or("(owner unchanged)"),
+                if *recursive { " recursively" } else { "" }
+            )),
+            Step::RecordState { state, .. } => PlannedChange::new(
+                "orca runner state".to_string(),
+                "record",
+            )
+            .with_detail(format!(
+                "scope {}, version {}, runner id {} (root-owned, mode 600)",
+                state.scope,
+                state.version,
+                state
+                    .runner_id
+                    .map(|i| i.to_string())
+                    .unwrap_or_else(|| "read from the fresh registration".to_string())
+            )),
             Step::Register {
                 name,
                 labels,
@@ -319,30 +352,47 @@ pub fn service_steps(layout: &Layout, op: ServiceOp, uid: u32, state: ServiceSta
     }
 }
 
-/// Create the runner's service account. In docker mode it also joins the
-/// `docker` group, which is root-equivalent on that host: containerized jobs
-/// need the socket, and that is the cost of docker mode.
-pub fn user_steps(init: Init, user: &str, home: &Path, docker: bool) -> Vec<Step> {
+/// Create the runner's service account. `group_exists` covers a group left
+/// behind by an earlier, partly removed install. In docker mode the account
+/// joins the `docker` group: the runner process needs the socket to start
+/// job containers (jobs themselves never get it; see `docker_host: "-"`),
+/// and socket access is root-equivalent on that host.
+pub fn user_steps(
+    init: Init,
+    user: &str,
+    home: &Path,
+    docker: bool,
+    group_exists: bool,
+) -> Vec<Step> {
     let home = home.to_string_lossy();
     let mut steps = match init {
         Init::Launchd => return Vec::new(),
-        Init::Systemd => vec![run(
-            &[
-                "useradd",
-                "--system",
-                "--user-group",
+        Init::Systemd => {
+            let group_flag = if group_exists {
+                "--gid"
+            } else {
+                "--user-group"
+            };
+            let mut argv = vec!["useradd", "--system", group_flag];
+            if group_exists {
+                argv.push(user);
+            }
+            argv.extend([
                 "--home-dir",
                 &home,
                 "--no-create-home",
                 "--shell",
                 "/usr/sbin/nologin",
                 user,
-            ],
-            false,
-        )],
-        Init::Openrc => vec![
-            run(&["addgroup", "-S", user], false),
-            run(
+            ]);
+            vec![run(&argv, false)]
+        }
+        Init::Openrc => {
+            let mut steps = Vec::new();
+            if !group_exists {
+                steps.push(run(&["addgroup", "-S", user], false));
+            }
+            steps.push(run(
                 &[
                     "adduser",
                     "-S",
@@ -357,8 +407,9 @@ pub fn user_steps(init: Init, user: &str, home: &Path, docker: bool) -> Vec<Step
                     user,
                 ],
                 false,
-            ),
-        ],
+            ));
+            steps
+        }
     };
     if docker {
         steps.push(match init {
@@ -367,6 +418,18 @@ pub fn user_steps(init: Init, user: &str, home: &Path, docker: bool) -> Vec<Step
         });
     }
     steps
+}
+
+/// Remove the runner's account (and, on Alpine, its group).
+pub fn user_removal_steps(init: Init, user: &str) -> Vec<Step> {
+    match init {
+        Init::Launchd => Vec::new(),
+        Init::Systemd => vec![run(&["userdel", user], true)],
+        Init::Openrc => vec![
+            run(&["deluser", user], true),
+            run(&["delgroup", user], true),
+        ],
+    }
 }
 
 fn unit_mode(init: Init) -> u32 {
@@ -394,9 +457,16 @@ pub struct InstallSpec<'a> {
 pub fn install_steps(spec: &InstallSpec<'_>) -> Vec<Step> {
     let l = spec.layout;
     let mut steps = spec.create_user.clone();
+    // A managed Linux install dir is root:<account> 0750: the runner can read
+    // its binary and config but write only `data/`.
+    let dir_mode = if l.user.is_some() { 0o750 } else { 0o700 };
     steps.extend([
         Step::CreateDir {
             path: l.dir.clone(),
+            mode: dir_mode,
+        },
+        Step::CreateDir {
+            path: l.data.clone(),
             mode: 0o700,
         },
         Step::InstallBinary {
@@ -412,7 +482,7 @@ pub fn install_steps(spec: &InstallSpec<'_>) -> Vec<Step> {
         Step::Register {
             binary: l.binary.clone(),
             config: l.config.clone(),
-            dir: l.dir.clone(),
+            dir: l.data.clone(),
             name: l.name.clone(),
             labels: spec.labels.clone(),
             instance_url: spec.instance_url.clone(),
@@ -422,21 +492,28 @@ pub fn install_steps(spec: &InstallSpec<'_>) -> Vec<Step> {
             path: l.runner_file.clone(),
             mode: 0o600,
         },
-        Step::WriteFile {
+        Step::RecordState {
             path: l.state_file(),
-            contents: RunnerState {
+            state: RunnerState {
                 scope: spec.scope.label(),
                 version: spec.artifact.version.clone(),
-            }
-            .to_json(),
-            mode: 0o600,
-            what: "orca runner state (scope, version)".to_string(),
+                runner_id: None,
+            },
+            runner_file: Some(l.runner_file.clone()),
         },
     ]);
     if let Some(user) = &l.user {
-        steps.push(Step::ChownTree {
+        steps.push(Step::Chown {
+            path: l.data.clone(),
+            user: Some(user.clone()),
+            group: user.clone(),
+            recursive: true,
+        });
+        steps.push(Step::Chown {
             path: l.dir.clone(),
-            user: user.clone(),
+            user: None,
+            group: user.clone(),
+            recursive: false,
         });
     }
     steps.push(Step::WriteFile {
@@ -504,6 +581,13 @@ pub fn uninstall_steps(
             path: layout.dir.clone(),
             recursive: true,
         });
+        steps.push(Step::Remove {
+            path: layout.state_file(),
+            recursive: false,
+        });
+        if let Some(user) = &layout.user {
+            steps.extend(user_removal_steps(layout.init, user));
+        }
     }
     steps
 }
@@ -530,15 +614,13 @@ pub fn upgrade_steps(
         dest: layout.binary.clone(),
     });
     if let Some(st) = recorded {
-        steps.push(Step::WriteFile {
+        steps.push(Step::RecordState {
             path: layout.state_file(),
-            contents: RunnerState {
-                scope: st.scope.clone(),
+            state: RunnerState {
                 version: artifact.version.clone(),
-            }
-            .to_json(),
-            mode: 0o600,
-            what: "orca runner state (scope, version)".to_string(),
+                ..st.clone()
+            },
+            runner_file: None,
         });
     }
     let op = if state == ServiceState::Running {
@@ -651,7 +733,8 @@ pub fn touched_paths(steps: &[Step]) -> Vec<&Path> {
             | Step::WriteFile { path, .. }
             | Step::Remove { path, .. }
             | Step::Chmod { path, .. }
-            | Step::ChownTree { path, .. } => Some(path.as_path()),
+            | Step::Chown { path, .. }
+            | Step::RecordState { path, .. } => Some(path.as_path()),
             Step::InstallBinary { dest, .. } => Some(dest.as_path()),
             _ => None,
         })
@@ -754,35 +837,37 @@ mod tests {
         let l = layout(Init::Launchd);
         let steps = install_steps(&spec(&l, vec![]));
         let a = actions(&steps);
-        assert_eq!(a.len(), 8, "{a:?}");
-        assert!(a[0].starts_with("create-dir "));
+        assert_eq!(a.len(), 9, "{a:?}");
         assert!(matches!(steps[0], Step::CreateDir { mode: 0o700, .. }));
-        assert!(a[1].starts_with("install-binary ") && a[1].ends_with("/r1/act_runner"));
-        assert!(a[2].starts_with("write ") && a[2].ends_with("config.yaml"));
-        assert_eq!(a[3], "register gitea runner r1");
-        assert!(a[4].starts_with("chmod ") && a[4].ends_with("/r1/.runner"));
-        assert!(matches!(steps[4], Step::Chmod { mode: 0o600, .. }));
-        assert!(a[5].ends_with("orca-runner.json"));
-        assert!(a[6].ends_with("com.argyle.gitea-runner.r1.plist"));
+        assert!(a[1].starts_with("create-dir ") && a[1].ends_with("/r1/data"));
+        assert!(a[2].starts_with("install-binary ") && a[2].ends_with("/r1/act_runner"));
+        assert!(a[3].starts_with("write ") && a[3].ends_with("config.yaml"));
+        assert_eq!(a[4], "register gitea runner r1");
+        assert!(a[5].starts_with("chmod ") && a[5].ends_with("/r1/data/.runner"));
+        assert!(matches!(steps[5], Step::Chmod { mode: 0o600, .. }));
+        assert!(a[6].starts_with("record "));
+        assert!(a[7].ends_with("com.argyle.gitea-runner.r1.plist"));
         assert_eq!(
-            a[7],
+            a[8],
             "run launchctl bootstrap gui/501 /Users/op/Library/LaunchAgents/com.argyle.gitea-runner.r1.plist"
         );
-        let register = steps[3].to_change().detail.unwrap();
+        let register = steps[4].to_change().detail.unwrap();
         assert!(
             register.contains("GITEA_RUNNER_REGISTRATION_TOKEN"),
             "{register}"
         );
-        match &steps[5] {
-            Step::WriteFile { contents, mode, .. } => {
-                assert_eq!(*mode, 0o600);
-                assert_eq!(
-                    plugin_toolkit::serde_json::from_str::<RunnerState>(contents).unwrap(),
-                    RunnerState {
-                        scope: "instance".into(),
-                        version: "4.1.0".into()
-                    }
+        match &steps[6] {
+            Step::RecordState {
+                path,
+                state,
+                runner_file,
+            } => {
+                assert!(
+                    !path.starts_with(&l.dir),
+                    "state must live outside the runner dir"
                 );
+                assert_eq!(state.scope, "instance");
+                assert_eq!(runner_file.as_deref(), Some(l.runner_file.as_path()));
             }
             other => panic!("unexpected {other:?}"),
         }
@@ -791,7 +876,7 @@ mod tests {
     #[test]
     fn install_plan_shows_source_url_and_host() {
         let l = layout(Init::Launchd);
-        let detail = install_steps(&spec(&l, vec![]))[1]
+        let detail = install_steps(&spec(&l, vec![]))[2]
             .to_change()
             .detail
             .unwrap();
@@ -804,29 +889,102 @@ mod tests {
         );
     }
 
+    /// The runner account may own only `data/`; everything that steers an
+    /// admin action or gets executed stays root-owned.
     #[test]
-    fn linux_install_creates_the_user_and_hands_it_the_dir() {
+    fn linux_install_ownership_per_path() {
         let l = layout(Init::Systemd);
-        let users = user_steps(Init::Systemd, "gitea-runner", &l.dir, true);
-        let steps = install_steps(&spec(&l, users));
-        let a = actions(&steps);
-        assert!(a[0].starts_with("run useradd --system"), "{a:?}");
-        assert_eq!(a[1], "run usermod -aG docker gitea-runner");
-        let chown = a.iter().position(|x| x.starts_with("chown ")).unwrap();
-        let unit = a
+        let acct = l.user.clone().unwrap();
+        assert_eq!(acct, "gitea-runner-r1");
+        let steps = install_steps(&spec(&l, vec![]));
+        let chowns: Vec<(&Path, Option<&str>, &str, bool)> = steps
             .iter()
-            .position(|x| x.ends_with(".service") && x.starts_with("write"))
-            .unwrap();
-        assert!(chown < unit);
-        assert_eq!(a[a.len() - 2], "run systemctl daemon-reload");
+            .filter_map(|s| match s {
+                Step::Chown {
+                    path,
+                    user,
+                    group,
+                    recursive,
+                } => Some((path.as_path(), user.as_deref(), group.as_str(), *recursive)),
+                _ => None,
+            })
+            .collect();
         assert_eq!(
-            a[a.len() - 1],
-            "run systemctl enable --now gitea-runner-r1.service"
+            chowns,
+            vec![
+                (l.data.as_path(), Some(acct.as_str()), acct.as_str(), true),
+                (l.dir.as_path(), None, acct.as_str(), false),
+            ]
         );
-        let alpine = actions(&user_steps(Init::Openrc, "gitea-runner", &l.dir, false));
-        assert_eq!(alpine[0], "run addgroup -S gitea-runner");
+        for root_owned in [&l.binary, &l.config, &l.unit_path, &l.state_file()] {
+            assert!(
+                !chowns.iter().any(|(p, u, _, rec)| u.is_some()
+                    && (*p == root_owned.as_path() || (*rec && root_owned.starts_with(p)))),
+                "{} would be owned by the runner",
+                root_owned.display()
+            );
+        }
+        for runner_owned in [
+            &l.runner_file,
+            &l.log,
+            &l.data.join("work"),
+            &l.data.join("cache"),
+        ] {
+            assert!(
+                runner_owned.starts_with(&l.data),
+                "{}",
+                runner_owned.display()
+            );
+        }
+        assert!(matches!(steps[0], Step::CreateDir { mode: 0o750, .. }));
+    }
+
+    #[test]
+    fn linux_account_creation_steps() {
+        let l = layout(Init::Systemd);
+        let fresh = actions(&user_steps(
+            Init::Systemd,
+            "gitea-runner-r1",
+            &l.data,
+            true,
+            false,
+        ));
+        assert!(
+            fresh[0].starts_with("run useradd --system --user-group "),
+            "{fresh:?}"
+        );
+        assert_eq!(fresh[1], "run usermod -aG docker gitea-runner-r1");
+        let regroup = actions(&user_steps(
+            Init::Systemd,
+            "gitea-runner-r1",
+            &l.data,
+            false,
+            true,
+        ));
+        assert!(
+            regroup[0].starts_with("run useradd --system --gid gitea-runner-r1 "),
+            "{regroup:?}"
+        );
+
+        let alpine = actions(&user_steps(
+            Init::Openrc,
+            "gitea-runner-r1",
+            &l.data,
+            false,
+            false,
+        ));
+        assert_eq!(alpine[0], "run addgroup -S gitea-runner-r1");
         assert!(alpine[1].starts_with("run adduser -S -D -H"));
-        assert!(user_steps(Init::Launchd, "x", &l.dir, true).is_empty());
+        let alpine_group_left = actions(&user_steps(
+            Init::Openrc,
+            "gitea-runner-r1",
+            &l.data,
+            false,
+            true,
+        ));
+        assert_eq!(alpine_group_left.len(), 1, "{alpine_group_left:?}");
+        assert!(alpine_group_left[0].starts_with("run adduser "));
+        assert!(user_steps(Init::Launchd, "x", &l.data, true, false).is_empty());
     }
 
     #[test]
@@ -887,6 +1045,9 @@ mod tests {
                 "remove-file /etc/init.d/gitea-runner-r1",
                 "deregister gitea runner id 7",
                 "remove-dir /var/lib/gitea-runner/r1",
+                "remove-file /var/lib/gitea-runner/.orca/r1.json",
+                "run deluser gitea-runner-r1",
+                "run delgroup gitea-runner-r1",
             ]
         );
         assert!(matches!(
@@ -918,6 +1079,7 @@ mod tests {
         let st = RunnerState {
             scope: "instance".into(),
             version: "3.1.0".into(),
+            runner_id: Some(7),
         };
         let a = actions(&upgrade_steps(
             &l,
@@ -929,7 +1091,7 @@ mod tests {
         ));
         assert_eq!(a.len(), 3, "{a:?}");
         assert!(a[0].starts_with("install-binary"));
-        assert!(a[1].ends_with("orca-runner.json"));
+        assert_eq!(a[1], "record orca runner state");
         assert_eq!(a[2], "run systemctl restart gitea-runner-r1.service");
     }
 

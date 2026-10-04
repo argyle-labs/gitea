@@ -111,6 +111,7 @@ impl LocalHost {
                 .flatten()
                 .filter(|e| e.path().is_dir())
                 .filter_map(|e| e.file_name().to_str().map(str::to_string))
+                .filter(|n| !n.starts_with('.'))
                 .collect();
             names.sort();
             found.extend(
@@ -185,6 +186,10 @@ impl LocalHost {
 
     pub async fn inspect(&self, layout: &Layout) -> LocalInstall {
         let reg = read_registration(&layout.runner_file);
+        let state = layout
+            .managed
+            .then(|| RunnerState::read(&layout.state_file()))
+            .flatten();
         let config = std::fs::read_to_string(&layout.config).ok();
         let (service_state, loaded_spawn_type) = self.service_state(layout).await;
         let process_type = (layout.init == Init::Launchd)
@@ -200,10 +205,14 @@ impl LocalHost {
             binary: layout.binary.display().to_string(),
             service: layout.service.clone(),
             unit_path: layout.unit_path.display().to_string(),
-            version: RunnerState::read(&layout.state_file()).map(|st| st.version),
+            version: state.as_ref().map(|st| st.version.clone()),
             mode: mode_from_labels(&labels),
             capacity: config.as_deref().and_then(config_capacity),
-            registered_id: reg.as_ref().map(|r| r.id),
+            registered_id: if layout.managed {
+                state.as_ref().and_then(|st| st.runner_id)
+            } else {
+                reg.as_ref().map(|r| r.id)
+            },
             address: reg.as_ref().map(|r| r.address.clone()),
             labels,
             service_state,
@@ -290,9 +299,46 @@ pub fn passwd_ids(passwd: &str, user: &str) -> Option<(u32, u32)> {
     })
 }
 
-/// `(uid, gid)` of a local account, read from `/etc/passwd` (no subprocess).
-pub fn lookup_user(user: &str) -> Option<(u32, u32)> {
-    passwd_ids(&std::fs::read_to_string("/etc/passwd").ok()?, user)
+/// gid of `group` from group-format text (`name:pw:gid:members`).
+pub fn group_id(group_db: &str, group: &str) -> Option<u32> {
+    group_db.lines().find_map(|line| {
+        let mut f = line.split(':');
+        if f.next()? != group {
+            return None;
+        }
+        let _password = f.next()?;
+        f.next()?.parse().ok()
+    })
+}
+
+/// One `getent <db> <key>` lookup through NSS, so LDAP/sssd accounts count.
+/// `Err` only when `getent` itself is unavailable; a miss is `Ok(None)`.
+async fn getent(db: &str, key: &str) -> std::result::Result<Option<String>, ()> {
+    let out = Command::new("getent")
+        .args([db, key])
+        .output()
+        .await
+        .map_err(|_| ())?;
+    Ok(out
+        .status
+        .success
+        .then(|| String::from_utf8_lossy(&out.stdout).into_owned()))
+}
+
+/// `(uid, gid)` of an account, via NSS; `/etc/passwd` only without `getent`.
+pub async fn lookup_user(user: &str) -> Option<(u32, u32)> {
+    match getent("passwd", user).await {
+        Ok(line) => passwd_ids(&line?, user),
+        Err(()) => passwd_ids(&std::fs::read_to_string("/etc/passwd").ok()?, user),
+    }
+}
+
+/// gid of a group, via NSS; `/etc/group` only without `getent`.
+pub async fn lookup_group(group: &str) -> Option<u32> {
+    match getent("group", group).await {
+        Ok(line) => group_id(&line?, group),
+        Err(()) => group_id(&std::fs::read_to_string("/etc/group").ok()?, group),
+    }
 }
 
 /// Effective uid (second field) of `/proc/self/status`'s `Uid:` line.
@@ -467,6 +513,13 @@ mod tests {
         assert_eq!(reg.name, "mint");
         assert!(!format!("{reg:?}").contains("SECRET"));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn group_lookup() {
+        let gr = "wheel:x:10:root\ngitea-runner-r1:x:103:\n";
+        assert_eq!(group_id(gr, "gitea-runner-r1"), Some(103));
+        assert_eq!(group_id(gr, "docker"), None);
     }
 
     #[test]

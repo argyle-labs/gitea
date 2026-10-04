@@ -169,8 +169,13 @@ identified admin caller (a call with no caller identity is refused).
 
 Service units: launchd agents set `ProcessType=Interactive` (otherwise macOS
 schedules the runner at background priority), `KeepAlive` and `RunAtLoad`.
-On Linux the runner runs as the unprivileged `gitea-runner` account (created
-by the plan if missing; docker mode adds it to the `docker` group). systemd
+On Linux each runner runs as its own unprivileged account,
+`gitea-runner-<name>` (created by the plan if missing; docker mode adds it to
+the `docker` group so the runner process can start containers). The account
+owns only the install's `data/` (registration, log, cache, job work); the
+binary, `config.yaml` and the unit stay root-owned, and the plugin's state
+record lives outside the install in `/var/lib/gitea-runner/.orca/`. Job
+containers never get the Docker socket (`docker_host: "-"`). systemd
 units use `Restart=always` with no start limit; docker-mode units wait for the
 Docker socket to answer. OpenRC scripts run under `supervise-daemon`. Any
 host-executor label pins capacity to 1, and host labels on a runner that would

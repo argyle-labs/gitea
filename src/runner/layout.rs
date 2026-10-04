@@ -61,8 +61,13 @@ impl std::str::FromStr for Mode {
 pub struct Layout {
     pub name: String,
     pub init: Init,
-    /// Working directory: config, registration file, logs, cache, job work.
+    /// Install directory. For a managed Linux install it is root-owned and
+    /// only group-readable by the runner, so a job cannot replace the binary
+    /// or config.
     pub dir: PathBuf,
+    /// The only tree the runner account may write: registration, its lock,
+    /// log, cache and job work.
+    pub data: PathBuf,
     pub binary: PathBuf,
     pub config: PathBuf,
     /// act_runner's registration file. Holds the runner's secret token.
@@ -81,8 +86,11 @@ pub struct Layout {
 }
 
 const LAUNCHD_LABEL_PREFIX: &str = "com.argyle.gitea-runner.";
-/// Account managed Linux runners run as, so a job never runs as root.
-pub const RUNNER_USER: &str = "gitea-runner";
+/// Prefix of the per-runner account managed Linux runners run as. One
+/// account per runner, so runners cannot read each other's registration.
+pub const RUNNER_USER_PREFIX: &str = "gitea-runner-";
+/// Longest account name `useradd`/busybox `adduser` accept.
+const MAX_ACCOUNT_LEN: usize = 32;
 const LINUX_ROOT: &str = "/var/lib/gitea-runner";
 
 /// Root under which managed installs live. The launchd root avoids
@@ -93,6 +101,19 @@ pub fn managed_root(init: Init, home: &Path) -> PathBuf {
         Init::Launchd => home.join(".local/share/orca/gitea-runner"),
         Init::Systemd | Init::Openrc => PathBuf::from(LINUX_ROOT),
     }
+}
+
+/// The service account for runner `name` on Linux.
+pub fn account_for(name: &str) -> Result<String> {
+    let account = format!("{RUNNER_USER_PREFIX}{name}").to_ascii_lowercase();
+    if account.len() > MAX_ACCOUNT_LEN || account.contains('.') {
+        bail!(
+            "runner name '{name}' gives account '{account}'; Linux accounts need at most {MAX_ACCOUNT_LEN} \
+             characters and no '.', so use a name of at most {} characters without '.'",
+            MAX_ACCOUNT_LEN - RUNNER_USER_PREFIX.len()
+        );
+    }
+    Ok(account)
 }
 
 /// Runner names become path segments and service names.
@@ -130,24 +151,33 @@ impl Layout {
                 (svc, path)
             }
         };
+        let data = dir.join("data");
         Layout {
             name: name.to_string(),
             init,
             binary: dir.join("act_runner"),
             config: dir.join("config.yaml"),
-            runner_file: dir.join(".runner"),
-            log: dir.join("runner.log"),
+            runner_file: data.join(".runner"),
+            log: data.join("runner.log"),
+            data,
             dir,
             service,
             unit_path,
             managed: true,
-            user: (init != Init::Launchd).then(|| RUNNER_USER.to_string()),
+            user: (init != Init::Launchd)
+                .then(|| format!("{RUNNER_USER_PREFIX}{name}").to_ascii_lowercase()),
         }
     }
 
-    /// Plugin-owned record of how the runner was installed (scope, version).
+    /// Plugin-owned record of the install (scope, version, Gitea runner id).
+    /// Kept outside the runner's directory so nothing the runner account can
+    /// write feeds a later admin action such as deregistration.
     pub fn state_file(&self) -> PathBuf {
-        self.dir.join("orca-runner.json")
+        self.dir
+            .parent()
+            .unwrap_or(&self.dir)
+            .join(".orca")
+            .join(format!("{}.json", self.name))
     }
 
     /// Hand-placed installs that predate this plugin, at the paths the fleet
@@ -164,6 +194,7 @@ impl Layout {
                     config: dir.join("config.yaml"),
                     runner_file: dir.join(".runner"),
                     log: dir.join("runner.err.log"),
+                    data: dir.clone(),
                     dir,
                     service: "com.argyle.gitea-act-runner".to_string(),
                     unit_path: home.join("Library/LaunchAgents/com.argyle.gitea-act-runner.plist"),
@@ -180,6 +211,7 @@ impl Layout {
                     config: dir.join("config.yaml"),
                     runner_file: dir.join(".runner"),
                     log: PathBuf::from("/var/log/act_runner.log"),
+                    data: dir.clone(),
                     dir,
                     service: "act_runner".to_string(),
                     unit_path: PathBuf::from("/etc/init.d/act_runner"),
@@ -240,16 +272,28 @@ mod tests {
         );
 
         assert_eq!(l.user, None);
-        assert_eq!(s.user.as_deref(), Some(RUNNER_USER));
+        assert_eq!(s.user.as_deref(), Some("gitea-runner-baldur"));
         assert_eq!(
             s.state_file(),
-            PathBuf::from("/var/lib/gitea-runner/baldur/orca-runner.json")
+            PathBuf::from("/var/lib/gitea-runner/.orca/baldur.json")
         );
+        assert_eq!(
+            s.runner_file,
+            PathBuf::from("/var/lib/gitea-runner/baldur/data/.runner")
+        );
+        assert!(!s.state_file().starts_with(&s.dir));
 
         let o = Layout::managed(Init::Openrc, "freyr", home);
         assert_eq!(o.service, "gitea-runner-freyr");
         assert_eq!(o.unit_path, PathBuf::from("/etc/init.d/gitea-runner-freyr"));
         assert!(o.managed);
+    }
+
+    #[test]
+    fn one_account_per_runner_within_the_length_limit() {
+        assert_eq!(account_for("baldur").unwrap(), "gitea-runner-baldur");
+        assert!(account_for("a-name-that-is-far-too-long").is_err());
+        assert!(account_for("v1.2").is_err());
     }
 
     #[test]

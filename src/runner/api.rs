@@ -22,7 +22,7 @@ fn status_error(what: &str, status: u16, body: &str) -> anyhow::Error {
 
 /// Every instance-level runner.
 pub async fn list_runners(cfg: &Config) -> Result<Vec<GiteaRunnerView>> {
-    let client = cfg.build_generated_client()?;
+    let client = verified_generated_client(cfg)?;
     let resp = client
         .get_admin_runners(None)
         .await
@@ -52,7 +52,7 @@ pub async fn list_runners(cfg: &Config) -> Result<Vec<GiteaRunnerView>> {
 /// Jobs Gitea is holding for a runner, newest first, with how long each has
 /// waited.
 pub async fn waiting_jobs(cfg: &Config) -> Result<Vec<WaitingJob>> {
-    let client = cfg.build_generated_client()?;
+    let client = verified_generated_client(cfg)?;
     let resp = client
         .list_admin_workflow_jobs(Some(50), None, None, None, Some("waiting"))
         .await
@@ -80,10 +80,15 @@ fn api_url(cfg: &Config, path: &str) -> String {
     format!("{}{path}", cfg.base_url.trim_end_matches('/'))
 }
 
-/// Calls that move runner credentials always verify TLS, whatever the
-/// endpoint's `insecure` flag says for ordinary API use.
+/// Every runner-administration call carries an admin token, so it always
+/// verifies TLS, whatever the endpoint's `insecure` flag says for ordinary
+/// API use.
 fn verified_client(cfg: &Config) -> Result<plugin_toolkit::reqwest::Client> {
     Ok(cfg.clone().insecure(false).build_reqwest_client()?)
+}
+
+fn verified_generated_client(cfg: &Config) -> Result<crate::generated::Client> {
+    Ok(cfg.clone().insecure(false).build_generated_client()?)
 }
 
 #[derive(Deserialize)]

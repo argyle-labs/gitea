@@ -21,7 +21,7 @@ use super::health::{
     self, DEFAULT_STALL_AFTER_SECS, Finding, GiteaRunnerView, GiteaSide, HealthStatus,
     LaunchdPriority, Observation, WaitingJob, mode_from_labels,
 };
-use super::host::{LocalHost, LocalInstall, lookup_user, read_registration};
+use super::host::{LocalHost, LocalInstall, lookup_group, lookup_user};
 use super::layout::{self, Init, Layout, Mode};
 use super::plan::{self, Rerender, RunnerState, Scope, Step};
 use super::release::{self, DEFAULT_VERSION, Source};
@@ -548,6 +548,9 @@ pub async fn gitea_runner_install(args: RunnerInstallArgs, ctx: &ToolCtx) -> Res
     if mode == Mode::Docker && host.init == Init::Launchd {
         bail!("docker labels are not supported for launchd (macOS) runners; use host labels");
     }
+    if host.init != Init::Launchd {
+        layout::account_for(&args.name)?;
+    }
     let l = Layout::managed(host.init, &args.name, &host.home);
     let runs_as_root = l.user.is_none() && host.is_root();
     check_host_as_root(mode, runs_as_root, args.force_host_as_root)?;
@@ -581,11 +584,12 @@ pub async fn gitea_runner_install(args: RunnerInstallArgs, ctx: &ToolCtx) -> Res
     });
     let unit = render::render_service(&l, mode, &host.home, &path_env);
     let create_user = match &l.user {
-        Some(u) if lookup_user(u).is_none() => plan::user_steps(
+        Some(u) if lookup_user(u).await.is_none() => plan::user_steps(
             host.init,
             u,
-            &layout::managed_root(host.init, &host.home),
+            &l.data,
             mode == Mode::Docker,
+            lookup_group(u).await.is_some(),
         ),
         _ => Vec::new(),
     };
@@ -695,7 +699,9 @@ pub async fn gitea_runner_uninstall(
         args.scope.as_deref(),
     )?;
     let (state, _) = host.service_state(&l).await;
-    let runner_id = read_registration(&l.runner_file).map(|r| r.id);
+    // Only the root-owned record is trusted: `.runner` is writable by the
+    // runner account, so a job could aim deregistration at another runner.
+    let runner_id = recorded.as_ref().and_then(|r| r.runner_id);
     let cfg = gitea_config(&args.endpoint).await?;
     let steps = plan::uninstall_steps(
         &l,
@@ -708,7 +714,10 @@ pub async fn gitea_runner_uninstall(
     );
     let mut notes = Vec::new();
     if runner_id.is_none() {
-        notes.push("no local registration file; nothing to deregister in Gitea".to_string());
+        notes.push(
+            "no recorded Gitea runner id; nothing is deregistered — delete it in Gitea if it exists"
+                .to_string(),
+        );
     }
     let exec = Executor {
         host: &host,

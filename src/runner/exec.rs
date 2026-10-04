@@ -83,13 +83,12 @@ fn create_dir_mode(path: &Path, mode: u32) -> Result<()> {
         .with_context(|| format!("chmod {}", path.display()))
 }
 
-fn chown_tree(path: &Path, uid: u32, gid: u32) -> Result<()> {
-    std::os::unix::fs::lchown(path, Some(uid), Some(gid))
+fn chown(path: &Path, uid: Option<u32>, gid: u32, recursive: bool) -> Result<()> {
+    std::os::unix::fs::lchown(path, uid, Some(gid))
         .with_context(|| format!("chown {}", path.display()))?;
-    let meta = std::fs::symlink_metadata(path)?;
-    if meta.is_dir() {
+    if recursive && std::fs::symlink_metadata(path)?.is_dir() {
         for entry in std::fs::read_dir(path)? {
-            chown_tree(&entry?.path(), uid, gid)?;
+            chown(&entry?.path(), uid, gid, true)?;
         }
     }
     Ok(())
@@ -101,6 +100,30 @@ fn scrub(text: &str, secret: &str) -> String {
     } else {
         text.replace(secret, "<redacted>")
     }
+}
+
+/// `act_runner register` argv. Takes no token: it travels only in
+/// `GITEA_RUNNER_REGISTRATION_TOKEN`, so it is never visible in `ps`.
+fn register_argv(
+    binary: &Path,
+    instance_url: &str,
+    name: &str,
+    labels: &[String],
+    config: &Path,
+) -> Vec<String> {
+    vec![
+        binary.display().to_string(),
+        "register".into(),
+        "--no-interactive".into(),
+        "--instance".into(),
+        instance_url.to_string(),
+        "--name".into(),
+        name.to_string(),
+        "--labels".into(),
+        labels.join(","),
+        "--config".into(),
+        config.display().to_string(),
+    ]
 }
 
 /// A 404 proves the runner is gone only under the scope it was registered
@@ -159,11 +182,44 @@ impl Executor<'_> {
                     .with_context(|| format!("chmod {}", path.display()))?;
                 Ok(None)
             }
-            Step::ChownTree { path, user } => {
-                let (uid, gid) = host::lookup_user(user)
-                    .ok_or_else(|| anyhow!("user '{user}' does not exist"))?;
-                chown_tree(path, uid, gid)?;
+            Step::Chown {
+                path,
+                user,
+                group,
+                recursive,
+            } => {
+                let gid = host::lookup_group(group)
+                    .await
+                    .ok_or_else(|| anyhow!("group '{group}' does not exist"))?;
+                let uid = match user {
+                    Some(u) => Some(
+                        host::lookup_user(u)
+                            .await
+                            .ok_or_else(|| anyhow!("user '{u}' does not exist"))?
+                            .0,
+                    ),
+                    None => None,
+                };
+                chown(path, uid, gid, *recursive)?;
                 Ok(None)
+            }
+            Step::RecordState {
+                path,
+                state,
+                runner_file,
+            } => {
+                let mut state = state.clone();
+                if let Some(rf) = runner_file {
+                    state.runner_id = Some(
+                        host::read_registration(rf)
+                            .ok_or_else(|| {
+                                anyhow!("no registration at {} after register", rf.display())
+                            })?
+                            .id,
+                    );
+                }
+                write_atomic(path, state.to_json().as_bytes(), 0o600)?;
+                Ok(state.runner_id.map(|id| format!("gitea runner id {id}")))
             }
             Step::WriteFile {
                 path,
@@ -184,20 +240,7 @@ impl Executor<'_> {
                 scope,
             } => {
                 let token = api::registration_token(self.gitea()?, scope).await?;
-                let argv: Vec<String> = [
-                    binary.display().to_string(),
-                    "register".into(),
-                    "--no-interactive".into(),
-                    "--instance".into(),
-                    instance_url.clone(),
-                    "--name".into(),
-                    name.clone(),
-                    "--labels".into(),
-                    labels.join(","),
-                    "--config".into(),
-                    config.display().to_string(),
-                ]
-                .into();
+                let argv = register_argv(binary, instance_url, name, labels, config);
                 let out = self
                     .host
                     .run_with_env(
@@ -367,6 +410,21 @@ mod tests {
         );
         let err = deregister_outcome(false, false, &Scope::Org("x".into()), 1).unwrap_err();
         assert!(err.to_string().contains("not recorded"), "{err}");
+    }
+
+    #[test]
+    fn register_argv_never_carries_the_token() {
+        let token = "s3cr3t-registration-token";
+        let argv = register_argv(
+            Path::new("/r/act_runner"),
+            "https://gitea.test",
+            "r1",
+            &["macos:host".to_string()],
+            Path::new("/r/config.yaml"),
+        );
+        assert!(argv.iter().all(|a| !a.contains(token)));
+        assert!(!argv.iter().any(|a| a.starts_with("--token")));
+        assert_eq!(argv[1], "register");
     }
 
     #[test]

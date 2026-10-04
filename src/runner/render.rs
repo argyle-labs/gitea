@@ -137,15 +137,18 @@ pub fn render_config(cfg: &RunnerConfig<'_>) -> String {
         out.push_str(&format!("    - {}\n", yaml_str(label)));
     }
     out.push_str("cache:\n  enabled: true\n");
-    out.push_str(&format!("  dir: {}\n", yaml_path(&l.dir.join("cache"))));
+    out.push_str(&format!("  dir: {}\n", yaml_path(&l.data.join("cache"))));
     out.push_str("container:\n");
     out.push_str("  network: \"\"\n");
     out.push_str("  privileged: false\n");
-    out.push_str("  docker_host: \"\"\n");
+    // "-": the runner finds the Docker host for itself but does NOT mount its
+    // socket into job containers. Empty would mount it, handing every job
+    // root on the host.
+    out.push_str("  docker_host: \"-\"\n");
     out.push_str("host:\n");
     out.push_str(&format!(
         "  workdir_parent: {}\n",
-        yaml_path(&l.dir.join("work"))
+        yaml_path(&l.data.join("work"))
     ));
     if cfg.mode == Mode::Host {
         out.push_str("# host executor: jobs share the work tree above, so capacity stays 1.\n");
@@ -385,11 +388,29 @@ mod tests {
         });
         assert!(yaml.contains("  capacity: 1\n"));
         assert!(yaml.contains("    - \"macos:host\"\n"));
-        assert!(yaml.contains("  file: \"/Users/op/.local/share/orca/gitea-runner/r1/.runner\"\n"));
         assert!(
-            yaml.contains("workdir_parent: \"/Users/op/.local/share/orca/gitea-runner/r1/work\"")
+            yaml.contains("  file: \"/Users/op/.local/share/orca/gitea-runner/r1/data/.runner\"\n")
+        );
+        assert!(
+            yaml.contains(
+                "workdir_parent: \"/Users/op/.local/share/orca/gitea-runner/r1/data/work\""
+            )
         );
         assert_eq!(config_capacity(&yaml), Some(1));
+    }
+
+    #[test]
+    fn config_never_mounts_the_docker_socket_into_jobs() {
+        let l = layout(Init::Systemd);
+        let yaml = render_config(&RunnerConfig {
+            layout: &l,
+            mode: Mode::Docker,
+            capacity: 2,
+            labels: &["ubuntu-latest:docker://node:20".to_string()],
+        });
+        assert!(yaml.contains("  docker_host: \"-\"\n"), "{yaml}");
+        assert!(!yaml.contains("docker_host: \"\""));
+        assert!(!yaml.contains("privileged: true"));
     }
 
     #[test]
@@ -461,7 +482,7 @@ mod tests {
         assert!(unit.contains("docker info"));
         assert!(unit.contains("Restart=always\n"));
         assert!(unit.contains("StartLimitIntervalSec=0\n"));
-        assert!(unit.contains("User=gitea-runner\nGroup=gitea-runner\n"));
+        assert!(unit.contains("User=gitea-runner-r1\nGroup=gitea-runner-r1\n"));
         assert!(unit.contains(
             "ExecStart=/var/lib/gitea-runner/r1/act_runner daemon --config /var/lib/gitea-runner/r1/config.yaml\n"
         ));
@@ -481,7 +502,7 @@ mod tests {
         assert!(script.starts_with("#!/sbin/openrc-run\n"));
         assert!(script.contains("supervisor=\"supervise-daemon\"\n"));
         assert!(script.contains("respawn_max=0\n"));
-        assert!(script.contains("command_user=\"gitea-runner:gitea-runner\"\n"));
+        assert!(script.contains("command_user=\"gitea-runner-r1:gitea-runner-r1\"\n"));
         assert!(script.contains("\tneed docker\n"));
         assert!(script.contains("start_pre() {"));
         assert!(script.contains("docker info >/dev/null 2>&1 && return 0"));
