@@ -76,6 +76,21 @@ pub fn default_labels(mode: Mode, release_target: &str) -> Vec<String> {
     }
 }
 
+/// Refuse label specs that could break out of the comma-joined `--labels`
+/// list or the quoted YAML they are written into.
+pub fn validate_labels(labels: &[String]) -> anyhow::Result<()> {
+    for l in labels {
+        let ok = !l.is_empty()
+            && l.len() <= 255
+            && l.chars()
+                .all(|c| c.is_ascii_alphanumeric() || "._-:/@+".contains(c));
+        if !ok {
+            anyhow::bail!("invalid runner label '{l}': use [A-Za-z0-9._-:/@+]");
+        }
+    }
+    Ok(())
+}
+
 /// The label names (`runs-on` keys) from act_runner label specs.
 pub fn label_names(labels: &[String]) -> Vec<String> {
     labels
@@ -226,6 +241,9 @@ pub fn render_systemd_unit(layout: &Layout, mode: Mode) -> String {
         unit.push_str("After=network-online.target\n");
     }
     unit.push_str("StartLimitIntervalSec=0\n\n[Service]\nType=simple\n");
+    if let Some(user) = &layout.user {
+        unit.push_str(&format!("User={user}\nGroup={user}\n"));
+    }
     unit.push_str(&format!("WorkingDirectory={}\n", layout.dir.display()));
     if mode == Mode::Docker {
         // `$$` is systemd's escape for a literal `$`.
@@ -243,8 +261,8 @@ pub fn render_systemd_unit(layout: &Layout, mode: Mode) -> String {
 }
 
 /// Render the OpenRC init script. `supervise-daemon` respawns a crashed
-/// runner; the plain `command_background` daemon the fleet used before left a
-/// crash `[ crashed ]` until someone noticed blocked CI.
+/// runner; a plain `command_background` daemon stays `[ crashed ]` until
+/// someone notices.
 pub fn render_openrc_script(layout: &Layout, mode: Mode) -> String {
     let mut s = String::new();
     s.push_str("#!/sbin/openrc-run\n# Managed by orca (gitea plugin).\n\n");
@@ -255,6 +273,9 @@ pub fn render_openrc_script(layout: &Layout, mode: Mode) -> String {
     ));
     s.push_str("supervisor=\"supervise-daemon\"\n");
     s.push_str(&format!("command=\"{}\"\n", layout.binary.display()));
+    if let Some(user) = &layout.user {
+        s.push_str(&format!("command_user=\"{user}:{user}\"\n"));
+    }
     s.push_str(&format!(
         "command_args=\"daemon --config {}\"\n",
         layout.config.display()
@@ -380,6 +401,20 @@ mod tests {
     }
 
     #[test]
+    fn labels_that_could_inject_are_refused() {
+        assert!(
+            validate_labels(&["ubuntu-latest:docker://gitea/runner-images:ubuntu-latest".into()])
+                .is_ok()
+        );
+        for bad in ["a,b", "a\nb", "a\"b", "a b", ""] {
+            assert!(
+                validate_labels(&[bad.to_string()]).is_err(),
+                "accepted {bad:?}"
+            );
+        }
+    }
+
+    #[test]
     fn yaml_strings_are_escaped() {
         assert_eq!(yaml_str(r#"a"b\c"#), r#""a\"b\\c""#);
     }
@@ -426,6 +461,7 @@ mod tests {
         assert!(unit.contains("docker info"));
         assert!(unit.contains("Restart=always\n"));
         assert!(unit.contains("StartLimitIntervalSec=0\n"));
+        assert!(unit.contains("User=gitea-runner\nGroup=gitea-runner\n"));
         assert!(unit.contains(
             "ExecStart=/var/lib/gitea-runner/r1/act_runner daemon --config /var/lib/gitea-runner/r1/config.yaml\n"
         ));
@@ -445,6 +481,7 @@ mod tests {
         assert!(script.starts_with("#!/sbin/openrc-run\n"));
         assert!(script.contains("supervisor=\"supervise-daemon\"\n"));
         assert!(script.contains("respawn_max=0\n"));
+        assert!(script.contains("command_user=\"gitea-runner:gitea-runner\"\n"));
         assert!(script.contains("\tneed docker\n"));
         assert!(script.contains("start_pre() {"));
         assert!(script.contains("docker info >/dev/null 2>&1 && return 0"));

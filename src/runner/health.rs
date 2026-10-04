@@ -290,17 +290,18 @@ pub fn classify(obs: &Observation, stall_after_secs: i64) -> (HealthStatus, Vec<
     (status, findings)
 }
 
-/// Infer the executor mode from act_runner label specs (`name:host` vs
-/// `name:docker://image`), for installs this plugin did not create.
+/// The executor mode act_runner will use for these label specs. Any label
+/// that runs on the host (`name:host`, or a bare `name`, which act_runner
+/// treats as host) puts jobs in the shared host work tree, so one such label
+/// makes the whole runner a host executor for capacity purposes.
 pub fn mode_from_labels(labels: &[String]) -> Option<Mode> {
-    let schemes: Vec<&str> = labels.iter().filter_map(|l| l.split(':').nth(1)).collect();
-    if schemes.is_empty() {
-        None
-    } else if schemes.iter().all(|s| *s == "host") {
-        Some(Mode::Host)
-    } else {
-        Some(Mode::Docker)
+    if labels.is_empty() {
+        return None;
     }
+    let host = labels
+        .iter()
+        .any(|l| matches!(l.split(':').nth(1), None | Some("host")));
+    Some(if host { Mode::Host } else { Mode::Docker })
 }
 
 #[cfg(test)]
@@ -466,6 +467,14 @@ mod tests {
             mode_from_labels(&["ubuntu-latest:docker://node:20".into()]),
             Some(Mode::Docker)
         );
-        assert_eq!(mode_from_labels(&["bare".into()]), None);
+        assert_eq!(mode_from_labels(&["bare".into()]), Some(Mode::Host));
+        assert_eq!(
+            mode_from_labels(&[
+                "ubuntu-latest:docker://node:20".into(),
+                "sneaky:host".into()
+            ]),
+            Some(Mode::Host)
+        );
+        assert_eq!(mode_from_labels(&[]), None);
     }
 }

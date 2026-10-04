@@ -13,6 +13,7 @@ use plugin_toolkit::process::Command;
 
 use super::health::{ServiceState, mode_from_labels};
 use super::layout::{Init, Layout, Mode, managed_root};
+use super::plan::RunnerState;
 use super::render::{config_capacity, plist_process_type};
 
 const CMD_TIMEOUT: Duration = Duration::from_secs(120);
@@ -63,8 +64,8 @@ impl LocalHost {
             .collect();
         (!outside.is_empty()).then(|| {
             format!(
-                "this plugin runs as uid {} and would need root to write {}; orca has no privileged \
-                 service-install seam for plugins yet (see the PR's orca-gap list)",
+                "this plugin runs as uid {} and would need root to write {}; orca offers plugins no \
+                 privileged service-install seam",
                 self.uid,
                 outside.join(", ")
             )
@@ -72,10 +73,22 @@ impl LocalHost {
     }
 
     pub async fn run(&self, argv: &[String], cwd: Option<&Path>) -> Result<CmdOut> {
+        self.run_with_env(argv, cwd, &[]).await
+    }
+
+    pub async fn run_with_env(
+        &self,
+        argv: &[String],
+        cwd: Option<&Path>,
+        env: &[(&str, &str)],
+    ) -> Result<CmdOut> {
         let (prog, args) = argv.split_first().ok_or_else(|| anyhow!("empty command"))?;
         let mut cmd = Command::new(prog).args(args);
         if let Some(dir) = cwd {
             cmd = cmd.current_dir(dir);
+        }
+        for (k, v) in env {
+            cmd = cmd.env(k, v);
         }
         let out = plugin_toolkit::time::timeout(CMD_TIMEOUT, cmd.output())
             .await
@@ -157,6 +170,8 @@ impl LocalHost {
         }
     }
 
+    /// Runs the binary. Only for execute-time checks: reads (list, health,
+    /// dry runs) never execute on-disk binaries.
     pub async fn binary_version(&self, binary: &Path) -> Option<String> {
         if !binary.exists() {
             return None;
@@ -185,7 +200,7 @@ impl LocalHost {
             binary: layout.binary.display().to_string(),
             service: layout.service.clone(),
             unit_path: layout.unit_path.display().to_string(),
-            version: self.binary_version(&layout.binary).await,
+            version: RunnerState::read(&layout.state_file()).map(|st| st.version),
             mode: mode_from_labels(&labels),
             capacity: config.as_deref().and_then(config_capacity),
             registered_id: reg.as_ref().map(|r| r.id),
@@ -211,6 +226,8 @@ pub struct LocalInstall {
     pub binary: String,
     pub service: String,
     pub unit_path: String,
+    /// From the plugin's state file; `None` for hand-placed installs, whose
+    /// version is not read by executing their binary.
     pub version: Option<String>,
     pub mode: Option<Mode>,
     pub capacity: Option<u32>,
@@ -259,6 +276,23 @@ fn effective_uid(home: &Path) -> Result<u32> {
     Ok(std::fs::metadata(home)
         .with_context(|| format!("stat {}", home.display()))?
         .uid())
+}
+
+/// `(uid, gid)` of `user` from passwd-format text.
+pub fn passwd_ids(passwd: &str, user: &str) -> Option<(u32, u32)> {
+    passwd.lines().find_map(|line| {
+        let mut f = line.split(':');
+        if f.next()? != user {
+            return None;
+        }
+        let _password = f.next()?;
+        Some((f.next()?.parse().ok()?, f.next()?.parse().ok()?))
+    })
+}
+
+/// `(uid, gid)` of a local account, read from `/etc/passwd` (no subprocess).
+pub fn lookup_user(user: &str) -> Option<(u32, u32)> {
+    passwd_ids(&std::fs::read_to_string("/etc/passwd").ok()?, user)
 }
 
 /// Effective uid (second field) of `/proc/self/status`'s `Uid:` line.
@@ -433,6 +467,13 @@ mod tests {
         assert_eq!(reg.name, "mint");
         assert!(!format!("{reg:?}").contains("SECRET"));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn passwd_lookup() {
+        let pw = "root:x:0:0:root:/root:/bin/sh\ngitea-runner:x:101:102::/var/lib/gitea-runner:/sbin/nologin\n";
+        assert_eq!(passwd_ids(pw, "gitea-runner"), Some((101, 102)));
+        assert_eq!(passwd_ids(pw, "gitea"), None);
     }
 
     #[test]

@@ -8,17 +8,15 @@ use super::health::{GiteaRunnerView, WaitingJob};
 use super::plan::Scope;
 use crate::Config;
 
-/// Turn a Gitea HTTP status into an actionable message. 401/403 are the common
-/// case: runner administration needs an admin-scoped token, and the fleet's
-/// default token has historically lacked it.
+/// Turn a Gitea HTTP status into an actionable message. 401/403 almost always
+/// mean the endpoint token lacks the admin scope runner administration needs.
 fn status_error(what: &str, status: u16, body: &str) -> anyhow::Error {
     let hint = match status {
         401 | 403 => " — the endpoint token needs admin scope (write:admin) to manage runners",
         404 => " — not found",
         _ => "",
     };
-    let body = body.trim();
-    let body = if body.len() > 300 { &body[..300] } else { body };
+    let body: String = body.trim().chars().take(300).collect();
     anyhow!("{what}: HTTP {status}{hint}: {body}")
 }
 
@@ -82,17 +80,24 @@ fn api_url(cfg: &Config, path: &str) -> String {
     format!("{}{path}", cfg.base_url.trim_end_matches('/'))
 }
 
+/// Calls that move runner credentials always verify TLS, whatever the
+/// endpoint's `insecure` flag says for ordinary API use.
+fn verified_client(cfg: &Config) -> Result<plugin_toolkit::reqwest::Client> {
+    Ok(cfg.clone().insecure(false).build_reqwest_client()?)
+}
+
 #[derive(Deserialize)]
 struct TokenBody {
     token: String,
 }
 
-/// Mint a runner registration token. The generated client discards this
-/// endpoint's body (the spec declares no schema for it), so it is read raw.
+/// Fetch the scope's runner registration token. The generated client discards
+/// this endpoint's body (the spec declares no schema for it), so it is read raw.
+/// Gitea returns the scope's current reusable token here and has no API to
+/// rotate it.
 pub async fn registration_token(cfg: &Config, scope: &Scope) -> Result<String> {
     let url = api_url(cfg, &format!("{}/registration-token", scope.runners_path()));
-    let resp = cfg
-        .build_reqwest_client()?
+    let resp = verified_client(cfg)?
         .post(url)
         .send()
         .await
@@ -113,8 +118,7 @@ pub async fn registration_token(cfg: &Config, scope: &Scope) -> Result<String> {
 /// Delete a runner in Gitea. Already-gone is success: the goal state holds.
 pub async fn deregister(cfg: &Config, scope: &Scope, runner_id: i64) -> Result<bool> {
     let url = api_url(cfg, &format!("{}/{runner_id}", scope.runners_path()));
-    let resp = cfg
-        .build_reqwest_client()?
+    let resp = verified_client(cfg)?
         .delete(url)
         .send()
         .await
@@ -151,6 +155,39 @@ mod tests {
     fn instance_url_strips_the_api_root() {
         let cfg = Config::new("http://gitea.test:3000/api/v1", "t");
         assert_eq!(instance_url(&cfg), "http://gitea.test:3000");
+    }
+
+    #[test]
+    fn credential_calls_ignore_the_insecure_flag() {
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let cap = captured.clone();
+        let reply = plugin_toolkit::serde_json::json!({"status": 200, "headers": [], "body": b"{\"token\":\"t\"}".to_vec()}).to_string();
+        plugin_toolkit::capsink::with_cap_sink(
+            Box::new(move |_c: &str, json: &str| {
+                cap.lock().unwrap().push(json.to_string());
+                Ok(reply.clone())
+            }),
+            || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                rt.block_on(async {
+                    let cfg = Config::new("https://gitea.test/api/v1", "k").insecure(true);
+                    let t = registration_token(&cfg, &Scope::Org("a b".into()))
+                        .await
+                        .unwrap();
+                    assert_eq!(t, "t");
+                });
+            },
+        );
+        let reqs = captured.lock().unwrap();
+        assert!(reqs[0].contains("\"insecure\":false"), "{}", reqs[0]);
+        assert!(
+            reqs[0].contains("/orgs/a%20b/actions/runners/registration-token"),
+            "{}",
+            reqs[0]
+        );
     }
 
     #[test]

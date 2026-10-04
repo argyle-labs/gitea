@@ -1,14 +1,17 @@
 //! `gitea.runner.*` verbs.
 //!
-//! Every verb acts on the host the call runs on. To manage a runner on another
-//! orca host, route the call there (`--peer <host>` on the CLI, `X-Orca-Peer`
-//! on REST, `peer` on MCP) so the gitea plugin on THAT host executes it.
+//! Every verb acts on the orca system it runs on; a runner on another system
+//! is managed by the gitea plugin on that system.
 //!
-//! Mutating verbs own their `execute` opt-in instead of using the toolkit's
-//! central gate: the central gate can only return a generic plan, and these
-//! verbs can say exactly which files, commands and API calls they would run.
-//! Without `execute: true` they return that `ExecutionPlan` and touch nothing.
+//! Mutating verbs set `execute_gated = false` and own their `execute` opt-in,
+//! because the central gate can only return a generic plan while these verbs
+//! can say exactly which files, commands and API calls they would run.
+//! Opting out of the central gate also opts out of the role check orca runs
+//! inside it, so [`authorize_execute`] replaces it: execute is refused unless
+//! the call carries an admin caller identity. Without `execute: true` a verb
+//! returns its `ExecutionPlan` and touches nothing.
 
+use plugin_toolkit::contract::CallerIdentity;
 use plugin_toolkit::contract::plan::ExecutionPlan;
 use plugin_toolkit::prelude::*;
 
@@ -16,14 +19,18 @@ use super::api;
 use super::exec::{Executor, StepOutcome};
 use super::health::{
     self, DEFAULT_STALL_AFTER_SECS, Finding, GiteaRunnerView, GiteaSide, HealthStatus,
-    LaunchdPriority, Observation, WaitingJob,
+    LaunchdPriority, Observation, WaitingJob, mode_from_labels,
 };
-use super::host::{LocalHost, LocalInstall, read_registration};
+use super::host::{LocalHost, LocalInstall, lookup_user, read_registration};
 use super::layout::{self, Init, Layout, Mode};
-use super::plan::{self, Rerender, Scope, Step};
-use super::release::DEFAULT_RELEASE_API;
+use super::plan::{self, Rerender, RunnerState, Scope, Step};
+use super::release::{self, DEFAULT_VERSION, Source};
 use super::render;
 use crate::Config;
+
+/// Operator allowlist of `scheme://host[:port]` origins a runner may register
+/// against over plain http (comma-separated, set on the orca daemon).
+pub const PLAINTEXT_ORIGINS_ENV: &str = "ORCA_GITEA_RUNNER_PLAINTEXT_ORIGINS";
 
 /// A dry-run plan, or the record of what was applied.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -49,11 +56,34 @@ pub struct AppliedChange {
     pub notes: Vec<String>,
 }
 
-fn default_version() -> String {
-    "latest".to_string()
+fn default_install_version() -> String {
+    DEFAULT_VERSION.to_string()
 }
 fn default_scope() -> String {
     "instance".to_string()
+}
+
+/// Fail closed: applying changes needs an identified admin caller. A call
+/// with no caller identity is refused, never assumed trusted.
+pub fn authorize_execute(tool: &str, caller: Option<&CallerIdentity>) -> Result<()> {
+    match caller {
+        Some(c) if c.role == "admin" => Ok(()),
+        Some(c) => bail!(
+            "{tool}: execute requires role 'admin'; caller '{}' has '{}'",
+            c.username,
+            c.role
+        ),
+        None => bail!(
+            "{tool}: execute refused: the call carries no caller identity, so admin cannot be verified"
+        ),
+    }
+}
+
+fn guard(tool: &str, execute: bool, ctx: &ToolCtx) -> Result<()> {
+    if execute {
+        authorize_execute(tool, ctx.caller().as_ref())?;
+    }
+    Ok(())
 }
 
 async fn gitea_config(endpoint: &str) -> Result<Config> {
@@ -83,6 +113,52 @@ fn cores() -> u32 {
         .unwrap_or(1)
 }
 
+/// `scheme://host[:port]`, lowercased, of an http(s) URL without userinfo.
+pub fn origin(url: &str) -> Option<String> {
+    let (scheme, rest) = url.trim().split_once("://")?;
+    let scheme = scheme.to_ascii_lowercase();
+    if scheme != "http" && scheme != "https" {
+        return None;
+    }
+    let authority = rest.split(['/', '?', '#']).next()?;
+    if authority.is_empty() || authority.contains('@') {
+        return None;
+    }
+    Some(format!("{scheme}://{}", authority.to_ascii_lowercase()))
+}
+
+/// Check the URL a runner will dial. It must be one of the endpoint's own
+/// origins (so a caller cannot point the runner, and the registration token,
+/// at an arbitrary server), and https unless the operator allowlisted that
+/// plain-http origin.
+pub fn check_instance_url(
+    url: &str,
+    endpoint_origins: &[String],
+    plaintext_ok: &[String],
+) -> Result<String> {
+    let o = origin(url).ok_or_else(|| anyhow!("instance_url '{url}' is not an http(s) URL"))?;
+    if !endpoint_origins.contains(&o) {
+        bail!(
+            "instance_url origin {o} is not one of the endpoint's routes [{}]",
+            endpoint_origins.join(", ")
+        );
+    }
+    if o.starts_with("http://") && !plaintext_ok.contains(&o) {
+        bail!(
+            "instance_url {o} is plain http; allow it explicitly in {PLAINTEXT_ORIGINS_ENV} on the orca daemon"
+        );
+    }
+    Ok(url.trim().trim_end_matches('/').to_string())
+}
+
+fn plaintext_allowlist() -> Vec<String> {
+    std::env::var(PLAINTEXT_ORIGINS_ENV)
+        .unwrap_or_default()
+        .split(',')
+        .filter_map(origin)
+        .collect()
+}
+
 /// Return the plan, or run it and report. A failed step is an error that
 /// names the step and what already ran: a partial apply must never read as
 /// success.
@@ -91,6 +167,7 @@ async fn plan_or_apply<A: Serialize>(
     tool: &str,
     args: &A,
     execute: bool,
+    caller: Option<&CallerIdentity>,
     runner: &str,
     summary: String,
     steps: Vec<Step>,
@@ -114,6 +191,7 @@ async fn plan_or_apply<A: Serialize>(
             ExecutionPlan::generic(tool, inputs.into()).detailed(summary, changes),
         ));
     }
+    authorize_execute(tool, caller)?;
     if let Some(why) = blocker {
         bail!("{tool}: refusing to execute: {why}");
     }
@@ -233,8 +311,8 @@ pub async fn gitea_runner_list(args: RunnerListArgs, _ctx: &ToolCtx) -> Result<R
     Ok(RunnerListOutput {
         runners: join(locals, &gitea),
         gitea_error,
-        note: "`local` describes the host this call ran on; route the call to another orca host \
-               (peer) to see its installs"
+        note: "`local` describes the system this call ran on; installs on other systems are \
+               reported by the gitea plugin there"
             .to_string(),
     })
 }
@@ -380,57 +458,71 @@ pub struct RunnerInstallArgs {
     /// Runner name in Gitea; also names its directory and service.
     #[arg(long)]
     pub name: String,
-    /// `host` or `docker`. Default: host on macOS, docker on Linux.
+    /// Picks the default labels when none are given: `host` or `docker`.
+    /// The executor mode itself follows the labels. Default: host on macOS,
+    /// docker on Linux.
     #[arg(long)]
     #[serde(default)]
     pub mode: Option<String>,
     /// act_runner label spec (`name:host`, `name:docker://image`). Repeatable.
-    /// Default depends on mode and platform.
     #[arg(long = "label")]
     #[serde(default)]
     pub labels: Vec<String>,
-    /// Concurrent jobs. Forced to 1 in host mode; docker mode defaults from
-    /// the core count.
+    /// Concurrent jobs. Forced to 1 whenever any label runs on the host;
+    /// docker-only runners default from the core count.
     #[arg(long)]
     #[serde(default)]
     pub capacity: Option<u32>,
-    /// Runner release version, or `latest`.
-    #[arg(long, default_value = "latest")]
-    #[serde(default = "default_version")]
+    /// Runner release version; must be one this plugin pins a checksum for.
+    #[arg(long, default_value = DEFAULT_VERSION)]
+    #[serde(default = "default_install_version")]
     pub version: String,
     /// `instance`, `org:<org>` or `repo:<owner>/<repo>`.
     #[arg(long, default_value = "instance")]
     #[serde(default = "default_scope")]
     pub scope: String,
-    /// Gitea URL the runner dials. Default: the endpoint's resolved address,
-    /// as seen from this host.
+    /// Gitea URL the runner dials. Must be one of the endpoint's routes.
+    /// Default: the endpoint's resolved address, as seen from this system.
     #[arg(long)]
     #[serde(default)]
     pub instance_url: Option<String>,
-    /// Release API to fetch the runner from (for an internal mirror).
-    #[arg(long)]
-    #[serde(default)]
-    pub release_api: Option<String>,
     /// launchd only: PATH for host-executor jobs.
     #[arg(long)]
     #[serde(default)]
     pub path_env: Option<String>,
+    /// Allow host-executor labels on a runner that would run as root. Host
+    /// jobs then run as root on this system.
+    #[arg(long)]
+    #[serde(default)]
+    pub force_host_as_root: bool,
     /// Apply. Omitted, returns the plan and changes nothing.
     #[arg(long)]
     #[serde(default)]
     pub execute: bool,
 }
 
-/// Install, register and supervise a Gitea Actions runner on this host.
+/// Host-executor jobs run as the service's account. Refuse that being root
+/// unless explicitly forced.
+pub fn check_host_as_root(mode: Mode, runs_as_root: bool, force: bool) -> Result<()> {
+    if mode == Mode::Host && runs_as_root && !force {
+        bail!(
+            "host-executor labels would run CI jobs as root on this system; use docker labels, \
+             run the orca daemon unprivileged, or pass force_host_as_root"
+        );
+    }
+    Ok(())
+}
+
+/// Install, register and supervise a Gitea Actions runner on this system.
 #[orca_tool(
     domain = "gitea",
     verb = "runner.install",
-    data_mutation = true,
     role = "admin",
     execute_gated = false
 )]
-pub async fn gitea_runner_install(args: RunnerInstallArgs, _ctx: &ToolCtx) -> Result<RunnerChange> {
+pub async fn gitea_runner_install(args: RunnerInstallArgs, ctx: &ToolCtx) -> Result<RunnerChange> {
     const TOOL: &str = "gitea.runner.install";
+    guard(TOOL, args.execute, ctx)?;
     layout::validate_name(&args.name)?;
     let host = LocalHost::current()?;
     if let Some(existing) = host.find(&args.name) {
@@ -441,26 +533,42 @@ pub async fn gitea_runner_install(args: RunnerInstallArgs, _ctx: &ToolCtx) -> Re
         );
     }
     let target = release_target()?;
-    let mode = match &args.mode {
+    let artifact = release::artifact(&Source::configured()?, &args.version, target)?;
+    let label_mode = match &args.mode {
         Some(m) => m.parse()?,
         None => default_mode(host.init),
     };
-    if mode == Mode::Docker && host.init == Init::Launchd {
-        bail!("docker mode is not supported for launchd (macOS) runners; use mode=host");
-    }
-    let scope: Scope = args.scope.parse()?;
-    let cfg = gitea_config(&args.endpoint).await?;
-    let instance_url = args
-        .instance_url
-        .clone()
-        .unwrap_or_else(|| api::instance_url(&cfg));
     let labels = if args.labels.is_empty() {
-        render::default_labels(mode, target)
+        render::default_labels(label_mode, target)
     } else {
         args.labels.clone()
     };
-    let capacity = render::effective_capacity(mode, args.capacity, cores());
+    render::validate_labels(&labels)?;
+    let mode = mode_from_labels(&labels).unwrap_or(label_mode);
+    if mode == Mode::Docker && host.init == Init::Launchd {
+        bail!("docker labels are not supported for launchd (macOS) runners; use host labels");
+    }
     let l = Layout::managed(host.init, &args.name, &host.home);
+    let runs_as_root = l.user.is_none() && host.is_root();
+    check_host_as_root(mode, runs_as_root, args.force_host_as_root)?;
+
+    let scope: Scope = args.scope.parse()?;
+    let cfg = gitea_config(&args.endpoint).await?;
+    let mut endpoint_origins: Vec<String> = crate::tools::endpoint_route_urls(&args.endpoint)?
+        .iter()
+        .filter_map(|u| origin(u))
+        .collect();
+    endpoint_origins.extend(origin(&cfg.base_url));
+    let instance_url = check_instance_url(
+        &args
+            .instance_url
+            .clone()
+            .unwrap_or_else(|| api::instance_url(&cfg)),
+        &endpoint_origins,
+        &plaintext_allowlist(),
+    )?;
+
+    let capacity = render::effective_capacity(mode, args.capacity, cores());
     let path_env = args
         .path_env
         .clone()
@@ -472,41 +580,57 @@ pub async fn gitea_runner_install(args: RunnerInstallArgs, _ctx: &ToolCtx) -> Re
         labels: &labels,
     });
     let unit = render::render_service(&l, mode, &host.home, &path_env);
-    let steps = plan::install_steps(&plan::InstallSpec {
-        layout: &l,
-        uid: host.uid,
-        version: &args.version,
-        config_yaml,
-        unit,
-        labels: labels.clone(),
-        instance_url: instance_url.clone(),
-        scope: scope.clone(),
-    });
+    let create_user = match &l.user {
+        Some(u) if lookup_user(u).is_none() => plan::user_steps(
+            host.init,
+            u,
+            &layout::managed_root(host.init, &host.home),
+            mode == Mode::Docker,
+        ),
+        _ => Vec::new(),
+    };
     let summary = format!(
-        "install runner '{}' ({} mode, capacity {}, {}) registering with {instance_url} as {}",
+        "install runner '{}' {} ({} executor, capacity {}, {}) from {} registering with {instance_url} as {}",
         args.name,
+        artifact.version,
         format!("{mode:?}").to_lowercase(),
         capacity.value,
         format!("{:?}", host.init).to_lowercase(),
+        artifact.host,
         scope.label()
     );
-    let release_api = args.release_api.as_deref().unwrap_or(DEFAULT_RELEASE_API);
+    let steps = plan::install_steps(&plan::InstallSpec {
+        layout: &l,
+        uid: host.uid,
+        artifact,
+        config_yaml,
+        unit,
+        labels: labels.clone(),
+        instance_url,
+        scope,
+        create_user,
+    });
     let exec = Executor {
         host: &host,
         gitea: Some(&cfg),
-        release_api,
-        release_target: target,
     };
+    let mut notes: Vec<String> = capacity.note.into_iter().collect();
+    notes.push(
+        "Gitea reuses one registration token per scope and offers no API to rotate it; \
+         reset it in Gitea after installs if it may have been exposed"
+            .to_string(),
+    );
     plan_or_apply(
         TOOL,
         &args,
         args.execute,
+        ctx.caller().as_ref(),
         &args.name,
         summary,
         steps,
         exec,
         Vec::new(),
-        capacity.note.into_iter().collect(),
+        notes,
     )
     .await
 }
@@ -522,10 +646,11 @@ pub struct RunnerUninstallArgs {
     pub endpoint: String,
     #[arg(long)]
     pub name: String,
-    /// Scope the runner was registered in.
-    #[arg(long, default_value = "instance")]
-    #[serde(default = "default_scope")]
-    pub scope: String,
+    /// Scope the runner was registered in. Normally read from the install's
+    /// own record; if given, it must agree with that record.
+    #[arg(long)]
+    #[serde(default)]
+    pub scope: Option<String>,
     /// Keep the runner's directory (cache, logs, registration).
     #[arg(long)]
     #[serde(default)]
@@ -541,19 +666,22 @@ pub struct RunnerUninstallArgs {
 #[orca_tool(
     domain = "gitea",
     verb = "runner.uninstall",
-    data_mutation = true,
     role = "admin",
     execute_gated = false
 )]
 pub async fn gitea_runner_uninstall(
     args: RunnerUninstallArgs,
-    _ctx: &ToolCtx,
+    ctx: &ToolCtx,
 ) -> Result<RunnerChange> {
     const TOOL: &str = "gitea.runner.uninstall";
+    guard(TOOL, args.execute, ctx)?;
     let host = LocalHost::current()?;
-    let l = host
-        .find(&args.name)
-        .ok_or_else(|| anyhow!("no runner named '{}' is installed on this host", args.name))?;
+    let l = host.find(&args.name).ok_or_else(|| {
+        anyhow!(
+            "no runner named '{}' is installed on this system",
+            args.name
+        )
+    })?;
     if !l.managed {
         bail!(
             "runner '{}' is a hand-placed install at {}; this plugin only removes installs it created",
@@ -561,11 +689,23 @@ pub async fn gitea_runner_uninstall(
             l.dir.display()
         );
     }
-    let scope: Scope = args.scope.parse()?;
+    let recorded = RunnerState::read(&l.state_file());
+    let (scope, scope_known) = plan::deregister_scope(
+        recorded.as_ref().map(|r| r.scope.as_str()),
+        args.scope.as_deref(),
+    )?;
     let (state, _) = host.service_state(&l).await;
     let runner_id = read_registration(&l.runner_file).map(|r| r.id);
     let cfg = gitea_config(&args.endpoint).await?;
-    let steps = plan::uninstall_steps(&l, host.uid, state, runner_id, &scope, args.keep_files);
+    let steps = plan::uninstall_steps(
+        &l,
+        host.uid,
+        state,
+        runner_id,
+        &scope,
+        scope_known,
+        args.keep_files,
+    );
     let mut notes = Vec::new();
     if runner_id.is_none() {
         notes.push("no local registration file; nothing to deregister in Gitea".to_string());
@@ -573,13 +713,12 @@ pub async fn gitea_runner_uninstall(
     let exec = Executor {
         host: &host,
         gitea: Some(&cfg),
-        release_api: DEFAULT_RELEASE_API,
-        release_target: "",
     };
     plan_or_apply(
         TOOL,
         &args,
         args.execute,
+        ctx.caller().as_ref(),
         &args.name,
         format!("uninstall runner '{}'", args.name),
         steps,
@@ -598,55 +737,103 @@ pub async fn gitea_runner_uninstall(
 pub struct RunnerUpgradeArgs {
     #[arg(long)]
     pub name: String,
-    /// Target runner release version, or `latest`.
-    #[arg(long, default_value = "latest")]
-    #[serde(default = "default_version")]
-    pub version: String,
-    /// Release API to fetch the runner from (for an internal mirror).
+    /// Target runner version; must be pinned in this plugin. Defaults to the
+    /// newest pinned version for installs this plugin created; required for
+    /// hand-placed ones.
     #[arg(long)]
     #[serde(default)]
-    pub release_api: Option<String>,
+    pub version: Option<String>,
+    /// Permit upgrading a hand-placed install this plugin did not create.
+    #[arg(long)]
+    #[serde(default)]
+    pub allow_unmanaged: bool,
+    /// Permit a hand-placed install to cross a major version.
+    #[arg(long)]
+    #[serde(default)]
+    pub allow_major_upgrade: bool,
     /// Apply. Omitted, returns the plan and changes nothing.
     #[arg(long)]
     #[serde(default)]
     pub execute: bool,
 }
 
-/// Replace a runner's binary with a checksum-verified release and restart it.
+/// Version and major-version guard for an upgrade.
+pub fn upgrade_target(
+    managed: bool,
+    requested: Option<&str>,
+    allow_unmanaged: bool,
+    allow_major_upgrade: bool,
+) -> Result<(String, Option<u64>)> {
+    if managed {
+        return Ok((requested.unwrap_or(DEFAULT_VERSION).to_string(), None));
+    }
+    if !allow_unmanaged {
+        bail!("this runner is a hand-placed install; pass allow_unmanaged to upgrade it");
+    }
+    let version = requested
+        .ok_or_else(|| anyhow!("upgrading a hand-placed install needs an explicit version"))?;
+    let check = if allow_major_upgrade {
+        None
+    } else {
+        release::major(&release::validate_version(version)?)
+    };
+    Ok((version.to_string(), check))
+}
+
+/// Replace a runner's binary with a pinned, checksum-verified release and
+/// restart it.
 #[orca_tool(
     domain = "gitea",
     verb = "runner.upgrade",
-    data_mutation = true,
     role = "admin",
     execute_gated = false
 )]
-pub async fn gitea_runner_upgrade(args: RunnerUpgradeArgs, _ctx: &ToolCtx) -> Result<RunnerChange> {
+pub async fn gitea_runner_upgrade(args: RunnerUpgradeArgs, ctx: &ToolCtx) -> Result<RunnerChange> {
     const TOOL: &str = "gitea.runner.upgrade";
+    guard(TOOL, args.execute, ctx)?;
     let host = LocalHost::current()?;
-    let l = host
-        .find(&args.name)
-        .ok_or_else(|| anyhow!("no runner named '{}' is installed on this host", args.name))?;
-    let target = release_target()?;
+    let l = host.find(&args.name).ok_or_else(|| {
+        anyhow!(
+            "no runner named '{}' is installed on this system",
+            args.name
+        )
+    })?;
+    let (version, check_major) = upgrade_target(
+        l.managed,
+        args.version.as_deref(),
+        args.allow_unmanaged,
+        args.allow_major_upgrade,
+    )?;
+    let artifact = release::artifact(&Source::configured()?, &version, release_target()?)?;
     let (state, _) = host.service_state(&l).await;
-    let current = host.binary_version(&l.binary).await;
-    let steps = plan::upgrade_steps(&l, host.uid, state, &args.version);
-    let summary = format!(
-        "upgrade runner '{}' from {} to {}",
-        args.name,
-        current.as_deref().unwrap_or("unknown"),
-        args.version
+    let recorded = RunnerState::read(&l.state_file());
+    let steps = plan::upgrade_steps(
+        &l,
+        host.uid,
+        state,
+        &artifact,
+        recorded.as_ref(),
+        check_major,
     );
-    let release_api = args.release_api.as_deref().unwrap_or(DEFAULT_RELEASE_API);
+    let summary = format!(
+        "upgrade runner '{}' from {} to {} ({})",
+        args.name,
+        recorded
+            .as_ref()
+            .map(|r| r.version.as_str())
+            .unwrap_or("an unrecorded version"),
+        artifact.version,
+        artifact.url
+    );
     let exec = Executor {
         host: &host,
         gitea: None,
-        release_api,
-        release_target: target,
     };
     plan_or_apply(
         TOOL,
         &args,
         args.execute,
+        ctx.caller().as_ref(),
         &args.name,
         summary,
         steps,
@@ -688,16 +875,19 @@ pub struct RunnerHealArgs {
 #[orca_tool(
     domain = "gitea",
     verb = "runner.heal",
-    data_mutation = true,
     role = "admin",
     execute_gated = false
 )]
-pub async fn gitea_runner_heal(args: RunnerHealArgs, _ctx: &ToolCtx) -> Result<RunnerChange> {
+pub async fn gitea_runner_heal(args: RunnerHealArgs, ctx: &ToolCtx) -> Result<RunnerChange> {
     const TOOL: &str = "gitea.runner.heal";
+    guard(TOOL, args.execute, ctx)?;
     let host = LocalHost::current()?;
-    let l = host
-        .find(&args.name)
-        .ok_or_else(|| anyhow!("no runner named '{}' is installed on this host", args.name))?;
+    let l = host.find(&args.name).ok_or_else(|| {
+        anyhow!(
+            "no runner named '{}' is installed on this system",
+            args.name
+        )
+    })?;
     let cfg = gitea_config(&args.endpoint).await?;
     let snap = gitea_snapshot(&cfg).await;
     let local = host.inspect(&l).await;
@@ -756,13 +946,12 @@ pub async fn gitea_runner_heal(args: RunnerHealArgs, _ctx: &ToolCtx) -> Result<R
     let exec = Executor {
         host: &host,
         gitea: Some(&cfg),
-        release_api: DEFAULT_RELEASE_API,
-        release_target: "",
     };
     plan_or_apply(
         TOOL,
         &args,
         args.execute,
+        ctx.caller().as_ref(),
         &args.name,
         summary,
         steps,
@@ -869,6 +1058,147 @@ mod tests {
         ));
     }
 
+    fn admin() -> CallerIdentity {
+        CallerIdentity {
+            user_id: "u1".into(),
+            username: "scott".into(),
+            role: "admin".into(),
+            can_mutate: true,
+        }
+    }
+
+    fn upgrade_args(execute: bool) -> RunnerUpgradeArgs {
+        RunnerUpgradeArgs {
+            name: "r1".into(),
+            version: Some("4.1.0".into()),
+            allow_unmanaged: false,
+            allow_major_upgrade: false,
+            execute,
+        }
+    }
+
+    fn artifact() -> release::Artifact {
+        release::artifact(
+            &Source::parse(release::DEFAULT_SOURCE, &[]).unwrap(),
+            "4.1.0",
+            "darwin-arm64",
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn execute_needs_an_admin_caller() {
+        assert!(authorize_execute("t", Some(&admin())).is_ok());
+        let none = authorize_execute("t", None).unwrap_err().to_string();
+        assert!(none.contains("no caller identity"), "{none}");
+        let mut reader = admin();
+        reader.role = "read".into();
+        reader.can_mutate = true;
+        let err = authorize_execute("t", Some(&reader))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("requires role 'admin'"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn dispatched_execute_without_a_caller_is_refused_before_anything_runs() {
+        let ctx = plugin_toolkit::tool_manifest::minimal_ctx();
+        for (tool, args) in [
+            (
+                "gitea.runner.upgrade",
+                json!({"name": "r1", "execute": true}),
+            ),
+            (
+                "gitea.runner.heal",
+                json!({"endpoint": "e", "name": "r1", "execute": true}),
+            ),
+            (
+                "gitea.runner.uninstall",
+                json!({"endpoint": "e", "name": "r1", "execute": true}),
+            ),
+            (
+                "gitea.runner.install",
+                json!({"endpoint": "e", "name": "r1", "execute": true}),
+            ),
+        ] {
+            let err = plugin_toolkit::dispatch::dispatch(tool, args, &ctx)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("no caller identity"), "{tool}: {err}");
+        }
+    }
+
+    // orca's derive marks every write-shaped verb a data mutation, so a
+    // `can_mutate` non-admin could pass orca's surface check; the plugin's own
+    // check is what refuses them (`execute_needs_an_admin_caller`).
+    #[test]
+    fn mutating_verbs_require_admin() {
+        for verb in ["install", "uninstall", "upgrade", "heal"] {
+            let name = format!("gitea.runner.{verb}");
+            assert_eq!(
+                plugin_toolkit::dispatch::required_role(&name),
+                Some("admin"),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn instance_url_must_be_an_endpoint_origin_and_https_unless_allowed() {
+        let origins = vec![
+            "https://gitea.test".to_string(),
+            "http://10.0.0.20:3000".to_string(),
+        ];
+        assert_eq!(
+            check_instance_url("https://gitea.test/", &origins, &[]).unwrap(),
+            "https://gitea.test"
+        );
+        assert!(check_instance_url("https://evil.test", &origins, &[]).is_err());
+        assert!(check_instance_url("https://gitea.test@evil.test", &origins, &[]).is_err());
+        let plain = check_instance_url("http://10.0.0.20:3000", &origins, &[]).unwrap_err();
+        assert!(plain.to_string().contains(PLAINTEXT_ORIGINS_ENV), "{plain}");
+        assert!(
+            check_instance_url(
+                "http://10.0.0.20:3000",
+                &origins,
+                &["http://10.0.0.20:3000".into()]
+            )
+            .is_ok()
+        );
+        assert!(check_instance_url("ftp://gitea.test", &origins, &[]).is_err());
+        assert_eq!(
+            origin("HTTPS://Gitea.Test:443/x?y").as_deref(),
+            Some("https://gitea.test:443")
+        );
+    }
+
+    #[test]
+    fn host_labels_as_root_are_refused_unless_forced() {
+        assert!(check_host_as_root(Mode::Host, true, false).is_err());
+        assert!(check_host_as_root(Mode::Host, true, true).is_ok());
+        assert!(check_host_as_root(Mode::Host, false, false).is_ok());
+        assert!(check_host_as_root(Mode::Docker, true, false).is_ok());
+    }
+
+    #[test]
+    fn unmanaged_upgrades_need_opt_in_explicit_version_and_same_major() {
+        assert_eq!(
+            upgrade_target(true, None, false, false).unwrap(),
+            (DEFAULT_VERSION.to_string(), None)
+        );
+        assert!(upgrade_target(false, Some("4.1.0"), false, false).is_err());
+        assert!(upgrade_target(false, None, true, false).is_err());
+        assert_eq!(
+            upgrade_target(false, Some("4.1.0"), true, false).unwrap().1,
+            Some(4)
+        );
+        assert_eq!(
+            upgrade_target(false, Some("4.1.0"), true, true).unwrap().1,
+            None
+        );
+    }
+
     #[tokio::test]
     async fn dry_run_returns_a_detailed_plan_and_touches_nothing() {
         let home = std::env::temp_dir().join(format!("gitea-plan-{}", std::process::id()));
@@ -878,23 +1208,16 @@ mod tests {
             uid: 501,
         };
         let l = Layout::managed(Init::Launchd, "r1", &home);
-        let steps = plan::upgrade_steps(&l, 501, ServiceState::Running, "4.1.0");
+        let steps = plan::upgrade_steps(&l, 501, ServiceState::Running, &artifact(), None, None);
         let exec = Executor {
             host: &host,
             gitea: None,
-            release_api: "http://unreachable.invalid",
-            release_target: "darwin-arm64",
-        };
-        let args = RunnerUpgradeArgs {
-            name: "r1".into(),
-            version: "4.1.0".into(),
-            release_api: None,
-            execute: false,
         };
         let out = plan_or_apply(
             "gitea.runner.upgrade",
-            &args,
+            &upgrade_args(false),
             false,
+            None,
             "r1",
             "upgrade".into(),
             steps,
@@ -911,6 +1234,13 @@ mod tests {
         assert_eq!(plan.tool, "gitea.runner.upgrade");
         assert_eq!(plan.changes.len(), 2);
         assert_eq!(plan.changes[0].action, "install-binary");
+        assert!(
+            plan.changes[0]
+                .detail
+                .as_deref()
+                .unwrap()
+                .contains("host gitea.com")
+        );
         assert_eq!(
             plan.changes[1].target,
             "launchctl kickstart -k gui/501/com.argyle.gitea-runner.r1"
@@ -921,6 +1251,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_is_refused_without_admin_even_past_the_verb_guard() {
+        let host = LocalHost {
+            init: Init::Launchd,
+            home: std::env::temp_dir().join("gitea-noexec"),
+            uid: 501,
+        };
+        let exec = Executor {
+            host: &host,
+            gitea: None,
+        };
+        let err = plan_or_apply(
+            "t",
+            &upgrade_args(true),
+            true,
+            None,
+            "r1",
+            "s".into(),
+            vec![Step::Run {
+                argv: vec!["false".into()],
+                tolerate_failure: false,
+            }],
+            exec,
+            vec![],
+            vec![],
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("no caller identity"), "{err}");
+    }
+
+    #[tokio::test]
     async fn dry_run_names_a_privilege_blocker_and_execute_refuses() {
         let host = LocalHost {
             init: Init::Systemd,
@@ -928,23 +1290,16 @@ mod tests {
             uid: 1000,
         };
         let l = Layout::managed(Init::Systemd, "r1", &host.home);
-        let steps = plan::upgrade_steps(&l, 1000, ServiceState::Running, "latest");
+        let steps = plan::upgrade_steps(&l, 1000, ServiceState::Running, &artifact(), None, None);
         let mk = || Executor {
             host: &host,
             gitea: None,
-            release_api: "",
-            release_target: "linux-amd64",
-        };
-        let args = RunnerUpgradeArgs {
-            name: "r1".into(),
-            version: "latest".into(),
-            release_api: None,
-            execute: false,
         };
         let RunnerChange::Plan(plan) = plan_or_apply(
             "t",
-            &args,
+            &upgrade_args(false),
             false,
+            None,
             "r1",
             "s".into(),
             steps.clone(),
@@ -959,8 +1314,9 @@ mod tests {
         assert!(plan.summary.contains("need root"), "{}", plan.summary);
         let err = plan_or_apply(
             "t",
-            &args,
+            &upgrade_args(true),
             true,
+            Some(&admin()),
             "r1",
             "s".into(),
             steps,

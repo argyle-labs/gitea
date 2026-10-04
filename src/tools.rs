@@ -57,6 +57,12 @@ pub(crate) async fn resolve_config(name: &str) -> Result<Config> {
     Ok(Config::new(base_url, token).insecure(row.insecure))
 }
 
+/// `scheme://host[:port]` of every enabled route registered for endpoint `name`.
+pub(crate) fn endpoint_route_urls(name: &str) -> Result<Vec<String>> {
+    let row = endpoint_db::require(name)?;
+    Ok(row.routes.enabled().filter_map(|r| r.base_url()).collect())
+}
+
 /// Promote a bare Gitea host URL to its REST API root (`.../api/v1`), leaving a
 /// URL that already carries the suffix untouched.
 fn api_root(base: &str) -> String {

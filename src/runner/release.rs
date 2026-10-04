@@ -1,69 +1,222 @@
-//! Resolve, download and checksum-verify a runner release binary.
+//! Where runner binaries come from and how they are verified.
 //!
-//! Releases are looked up through the forge's release API rather than a
-//! hard-coded download URL: upstream renamed both the project (`act_runner` →
-//! `runner`) and the asset prefix (`act_runner-` → `gitea-runner-`), and picking
-//! the asset by its `-<os>-<arch>` suffix survives both.
+//! Upstream publishes no signatures, only checksums served from the same place
+//! as the binaries, which protect against corruption but not against a
+//! compromised or substituted source. So the trust root is a table of sha256s
+//! pinned in this plugin: a version/platform not in [`PINNED`] cannot be
+//! installed. Each pin was cross-checked against two independent upstream
+//! publications (`checksums.txt` on gitea.com and the per-asset `.sha256` on
+//! dl.gitea.com).
+//!
+//! The source is operator config, not a call argument: [`SOURCE_ENV`] on the
+//! orca daemon (inherited by the plugin process) may point at a mirror, which
+//! must be https and whose host must be gitea.com or listed in
+//! [`ALLOWED_HOSTS_ENV`].
 
 use plugin_toolkit::client::{Client, Request};
 use plugin_toolkit::prelude::*;
 
-/// Upstream release API. Overridable so a fleet can mirror releases internally.
-pub const DEFAULT_RELEASE_API: &str = "https://gitea.com/api/v1/repos/gitea/runner";
+/// Upstream release repository.
+pub const DEFAULT_SOURCE: &str = "https://gitea.com/gitea/runner";
+/// Operator override: base URL of a Gitea repository mirroring the releases.
+pub const SOURCE_ENV: &str = "ORCA_GITEA_RUNNER_RELEASE_SOURCE";
+/// Operator allowlist: comma-separated hosts a mirror may live on.
+pub const ALLOWED_HOSTS_ENV: &str = "ORCA_GITEA_RUNNER_RELEASE_HOSTS";
+const BUILTIN_ALLOWED_HOSTS: &[&str] = &["gitea.com"];
 
 const DOWNLOAD_TIMEOUT_MS: u64 = 300_000;
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct ReleaseAssetJson {
-    pub name: String,
-    pub browser_download_url: String,
+/// `(version, release target, asset name, sha256)`.
+pub const PINNED: &[(&str, &str, &str, &str)] = &[
+    (
+        "4.1.0",
+        "darwin-arm64",
+        "gitea-runner-4.1.0-darwin-arm64",
+        "3f1191ea1da7e64f93ff02295db7884b454eef69ceaa87eaf58ca2f583b75c81",
+    ),
+    (
+        "4.1.0",
+        "darwin-amd64",
+        "gitea-runner-4.1.0-darwin-amd64",
+        "eecac821bae95e3aea2285f3076e17610419447b205e63c9925a51ca56ee9769",
+    ),
+    (
+        "4.1.0",
+        "linux-amd64",
+        "gitea-runner-4.1.0-linux-amd64",
+        "b781d26b0f82269e73f6fae813a84c8ba5a215ea65cd7949c2fb3db5e0ccc8cf",
+    ),
+    (
+        "4.1.0",
+        "linux-arm64",
+        "gitea-runner-4.1.0-linux-arm64",
+        "42c2c66e67e09fbcd74c3ab26abc038b644ceaad13e3205e59c8eb7e65a65801",
+    ),
+    (
+        "3.1.0",
+        "darwin-arm64",
+        "gitea-runner-3.1.0-darwin-arm64",
+        "91a19fd5481037e34fc5435f464708b3e0eba6719791fc76ec7146c01e0e7eef",
+    ),
+    (
+        "3.1.0",
+        "darwin-amd64",
+        "gitea-runner-3.1.0-darwin-amd64",
+        "de6664193015cf4f10355f48d9dca1c0d54a3edfeb7bcbc42fbffcd725a5b320",
+    ),
+    (
+        "3.1.0",
+        "linux-amd64",
+        "gitea-runner-3.1.0-linux-amd64",
+        "377842d074b331bee7a94a18dc5310636d44ec5cbadbcb1052809d34a6543ef3",
+    ),
+    (
+        "3.1.0",
+        "linux-arm64",
+        "gitea-runner-3.1.0-linux-arm64",
+        "9f7d3bb909feb368cbe5e46f350aba6939772d674ec2c98abfe0db92a8815fb1",
+    ),
+];
+
+/// Newest pinned version; the default for install and upgrade.
+pub const DEFAULT_VERSION: &str = "4.1.0";
+
+/// Accept only `MAJOR.MINOR.PATCH` with an optional `-suffix`/`.suffix`, with or
+/// without a leading `v`. Returns the version without the `v`. This is what
+/// keeps `/`, `?`, `#` and friends out of the download URL.
+pub fn validate_version(v: &str) -> Result<String> {
+    let bare = v.strip_prefix('v').unwrap_or(v);
+    let bad = || anyhow!("invalid runner version '{v}' (expected MAJOR.MINOR.PATCH)");
+    let bytes = bare.as_bytes();
+    let mut i = 0;
+    for part in 0..3 {
+        let start = i;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+        if i == start {
+            return Err(bad());
+        }
+        if part < 2 {
+            if bytes.get(i) != Some(&b'.') {
+                return Err(bad());
+            }
+            i += 1;
+        }
+    }
+    if i < bytes.len() {
+        let suffix = &bytes[i + 1..];
+        let ok = matches!(bytes[i], b'-' | b'.')
+            && !suffix.is_empty()
+            && suffix
+                .iter()
+                .all(|c| c.is_ascii_alphanumeric() || *c == b'.');
+        if !ok {
+            return Err(bad());
+        }
+    }
+    Ok(bare.to_string())
 }
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct ReleaseJson {
-    pub tag_name: String,
-    #[serde(default)]
-    pub assets: Vec<ReleaseAssetJson>,
+/// Major component of a validated version.
+pub fn major(version: &str) -> Option<u64> {
+    version
+        .trim_start_matches('v')
+        .split('.')
+        .next()?
+        .parse()
+        .ok()
 }
 
-/// A binary chosen from a release, with the checksum it must match.
+/// A checked release source: an https Gitea repository URL on an allowed host.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ResolvedBinary {
-    pub version: String,
-    pub asset: String,
-    pub url: String,
-    pub sha256: String,
+pub struct Source {
+    pub base: String,
+    pub host: String,
 }
 
-/// Normalise a requested version to a release-API path segment.
-pub fn release_path(version: &str) -> String {
-    let v = version.trim();
-    if v.is_empty() || v.eq_ignore_ascii_case("latest") {
-        "releases/latest".to_string()
-    } else {
-        format!("releases/tags/v{}", v.trim_start_matches('v'))
+fn https_host(url: &str) -> Option<&str> {
+    let rest = url.strip_prefix("https://")?;
+    let authority = rest.split('/').next()?;
+    if authority.is_empty() || authority.contains('@') {
+        return None;
+    }
+    Some(authority.split(':').next().unwrap_or(authority))
+}
+
+impl Source {
+    /// Validate a source URL against the allowlist.
+    pub fn parse(url: &str, extra_hosts: &[String]) -> Result<Source> {
+        let base = url.trim().trim_end_matches('/').to_string();
+        let host = https_host(&base)
+            .ok_or_else(|| anyhow!("release source '{base}' must be an https URL"))?
+            .to_ascii_lowercase();
+        let allowed = BUILTIN_ALLOWED_HOSTS.contains(&host.as_str())
+            || extra_hosts.iter().any(|h| h.eq_ignore_ascii_case(&host));
+        if !allowed {
+            bail!(
+                "release source host '{host}' is not allowed; add it to {ALLOWED_HOSTS_ENV} on the orca daemon"
+            );
+        }
+        if base.contains(['?', '#']) {
+            bail!("release source '{base}' must not carry a query or fragment");
+        }
+        Ok(Source { base, host })
+    }
+
+    /// The operator-configured source, or upstream.
+    pub fn configured() -> Result<Source> {
+        let url = std::env::var(SOURCE_ENV).unwrap_or_else(|_| DEFAULT_SOURCE.to_string());
+        let extra: Vec<String> = std::env::var(ALLOWED_HOSTS_ENV)
+            .unwrap_or_default()
+            .split(',')
+            .map(|h| h.trim().to_string())
+            .filter(|h| !h.is_empty())
+            .collect();
+        Source::parse(&url, &extra)
     }
 }
 
-/// The uncompressed binary for `target` (e.g. `darwin-arm64`). An exact
-/// suffix match skips the `.xz` and `.sha256` siblings.
-pub fn pick_binary<'a>(
-    assets: &'a [ReleaseAssetJson],
-    target: &str,
-) -> Option<&'a ReleaseAssetJson> {
-    let suffix = format!("-{target}");
-    assets.iter().find(|a| a.name.ends_with(&suffix))
+/// A binary to install: where it comes from and the hash it must have.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Artifact {
+    pub version: String,
+    pub asset: String,
+    pub url: String,
+    pub host: String,
+    pub sha256: String,
 }
 
-/// The hash for `asset` in a `sha256sum`-format file (`<hex>  <name>`), which
-/// covers both `checksums.txt` and per-asset `.sha256` files.
-pub fn checksum_for(text: &str, asset: &str) -> Option<String> {
-    text.lines().find_map(|line| {
-        let mut cols = line.split_whitespace();
-        let hash = cols.next()?;
-        let name = cols.next()?.trim_start_matches('*');
-        (name == asset && hash.len() == 64 && hash.chars().all(|c| c.is_ascii_hexdigit()))
-            .then(|| hash.to_ascii_lowercase())
+/// Resolve `version` for `target` against `source`. Pure: no network.
+pub fn artifact(source: &Source, version: &str, target: &str) -> Result<Artifact> {
+    let version = validate_version(version)?;
+    let (_, _, asset, sha) = PINNED
+        .iter()
+        .find(|(v, t, _, _)| *v == version && *t == target)
+        .ok_or_else(|| {
+            let known: Vec<&str> = PINNED
+                .iter()
+                .filter(|(_, t, _, _)| *t == target)
+                .map(|(v, _, _, _)| *v)
+                .collect();
+            anyhow!(
+                "runner {version} for {target} has no pinned checksum in this plugin; pinned: [{}]",
+                known.join(", ")
+            )
+        })?;
+    let url = format!("{}/releases/download/v{version}/{asset}", source.base);
+    if https_host(&url).map(str::to_ascii_lowercase).as_deref() != Some(source.host.as_str()) {
+        bail!(
+            "asset URL {url} is not on the release source host {}",
+            source.host
+        );
+    }
+    Ok(Artifact {
+        version,
+        asset: asset.to_string(),
+        url,
+        host: source.host.clone(),
+        sha256: sha.to_string(),
     })
 }
 
@@ -76,133 +229,100 @@ pub fn verify(bytes: &[u8], expected: &str) -> Result<()> {
     Ok(())
 }
 
-fn get(url: &str, timeout_ms: u64) -> Result<Vec<u8>> {
+/// Download and verify an artifact, returning its bytes.
+pub fn download(a: &Artifact) -> Result<Vec<u8>> {
     let resp = Client::new()
-        .send(Request::new("GET", url).timeout_ms(timeout_ms))
-        .with_context(|| format!("GET {url}"))?;
+        .send(Request::new("GET", &a.url).timeout_ms(DOWNLOAD_TIMEOUT_MS))
+        .with_context(|| format!("GET {}", a.url))?;
     if !resp.is_success() {
-        bail!("GET {url}: HTTP {}", resp.status);
+        bail!("GET {}: HTTP {}", a.url, resp.status);
     }
+    verify(&resp.body, &a.sha256).with_context(|| format!("verify {}", a.asset))?;
     Ok(resp.body)
-}
-
-/// Resolve `version` for `target` against `release_api`: the binary's URL and
-/// the checksum published alongside it. A release with no checksum for the
-/// binary is refused — an unverifiable binary is not installed.
-pub fn resolve(release_api: &str, version: &str, target: &str) -> Result<ResolvedBinary> {
-    let url = format!(
-        "{}/{}",
-        release_api.trim_end_matches('/'),
-        release_path(version)
-    );
-    let release: ReleaseJson = serde_json_from(&get(&url, 30_000)?)
-        .with_context(|| format!("parse release JSON from {url}"))?;
-    let bin = pick_binary(&release.assets, target).ok_or_else(|| {
-        anyhow!(
-            "release {} has no binary for {target} (assets: {})",
-            release.tag_name,
-            release
-                .assets
-                .iter()
-                .map(|a| a.name.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
-    })?;
-    let sums = ["checksums.txt".to_string(), format!("{}.sha256", bin.name)];
-    let mut sha = None;
-    for sum_name in &sums {
-        if let Some(asset) = release.assets.iter().find(|a| &a.name == sum_name) {
-            let text =
-                String::from_utf8_lossy(&get(&asset.browser_download_url, 30_000)?).into_owned();
-            if let Some(h) = checksum_for(&text, &bin.name) {
-                sha = Some(h);
-                break;
-            }
-        }
-    }
-    let sha256 = sha.ok_or_else(|| {
-        anyhow!(
-            "release {} publishes no checksum for {}; refusing to install an unverified binary",
-            release.tag_name,
-            bin.name
-        )
-    })?;
-    Ok(ResolvedBinary {
-        version: release.tag_name.clone(),
-        asset: bin.name.clone(),
-        url: bin.browser_download_url.clone(),
-        sha256,
-    })
-}
-
-/// Download and verify a resolved binary, returning its bytes.
-pub fn download(bin: &ResolvedBinary) -> Result<Vec<u8>> {
-    let bytes = get(&bin.url, DOWNLOAD_TIMEOUT_MS)?;
-    verify(&bytes, &bin.sha256).with_context(|| format!("verify {}", bin.asset))?;
-    Ok(bytes)
-}
-
-fn serde_json_from<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T> {
-    Ok(plugin_toolkit::serde_json::from_slice(bytes)?)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn asset(name: &str) -> ReleaseAssetJson {
-        ReleaseAssetJson {
-            name: name.to_string(),
-            browser_download_url: format!("https://dl.test/{name}"),
+    fn upstream() -> Source {
+        Source::parse(DEFAULT_SOURCE, &[]).unwrap()
+    }
+
+    #[test]
+    fn versions_are_strictly_shaped() {
+        assert_eq!(validate_version("4.1.0").unwrap(), "4.1.0");
+        assert_eq!(validate_version("v4.1.0").unwrap(), "4.1.0");
+        assert_eq!(validate_version("4.1.0-rc.1").unwrap(), "4.1.0-rc.1");
+        for bad in [
+            "",
+            "latest",
+            "4.1",
+            "4.1.0/../../x",
+            "4.1.0?x=1",
+            "4.1.0#f",
+            "../4.1.0",
+            "4.1.0-",
+            "4.1.0-a/b",
+            "4.1.0%2e",
+            "a.b.c",
+            "4.1.0 ",
+            " 4.1.0",
+            "vv4.1.0",
+        ] {
+            assert!(validate_version(bad).is_err(), "accepted {bad:?}");
         }
     }
 
     #[test]
-    fn release_path_normalises_versions() {
-        assert_eq!(release_path("latest"), "releases/latest");
-        assert_eq!(release_path(""), "releases/latest");
-        assert_eq!(release_path("4.1.0"), "releases/tags/v4.1.0");
-        assert_eq!(release_path("v4.1.0"), "releases/tags/v4.1.0");
+    fn major_reads_the_first_component() {
+        assert_eq!(major("v3.1.0"), Some(3));
+        assert_eq!(major("4.1.0"), Some(4));
     }
 
     #[test]
-    fn picks_the_raw_binary_under_either_prefix() {
-        let new = vec![
-            asset("checksums.txt"),
-            asset("gitea-runner-4.1.0-darwin-arm64.xz"),
-            asset("gitea-runner-4.1.0-darwin-arm64.xz.sha256"),
-            asset("gitea-runner-4.1.0-darwin-arm64"),
-            asset("gitea-runner-4.1.0-linux-amd64"),
-        ];
-        assert_eq!(
-            pick_binary(&new, "darwin-arm64").unwrap().name,
-            "gitea-runner-4.1.0-darwin-arm64"
-        );
-        let old = vec![
-            asset("act_runner-0.2.11-linux-amd64"),
-            asset("act_runner-0.2.11-linux-amd64.sha256"),
-        ];
-        assert_eq!(
-            pick_binary(&old, "linux-amd64").unwrap().name,
-            "act_runner-0.2.11-linux-amd64"
-        );
-        assert!(pick_binary(&old, "darwin-arm64").is_none());
+    fn sources_must_be_https_on_an_allowed_host() {
+        assert_eq!(upstream().host, "gitea.com");
+        assert!(Source::parse("http://gitea.com/gitea/runner", &[]).is_err());
+        assert!(Source::parse("https://evil.test/gitea/runner", &[]).is_err());
+        assert!(Source::parse("https://user@gitea.com/x", &[]).is_err());
+        assert!(Source::parse("https://gitea.com/x?y", &[]).is_err());
+        let mirror = Source::parse(
+            "https://git.internal.test/mirror/runner/",
+            &["git.internal.test".into()],
+        )
+        .unwrap();
+        assert_eq!(mirror.base, "https://git.internal.test/mirror/runner");
     }
 
     #[test]
-    fn checksum_lookup_matches_the_exact_asset() {
-        let sums = "\
-eecac821bae95e3aea2285f3076e17610419447b205e63c9925a51ca56ee9769  gitea-runner-4.1.0-darwin-amd64
-141bd96e29e5704289cf888b7ae872ffcf41d14f39b8af031e2ab2978449f769  gitea-runner-4.1.0-darwin-arm64.xz
-3f1191ea1da7e64f93ff02295db7884b454eef69ceaa87eaf58ca2f583b75c81  gitea-runner-4.1.0-darwin-arm64
-";
+    fn artifacts_come_only_from_pins_on_the_source_host() {
+        let a = artifact(&upstream(), "v4.1.0", "darwin-arm64").unwrap();
         assert_eq!(
-            checksum_for(sums, "gitea-runner-4.1.0-darwin-arm64").as_deref(),
-            Some("3f1191ea1da7e64f93ff02295db7884b454eef69ceaa87eaf58ca2f583b75c81")
+            a.url,
+            "https://gitea.com/gitea/runner/releases/download/v4.1.0/gitea-runner-4.1.0-darwin-arm64"
         );
-        assert_eq!(checksum_for(sums, "gitea-runner-4.1.0-linux-amd64"), None);
-        assert_eq!(checksum_for("nothex  x", "x"), None);
+        assert_eq!(a.host, "gitea.com");
+        assert_eq!(
+            a.sha256,
+            "3f1191ea1da7e64f93ff02295db7884b454eef69ceaa87eaf58ca2f583b75c81"
+        );
+        let err = artifact(&upstream(), "9.9.9", "linux-amd64")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no pinned checksum"), "{err}");
+        assert!(artifact(&upstream(), "4.1.0/../../evil", "linux-amd64").is_err());
+    }
+
+    #[test]
+    fn every_pin_is_well_formed() {
+        for (v, t, asset, sha) in PINNED {
+            assert!(validate_version(v).is_ok());
+            assert!(asset.ends_with(&format!("{v}-{t}")));
+            assert_eq!(sha.len(), 64);
+            assert!(sha.chars().all(|c| c.is_ascii_hexdigit()));
+        }
+        assert!(PINNED.iter().any(|(v, ..)| *v == DEFAULT_VERSION));
     }
 
     #[test]

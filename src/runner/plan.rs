@@ -11,6 +11,7 @@ use plugin_toolkit::prelude::*;
 
 use super::health::{Finding, Remedy, ServiceState};
 use super::layout::{Init, Layout};
+use super::release::Artifact;
 
 /// Who a runner serves, which picks the Gitea endpoints that mint its
 /// registration token and delete it.
@@ -21,6 +22,34 @@ pub enum Scope {
     Repo(String, String),
 }
 
+/// Gitea's owner/repo name charset. `.` and `..` are refused outright: they
+/// are valid characters but, as whole segments, path traversal.
+fn validate_segment(kind: &str, s: &str) -> Result<()> {
+    let ok = !s.is_empty()
+        && s.len() <= 100
+        && s != "."
+        && s != ".."
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+    if !ok {
+        bail!("invalid {kind} name '{s}' in scope: use [A-Za-z0-9._-], not '.' or '..'");
+    }
+    Ok(())
+}
+
+/// Percent-encode one URL path segment (everything but RFC 3986 unreserved).
+pub fn encode_segment(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
 impl std::str::FromStr for Scope {
     type Err = anyhow::Error;
     fn from_str(s: &str) -> Result<Self> {
@@ -28,13 +57,13 @@ impl std::str::FromStr for Scope {
         if s.is_empty() || s == "instance" {
             return Ok(Scope::Instance);
         }
-        if let Some(org) = s.strip_prefix("org:").filter(|o| !o.is_empty()) {
+        if let Some(org) = s.strip_prefix("org:") {
+            validate_segment("org", org)?;
             return Ok(Scope::Org(org.to_string()));
         }
-        if let Some((owner, repo)) = s.strip_prefix("repo:").and_then(|r| r.split_once('/'))
-            && !owner.is_empty()
-            && !repo.is_empty()
-        {
+        if let Some((owner, repo)) = s.strip_prefix("repo:").and_then(|r| r.split_once('/')) {
+            validate_segment("owner", owner)?;
+            validate_segment("repo", repo)?;
             return Ok(Scope::Repo(owner.to_string(), repo.to_string()));
         }
         bail!("invalid scope '{s}' (expected instance | org:<org> | repo:<owner>/<repo>)")
@@ -46,8 +75,12 @@ impl Scope {
     pub fn runners_path(&self) -> String {
         match self {
             Scope::Instance => "/admin/actions/runners".to_string(),
-            Scope::Org(o) => format!("/orgs/{o}/actions/runners"),
-            Scope::Repo(o, r) => format!("/repos/{o}/{r}/actions/runners"),
+            Scope::Org(o) => format!("/orgs/{}/actions/runners", encode_segment(o)),
+            Scope::Repo(o, r) => format!(
+                "/repos/{}/{}/actions/runners",
+                encode_segment(o),
+                encode_segment(r)
+            ),
         }
     }
 
@@ -60,14 +93,43 @@ impl Scope {
     }
 }
 
+/// What the plugin records about a managed install, in the install's own
+/// directory. Deregistration uses the recorded scope rather than trusting a
+/// caller to remember it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunnerState {
+    pub scope: String,
+    pub version: String,
+}
+
+impl RunnerState {
+    pub fn to_json(&self) -> String {
+        plugin_toolkit::serde_json::to_string_pretty(self).unwrap_or_default()
+    }
+
+    pub fn read(path: &Path) -> Option<RunnerState> {
+        let text = std::fs::read_to_string(path).ok()?;
+        plugin_toolkit::serde_json::from_str(&text).ok()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Step {
-    CreateDir(PathBuf),
-    /// Resolve, download and checksum-verify the release, then atomically
+    CreateDir {
+        path: PathBuf,
+        mode: u32,
+    },
+    /// Download the pinned artifact, verify its sha256, then atomically
     /// replace `dest`.
     InstallBinary {
-        version: String,
+        artifact: Artifact,
         dest: PathBuf,
+    },
+    /// Refuse to continue unless the installed binary's major version equals
+    /// `major`. Runs the binary's `--version`, so it only ever runs on execute.
+    CheckMajor {
+        binary: PathBuf,
+        major: u64,
     },
     WriteFile {
         path: PathBuf,
@@ -75,8 +137,17 @@ pub enum Step {
         mode: u32,
         what: String,
     },
-    /// `act_runner register` with a registration token minted at run time, so
-    /// the token never appears in a plan.
+    Chmod {
+        path: PathBuf,
+        mode: u32,
+    },
+    /// Hand `path` and everything under it to `user`.
+    ChownTree {
+        path: PathBuf,
+        user: String,
+    },
+    /// `act_runner register` with a registration token minted at run time and
+    /// passed in the environment, so it appears in neither the plan nor `ps`.
     Register {
         binary: PathBuf,
         config: PathBuf,
@@ -94,6 +165,10 @@ pub enum Step {
     Deregister {
         runner_id: i64,
         scope: Scope,
+        /// True when `scope` is the one recorded at install. Only then is a
+        /// 404 proof the runner is gone; under a guessed scope it may just
+        /// mean the wrong collection was asked.
+        scope_known: bool,
     },
     Remove {
         path: PathBuf,
@@ -111,15 +186,33 @@ fn run(argv: &[&str], tolerate_failure: bool) -> Step {
 impl Step {
     pub fn to_change(&self) -> PlannedChange {
         match self {
-            Step::CreateDir(p) => PlannedChange::new(p.display().to_string(), "create-dir"),
-            Step::InstallBinary { version, dest } => {
+            Step::CreateDir { path, mode } => {
+                PlannedChange::new(path.display().to_string(), "create-dir")
+                    .with_detail(format!("mode {mode:o}"))
+            }
+            Step::InstallBinary { artifact: a, dest } => {
                 PlannedChange::new(dest.display().to_string(), "install-binary").with_detail(
-                    format!("download runner {version}, verify sha256 against the release checksum, replace atomically"),
+                    format!(
+                        "runner {} from {} (host {}), sha256 {} pinned in the plugin, replaced atomically",
+                        a.version, a.url, a.host, a.sha256
+                    ),
                 )
             }
-            Step::WriteFile { path, mode, what, .. } => {
-                PlannedChange::new(path.display().to_string(), "write")
-                    .with_detail(format!("{what} (mode {mode:o})"))
+            Step::CheckMajor { binary, major } => {
+                PlannedChange::new(binary.display().to_string(), "check-major")
+                    .with_detail(format!("refuse unless the installed major version is {major}"))
+            }
+            Step::WriteFile {
+                path, mode, what, ..
+            } => PlannedChange::new(path.display().to_string(), "write")
+                .with_detail(format!("{what} (mode {mode:o})")),
+            Step::Chmod { path, mode } => {
+                PlannedChange::new(path.display().to_string(), "chmod")
+                    .with_detail(format!("{mode:o}"))
+            }
+            Step::ChownTree { path, user } => {
+                PlannedChange::new(path.display().to_string(), "chown")
+                    .with_detail(format!("recursively to {user}"))
             }
             Step::Register {
                 name,
@@ -127,12 +220,18 @@ impl Step {
                 instance_url,
                 scope,
                 ..
-            } => PlannedChange::new(format!("gitea runner {name}"), "register").with_detail(format!(
-                "mint a {} registration token, register against {instance_url} with labels [{}]",
-                scope.label(),
-                labels.join(", ")
-            )),
-            Step::Run { argv, tolerate_failure } => {
+            } => PlannedChange::new(format!("gitea runner {name}"), "register").with_detail(
+                format!(
+                    "fetch the {} registration token, register against {instance_url} with labels [{}]; \
+                     the token is passed via GITEA_RUNNER_REGISTRATION_TOKEN, never argv",
+                    scope.label(),
+                    labels.join(", ")
+                ),
+            ),
+            Step::Run {
+                argv,
+                tolerate_failure,
+            } => {
                 let change = PlannedChange::new(argv.join(" "), "run");
                 if *tolerate_failure {
                     change.with_detail("failure tolerated")
@@ -140,10 +239,16 @@ impl Step {
                     change
                 }
             }
-            Step::Deregister { runner_id, scope } => {
-                PlannedChange::new(format!("gitea runner id {runner_id}"), "deregister")
-                    .with_detail(format!("DELETE {}/{runner_id}", scope.runners_path()))
-            }
+            Step::Deregister {
+                runner_id,
+                scope,
+                scope_known,
+            } => PlannedChange::new(format!("gitea runner id {runner_id}"), "deregister")
+                .with_detail(format!(
+                    "DELETE {}/{runner_id} ({} scope)",
+                    scope.runners_path(),
+                    if *scope_known { "recorded" } else { "caller-supplied" }
+                )),
             Step::Remove { path, recursive } => PlannedChange::new(
                 path.display().to_string(),
                 if *recursive { "remove-dir" } else { "remove-file" },
@@ -214,6 +319,56 @@ pub fn service_steps(layout: &Layout, op: ServiceOp, uid: u32, state: ServiceSta
     }
 }
 
+/// Create the runner's service account. In docker mode it also joins the
+/// `docker` group, which is root-equivalent on that host: containerized jobs
+/// need the socket, and that is the cost of docker mode.
+pub fn user_steps(init: Init, user: &str, home: &Path, docker: bool) -> Vec<Step> {
+    let home = home.to_string_lossy();
+    let mut steps = match init {
+        Init::Launchd => return Vec::new(),
+        Init::Systemd => vec![run(
+            &[
+                "useradd",
+                "--system",
+                "--user-group",
+                "--home-dir",
+                &home,
+                "--no-create-home",
+                "--shell",
+                "/usr/sbin/nologin",
+                user,
+            ],
+            false,
+        )],
+        Init::Openrc => vec![
+            run(&["addgroup", "-S", user], false),
+            run(
+                &[
+                    "adduser",
+                    "-S",
+                    "-D",
+                    "-H",
+                    "-h",
+                    &home,
+                    "-s",
+                    "/sbin/nologin",
+                    "-G",
+                    user,
+                    user,
+                ],
+                false,
+            ),
+        ],
+    };
+    if docker {
+        steps.push(match init {
+            Init::Openrc => run(&["addgroup", user, "docker"], false),
+            _ => run(&["usermod", "-aG", "docker", user], false),
+        });
+    }
+    steps
+}
+
 fn unit_mode(init: Init) -> u32 {
     match init {
         Init::Openrc => 0o755,
@@ -226,20 +381,26 @@ fn unit_mode(init: Init) -> u32 {
 pub struct InstallSpec<'a> {
     pub layout: &'a Layout,
     pub uid: u32,
-    pub version: &'a str,
+    pub artifact: Artifact,
     pub config_yaml: String,
     pub unit: String,
     pub labels: Vec<String>,
     pub instance_url: String,
     pub scope: Scope,
+    /// Account creation, when the layout's service user does not exist yet.
+    pub create_user: Vec<Step>,
 }
 
 pub fn install_steps(spec: &InstallSpec<'_>) -> Vec<Step> {
     let l = spec.layout;
-    let mut steps = vec![
-        Step::CreateDir(l.dir.clone()),
+    let mut steps = spec.create_user.clone();
+    steps.extend([
+        Step::CreateDir {
+            path: l.dir.clone(),
+            mode: 0o700,
+        },
         Step::InstallBinary {
-            version: spec.version.to_string(),
+            artifact: spec.artifact.clone(),
             dest: l.binary.clone(),
         },
         Step::WriteFile {
@@ -257,13 +418,33 @@ pub fn install_steps(spec: &InstallSpec<'_>) -> Vec<Step> {
             instance_url: spec.instance_url.clone(),
             scope: spec.scope.clone(),
         },
-        Step::WriteFile {
-            path: l.unit_path.clone(),
-            contents: spec.unit.clone(),
-            mode: unit_mode(l.init),
-            what: format!("{:?} service definition", l.init).to_lowercase(),
+        Step::Chmod {
+            path: l.runner_file.clone(),
+            mode: 0o600,
         },
-    ];
+        Step::WriteFile {
+            path: l.state_file(),
+            contents: RunnerState {
+                scope: spec.scope.label(),
+                version: spec.artifact.version.clone(),
+            }
+            .to_json(),
+            mode: 0o600,
+            what: "orca runner state (scope, version)".to_string(),
+        },
+    ]);
+    if let Some(user) = &l.user {
+        steps.push(Step::ChownTree {
+            path: l.dir.clone(),
+            user: user.clone(),
+        });
+    }
+    steps.push(Step::WriteFile {
+        path: l.unit_path.clone(),
+        contents: spec.unit.clone(),
+        mode: unit_mode(l.init),
+        what: format!("{:?} service definition", l.init).to_lowercase(),
+    });
     steps.extend(service_steps(
         l,
         ServiceOp::Load,
@@ -273,12 +454,34 @@ pub fn install_steps(spec: &InstallSpec<'_>) -> Vec<Step> {
     steps
 }
 
+/// The scope to deregister under: the recorded one, checked against what the
+/// caller passed. Disagreement is an error, not a guess.
+pub fn deregister_scope(recorded: Option<&str>, given: Option<&str>) -> Result<(Scope, bool)> {
+    match (recorded, given) {
+        (Some(r), Some(g)) => {
+            let (r, g): (Scope, Scope) = (r.parse()?, g.parse()?);
+            if r != g {
+                bail!(
+                    "runner was registered under scope '{}', not '{}'",
+                    r.label(),
+                    g.label()
+                );
+            }
+            Ok((r, true))
+        }
+        (Some(r), None) => Ok((r.parse()?, true)),
+        (None, Some(g)) => Ok((g.parse()?, false)),
+        (None, None) => Ok((Scope::Instance, false)),
+    }
+}
+
 pub fn uninstall_steps(
     layout: &Layout,
     uid: u32,
     state: ServiceState,
     runner_id: Option<i64>,
     scope: &Scope,
+    scope_known: bool,
     keep_files: bool,
 ) -> Vec<Step> {
     let mut steps = service_steps(layout, ServiceOp::Unload, uid, state);
@@ -293,6 +496,7 @@ pub fn uninstall_steps(
         steps.push(Step::Deregister {
             runner_id: id,
             scope: scope.clone(),
+            scope_known,
         });
     }
     if !keep_files {
@@ -304,11 +508,39 @@ pub fn uninstall_steps(
     steps
 }
 
-pub fn upgrade_steps(layout: &Layout, uid: u32, state: ServiceState, version: &str) -> Vec<Step> {
-    let mut steps = vec![Step::InstallBinary {
-        version: version.to_string(),
+/// `recorded` is the managed install's state, rewritten with the new version.
+/// `check_major` guards a hand-placed install against a silent major jump.
+pub fn upgrade_steps(
+    layout: &Layout,
+    uid: u32,
+    state: ServiceState,
+    artifact: &Artifact,
+    recorded: Option<&RunnerState>,
+    check_major: Option<u64>,
+) -> Vec<Step> {
+    let mut steps = Vec::new();
+    if let Some(major) = check_major {
+        steps.push(Step::CheckMajor {
+            binary: layout.binary.clone(),
+            major,
+        });
+    }
+    steps.push(Step::InstallBinary {
+        artifact: artifact.clone(),
         dest: layout.binary.clone(),
-    }];
+    });
+    if let Some(st) = recorded {
+        steps.push(Step::WriteFile {
+            path: layout.state_file(),
+            contents: RunnerState {
+                scope: st.scope.clone(),
+                version: artifact.version.clone(),
+            }
+            .to_json(),
+            mode: 0o600,
+            what: "orca runner state (scope, version)".to_string(),
+        });
+    }
     let op = if state == ServiceState::Running {
         ServiceOp::Restart
     } else {
@@ -415,9 +647,12 @@ pub fn touched_paths(steps: &[Step]) -> Vec<&Path> {
     steps
         .iter()
         .filter_map(|s| match s {
-            Step::CreateDir(p) => Some(p.as_path()),
+            Step::CreateDir { path, .. }
+            | Step::WriteFile { path, .. }
+            | Step::Remove { path, .. }
+            | Step::Chmod { path, .. }
+            | Step::ChownTree { path, .. } => Some(path.as_path()),
             Step::InstallBinary { dest, .. } => Some(dest.as_path()),
-            Step::WriteFile { path, .. } | Step::Remove { path, .. } => Some(path.as_path()),
             _ => None,
         })
         .collect()
@@ -450,6 +685,27 @@ mod tests {
         }
     }
 
+    fn artifact() -> Artifact {
+        let src =
+            crate::runner::release::Source::parse(crate::runner::release::DEFAULT_SOURCE, &[])
+                .unwrap();
+        crate::runner::release::artifact(&src, "4.1.0", "linux-amd64").unwrap()
+    }
+
+    fn spec(l: &Layout, create_user: Vec<Step>) -> InstallSpec<'_> {
+        InstallSpec {
+            layout: l,
+            uid: 501,
+            artifact: artifact(),
+            config_yaml: "cfg".into(),
+            unit: "unit".into(),
+            labels: vec!["macos:host".into()],
+            instance_url: "https://gitea.test".into(),
+            scope: Scope::Instance,
+            create_user,
+        }
+    }
+
     #[test]
     fn scope_parses_and_maps_to_api_paths() {
         assert_eq!("".parse::<Scope>().unwrap(), Scope::Instance);
@@ -469,79 +725,145 @@ mod tests {
     }
 
     #[test]
-    fn install_plan_orders_binary_config_register_unit_load() {
-        let l = layout(Init::Launchd);
-        let steps = install_steps(&InstallSpec {
-            layout: &l,
-            uid: 501,
-            version: "4.1.0",
-            config_yaml: "cfg".into(),
-            unit: "plist".into(),
-            labels: vec!["macos:host".into()],
-            instance_url: "http://gitea.test:3000".into(),
-            scope: Scope::Instance,
-        });
-        let a = actions(&steps);
-        assert_eq!(a.len(), 6, "{a:?}");
-        assert!(a[0].starts_with("create-dir "));
-        assert!(a[1].starts_with("install-binary ") && a[1].ends_with("/r1/act_runner"));
-        assert!(a[2].starts_with("write ") && a[2].ends_with("config.yaml"));
-        assert_eq!(a[3], "register gitea runner r1");
-        assert!(a[4].ends_with("com.argyle.gitea-runner.r1.plist"));
+    fn scope_refuses_traversal_and_url_metacharacters() {
+        for bad in [
+            "org:..",
+            "org:.",
+            "org:a/b",
+            "org:a?x",
+            "org:a#x",
+            "org:a%2F",
+            "org:a b",
+            "repo:../x",
+            "repo:a/..",
+            "repo:a/b/c",
+            "repo:a/b?x",
+            "repo:a/b#x",
+        ] {
+            assert!(bad.parse::<Scope>().is_err(), "accepted {bad:?}");
+        }
+        assert_eq!(encode_segment("a b/?#"), "a%20b%2F%3F%23");
         assert_eq!(
-            a[5],
-            "run launchctl bootstrap gui/501 /Users/op/Library/LaunchAgents/com.argyle.gitea-runner.r1.plist"
+            Scope::Org("we/ird".into()).runners_path(),
+            "/orgs/we%2Fird/actions/runners"
         );
-        let register = steps[3].to_change().detail.unwrap();
-        assert!(register.contains("instance registration token"));
-        assert!(!register.to_lowercase().contains("token="), "{register}");
     }
 
     #[test]
-    fn install_plan_on_systemd_reloads_and_enables() {
-        let l = layout(Init::Systemd);
-        let steps = install_steps(&InstallSpec {
-            layout: &l,
-            uid: 0,
-            version: "latest",
-            config_yaml: String::new(),
-            unit: String::new(),
-            labels: vec![],
-            instance_url: "http://g".into(),
-            scope: Scope::Org("argyle-labs".into()),
-        });
+    fn install_plan_orders_binary_config_register_secure_unit_load() {
+        let l = layout(Init::Launchd);
+        let steps = install_steps(&spec(&l, vec![]));
         let a = actions(&steps);
+        assert_eq!(a.len(), 8, "{a:?}");
+        assert!(a[0].starts_with("create-dir "));
+        assert!(matches!(steps[0], Step::CreateDir { mode: 0o700, .. }));
+        assert!(a[1].starts_with("install-binary ") && a[1].ends_with("/r1/act_runner"));
+        assert!(a[2].starts_with("write ") && a[2].ends_with("config.yaml"));
+        assert_eq!(a[3], "register gitea runner r1");
+        assert!(a[4].starts_with("chmod ") && a[4].ends_with("/r1/.runner"));
+        assert!(matches!(steps[4], Step::Chmod { mode: 0o600, .. }));
+        assert!(a[5].ends_with("orca-runner.json"));
+        assert!(a[6].ends_with("com.argyle.gitea-runner.r1.plist"));
+        assert_eq!(
+            a[7],
+            "run launchctl bootstrap gui/501 /Users/op/Library/LaunchAgents/com.argyle.gitea-runner.r1.plist"
+        );
+        let register = steps[3].to_change().detail.unwrap();
+        assert!(
+            register.contains("GITEA_RUNNER_REGISTRATION_TOKEN"),
+            "{register}"
+        );
+        match &steps[5] {
+            Step::WriteFile { contents, mode, .. } => {
+                assert_eq!(*mode, 0o600);
+                assert_eq!(
+                    plugin_toolkit::serde_json::from_str::<RunnerState>(contents).unwrap(),
+                    RunnerState {
+                        scope: "instance".into(),
+                        version: "4.1.0".into()
+                    }
+                );
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn install_plan_shows_source_url_and_host() {
+        let l = layout(Init::Launchd);
+        let detail = install_steps(&spec(&l, vec![]))[1]
+            .to_change()
+            .detail
+            .unwrap();
+        assert!(detail.contains(
+            "https://gitea.com/gitea/runner/releases/download/v4.1.0/gitea-runner-4.1.0-linux-amd64"
+        ));
+        assert!(detail.contains("host gitea.com"));
+        assert!(
+            detail.contains("b781d26b0f82269e73f6fae813a84c8ba5a215ea65cd7949c2fb3db5e0ccc8cf")
+        );
+    }
+
+    #[test]
+    fn linux_install_creates_the_user_and_hands_it_the_dir() {
+        let l = layout(Init::Systemd);
+        let users = user_steps(Init::Systemd, "gitea-runner", &l.dir, true);
+        let steps = install_steps(&spec(&l, users));
+        let a = actions(&steps);
+        assert!(a[0].starts_with("run useradd --system"), "{a:?}");
+        assert_eq!(a[1], "run usermod -aG docker gitea-runner");
+        let chown = a.iter().position(|x| x.starts_with("chown ")).unwrap();
+        let unit = a
+            .iter()
+            .position(|x| x.ends_with(".service") && x.starts_with("write"))
+            .unwrap();
+        assert!(chown < unit);
         assert_eq!(a[a.len() - 2], "run systemctl daemon-reload");
         assert_eq!(
             a[a.len() - 1],
             "run systemctl enable --now gitea-runner-r1.service"
         );
-        match &steps[4] {
-            Step::WriteFile { mode, .. } => assert_eq!(*mode, 0o644),
-            other => panic!("unexpected {other:?}"),
-        }
+        let alpine = actions(&user_steps(Init::Openrc, "gitea-runner", &l.dir, false));
+        assert_eq!(alpine[0], "run addgroup -S gitea-runner");
+        assert!(alpine[1].starts_with("run adduser -S -D -H"));
+        assert!(user_steps(Init::Launchd, "x", &l.dir, true).is_empty());
     }
 
     #[test]
     fn openrc_unit_is_executable() {
         let l = layout(Init::Openrc);
-        let steps = install_steps(&InstallSpec {
-            layout: &l,
-            uid: 0,
-            version: "latest",
-            config_yaml: String::new(),
-            unit: String::new(),
-            labels: vec![],
-            instance_url: "http://g".into(),
-            scope: Scope::Instance,
-        });
-        match &steps[4] {
-            Step::WriteFile { mode, path, .. } => {
-                assert_eq!(*mode, 0o755);
-                assert_eq!(path, &PathBuf::from("/etc/init.d/gitea-runner-r1"));
-            }
-            other => panic!("unexpected {other:?}"),
-        }
+        let steps = install_steps(&spec(&l, vec![]));
+        let unit = steps
+            .iter()
+            .find_map(|s| match s {
+                Step::WriteFile { mode, path, .. } if path.starts_with("/etc/init.d") => {
+                    Some(*mode)
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(unit, 0o755);
+    }
+
+    #[test]
+    fn deregister_scope_prefers_the_record_and_rejects_disagreement() {
+        assert_eq!(
+            deregister_scope(Some("org:a"), None).unwrap(),
+            (Scope::Org("a".into()), true)
+        );
+        assert_eq!(
+            deregister_scope(Some("org:a"), Some("org:a")).unwrap(),
+            (Scope::Org("a".into()), true)
+        );
+        assert!(deregister_scope(Some("org:a"), Some("instance")).is_err());
+        assert_eq!(
+            deregister_scope(None, Some("org:b")).unwrap(),
+            (Scope::Org("b".into()), false)
+        );
+        assert_eq!(
+            deregister_scope(None, None).unwrap(),
+            (Scope::Instance, false)
+        );
     }
 
     #[test]
@@ -553,6 +875,7 @@ mod tests {
             ServiceState::Running,
             Some(7),
             &Scope::Instance,
+            true,
             false,
         );
         let a = actions(&steps);
@@ -573,7 +896,15 @@ mod tests {
                 ..
             }
         ));
-        let kept = uninstall_steps(&l, 0, ServiceState::Stopped, None, &Scope::Instance, true);
+        let kept = uninstall_steps(
+            &l,
+            0,
+            ServiceState::Stopped,
+            None,
+            &Scope::Instance,
+            false,
+            true,
+        );
         assert!(
             !actions(&kept)
                 .iter()
@@ -582,12 +913,32 @@ mod tests {
     }
 
     #[test]
-    fn upgrade_plan_swaps_binary_then_restarts() {
+    fn upgrade_plan_swaps_binary_records_version_then_restarts() {
         let l = layout(Init::Systemd);
-        let a = actions(&upgrade_steps(&l, 0, ServiceState::Running, "4.1.0"));
-        assert_eq!(a.len(), 2);
+        let st = RunnerState {
+            scope: "instance".into(),
+            version: "3.1.0".into(),
+        };
+        let a = actions(&upgrade_steps(
+            &l,
+            0,
+            ServiceState::Running,
+            &artifact(),
+            Some(&st),
+            None,
+        ));
+        assert_eq!(a.len(), 3, "{a:?}");
         assert!(a[0].starts_with("install-binary"));
-        assert_eq!(a[1], "run systemctl restart gitea-runner-r1.service");
+        assert!(a[1].ends_with("orca-runner.json"));
+        assert_eq!(a[2], "run systemctl restart gitea-runner-r1.service");
+    }
+
+    #[test]
+    fn unmanaged_upgrade_checks_the_major_first() {
+        let l = Layout::legacy_candidates(Init::Openrc, Path::new("/root"))[0].clone();
+        let steps = upgrade_steps(&l, 0, ServiceState::Running, &artifact(), None, Some(4));
+        assert!(matches!(steps[0], Step::CheckMajor { major: 4, .. }));
+        assert!(actions(&steps)[1].starts_with("install-binary"));
     }
 
     #[test]

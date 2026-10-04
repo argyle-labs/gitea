@@ -5,7 +5,7 @@ use std::path::Path;
 use plugin_toolkit::prelude::*;
 
 use super::api;
-use super::host::LocalHost;
+use super::host::{self, LocalHost};
 use super::layout::managed_root;
 use super::plan::Step;
 use super::release;
@@ -25,25 +25,73 @@ pub struct Executor<'a> {
     pub host: &'a LocalHost,
     /// Needed only by register/deregister steps.
     pub gitea: Option<&'a Config>,
-    pub release_api: &'a str,
-    pub release_target: &'a str,
 }
 
-/// Write `contents` beside `path` and rename over it, so a reader (launchd,
-/// a running runner) never sees a half-written file.
+/// Write `contents` to a fresh temp file beside `path`, fsync it, and rename
+/// over `path`, so a reader (launchd, a running runner) never sees a partial
+/// file and a crash never leaves one. `create_new` refuses to reuse a temp
+/// path someone else planted.
 fn write_atomic(path: &Path, contents: &[u8], mode: u32) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
-    }
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("{} has no parent", path.display()))?;
+    std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     let file_name = path
         .file_name()
         .ok_or_else(|| anyhow!("{} has no file name", path.display()))?;
-    let tmp = path.with_file_name(format!(".{}.orca-new", file_name.to_string_lossy()));
-    std::fs::write(&tmp, contents).with_context(|| format!("write {}", tmp.display()))?;
-    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode))
-        .with_context(|| format!("chmod {}", tmp.display()))?;
-    std::fs::rename(&tmp, path).with_context(|| format!("rename onto {}", path.display()))?;
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let tmp = parent.join(format!(
+        ".{}.orca-new.{}.{nonce}",
+        file_name.to_string_lossy(),
+        std::process::id()
+    ));
+    let result = (|| -> Result<()> {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(mode)
+            .open(&tmp)
+            .with_context(|| format!("create {}", tmp.display()))?;
+        f.write_all(contents)
+            .with_context(|| format!("write {}", tmp.display()))?;
+        // `mode` above is filtered by the umask; set it exactly.
+        f.set_permissions(std::fs::Permissions::from_mode(mode))
+            .with_context(|| format!("chmod {}", tmp.display()))?;
+        f.sync_all()
+            .with_context(|| format!("fsync {}", tmp.display()))?;
+        std::fs::rename(&tmp, path).with_context(|| format!("rename onto {}", path.display()))?;
+        if let Ok(dir) = std::fs::File::open(parent) {
+            dir.sync_all().ok();
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        std::fs::remove_file(&tmp).ok();
+    }
+    result
+}
+
+fn create_dir_mode(path: &Path, mode: u32) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(path).with_context(|| format!("create {}", path.display()))?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+        .with_context(|| format!("chmod {}", path.display()))
+}
+
+fn chown_tree(path: &Path, uid: u32, gid: u32) -> Result<()> {
+    std::os::unix::fs::lchown(path, Some(uid), Some(gid))
+        .with_context(|| format!("chown {}", path.display()))?;
+    let meta = std::fs::symlink_metadata(path)?;
+    if meta.is_dir() {
+        for entry in std::fs::read_dir(path)? {
+            chown_tree(&entry?.path(), uid, gid)?;
+        }
+    }
     Ok(())
 }
 
@@ -55,6 +103,24 @@ fn scrub(text: &str, secret: &str) -> String {
     }
 }
 
+/// A 404 proves the runner is gone only under the scope it was registered
+/// in; under a caller-supplied scope it may be the wrong collection.
+fn deregister_outcome(
+    existed: bool,
+    scope_known: bool,
+    scope: &super::plan::Scope,
+    runner_id: i64,
+) -> Result<Option<String>> {
+    match (existed, scope_known) {
+        (true, _) => Ok(None),
+        (false, true) => Ok(Some("already absent in Gitea".to_string())),
+        (false, false) => bail!(
+            "runner {runner_id} not found under scope '{}', and the scope it was registered in is not recorded",
+            scope.label()
+        ),
+    }
+}
+
 impl Executor<'_> {
     fn gitea(&self) -> Result<&Config> {
         self.gitea
@@ -63,18 +129,41 @@ impl Executor<'_> {
 
     async fn step(&self, step: &Step) -> Result<Option<String>> {
         match step {
-            Step::CreateDir(p) => {
-                std::fs::create_dir_all(p).with_context(|| format!("create {}", p.display()))?;
+            Step::CreateDir { path, mode } => {
+                create_dir_mode(path, *mode)?;
                 Ok(None)
             }
-            Step::InstallBinary { version, dest } => {
-                let bin = release::resolve(self.release_api, version, self.release_target)?;
-                let bytes = release::download(&bin)?;
+            Step::InstallBinary { artifact, dest } => {
+                let bytes = release::download(artifact)?;
                 write_atomic(dest, &bytes, 0o755)?;
                 Ok(Some(format!(
-                    "installed {} ({}, sha256 {} verified)",
-                    bin.version, bin.asset, bin.sha256
+                    "installed {} from {} (sha256 {} verified)",
+                    artifact.version, artifact.host, artifact.sha256
                 )))
+            }
+            Step::CheckMajor { binary, major } => {
+                let found =
+                    self.host.binary_version(binary).await.ok_or_else(|| {
+                        anyhow!("could not read the version of {}", binary.display())
+                    })?;
+                if release::major(&found) != Some(*major) {
+                    bail!(
+                        "installed runner is {found}, target major is {major}; pass allow_major_upgrade to cross a major version"
+                    );
+                }
+                Ok(Some(format!("installed {found}")))
+            }
+            Step::Chmod { path, mode } => {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(*mode))
+                    .with_context(|| format!("chmod {}", path.display()))?;
+                Ok(None)
+            }
+            Step::ChownTree { path, user } => {
+                let (uid, gid) = host::lookup_user(user)
+                    .ok_or_else(|| anyhow!("user '{user}' does not exist"))?;
+                chown_tree(path, uid, gid)?;
+                Ok(None)
             }
             Step::WriteFile {
                 path,
@@ -101,8 +190,6 @@ impl Executor<'_> {
                     "--no-interactive".into(),
                     "--instance".into(),
                     instance_url.clone(),
-                    "--token".into(),
-                    token.clone(),
                     "--name".into(),
                     name.clone(),
                     "--labels".into(),
@@ -111,7 +198,14 @@ impl Executor<'_> {
                     config.display().to_string(),
                 ]
                 .into();
-                let out = self.host.run(&argv, Some(dir)).await?;
+                let out = self
+                    .host
+                    .run_with_env(
+                        &argv,
+                        Some(dir),
+                        &[("GITEA_RUNNER_REGISTRATION_TOKEN", token.as_str())],
+                    )
+                    .await?;
                 if !out.ok {
                     bail!(
                         "act_runner register exited {:?}: {}",
@@ -144,9 +238,13 @@ impl Executor<'_> {
                     bail!("{why}")
                 }
             }
-            Step::Deregister { runner_id, scope } => {
+            Step::Deregister {
+                runner_id,
+                scope,
+                scope_known,
+            } => {
                 let existed = api::deregister(self.gitea()?, scope, *runner_id).await?;
-                Ok((!existed).then(|| "already absent in Gitea".to_string()))
+                deregister_outcome(existed, *scope_known, scope, *runner_id)
             }
             Step::Remove { path, recursive } => {
                 let result = if *recursive {
@@ -231,6 +329,47 @@ mod tests {
     }
 
     #[test]
+    fn atomic_write_replaces_and_never_reuses_a_planted_temp() {
+        let d = scratch("planted");
+        let p = d.join("cfg");
+        std::fs::write(&p, b"old").unwrap();
+        write_atomic(&p, b"new", 0o600).unwrap();
+        write_atomic(&p, b"newer", 0o600).unwrap();
+        assert_eq!(std::fs::read(&p).unwrap(), b"newer");
+        assert_eq!(std::fs::read_dir(&d).unwrap().count(), 1);
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn create_dir_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = scratch("mode").join("r1");
+        create_dir_mode(&d, 0o700).unwrap();
+        assert_eq!(
+            std::fs::metadata(&d).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        std::fs::remove_dir_all(d.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn a_404_is_only_success_under_the_recorded_scope() {
+        use crate::runner::plan::Scope;
+        assert!(
+            deregister_outcome(true, false, &Scope::Instance, 1)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            deregister_outcome(false, true, &Scope::Instance, 1)
+                .unwrap()
+                .is_some()
+        );
+        let err = deregister_outcome(false, false, &Scope::Org("x".into()), 1).unwrap_err();
+        assert!(err.to_string().contains("not recorded"), "{err}");
+    }
+
+    #[test]
     fn scrub_redacts_the_token() {
         assert_eq!(scrub("bad token abc123", "abc123"), "bad token <redacted>");
     }
@@ -246,8 +385,6 @@ mod tests {
         let exec = Executor {
             host: &host,
             gitea: None,
-            release_api: "",
-            release_target: "darwin-arm64",
         };
         let outside = home.join("precious");
         std::fs::create_dir_all(&outside).unwrap();
@@ -291,8 +428,6 @@ mod tests {
         let exec = Executor {
             host: &host,
             gitea: None,
-            release_api: "",
-            release_target: "",
         };
         let steps = vec![
             Step::Run {

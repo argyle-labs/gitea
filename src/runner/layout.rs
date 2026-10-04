@@ -74,9 +74,15 @@ pub struct Layout {
     pub unit_path: PathBuf,
     /// False for a hand-placed install this plugin found but did not create.
     pub managed: bool,
+    /// Unprivileged account the service runs as. `None` runs it as whoever
+    /// the service manager uses: the daemon user for a launchd agent, root
+    /// for a hand-placed Linux install.
+    pub user: Option<String>,
 }
 
 const LAUNCHD_LABEL_PREFIX: &str = "com.argyle.gitea-runner.";
+/// Account managed Linux runners run as, so a job never runs as root.
+pub const RUNNER_USER: &str = "gitea-runner";
 const LINUX_ROOT: &str = "/var/lib/gitea-runner";
 
 /// Root under which managed installs live. The launchd root avoids
@@ -135,7 +141,13 @@ impl Layout {
             service,
             unit_path,
             managed: true,
+            user: (init != Init::Launchd).then(|| RUNNER_USER.to_string()),
         }
+    }
+
+    /// Plugin-owned record of how the runner was installed (scope, version).
+    pub fn state_file(&self) -> PathBuf {
+        self.dir.join("orca-runner.json")
     }
 
     /// Hand-placed installs that predate this plugin, at the paths the fleet
@@ -156,6 +168,7 @@ impl Layout {
                     service: "com.argyle.gitea-act-runner".to_string(),
                     unit_path: home.join("Library/LaunchAgents/com.argyle.gitea-act-runner.plist"),
                     managed: false,
+                    user: None,
                 }]
             }
             Init::Openrc => {
@@ -171,6 +184,7 @@ impl Layout {
                     service: "act_runner".to_string(),
                     unit_path: PathBuf::from("/etc/init.d/act_runner"),
                     managed: false,
+                    user: None,
                 }]
             }
             Init::Systemd => Vec::new(),
@@ -223,6 +237,13 @@ mod tests {
         assert_eq!(
             s.unit_path,
             PathBuf::from("/etc/systemd/system/gitea-runner-baldur.service")
+        );
+
+        assert_eq!(l.user, None);
+        assert_eq!(s.user.as_deref(), Some(RUNNER_USER));
+        assert_eq!(
+            s.state_file(),
+            PathBuf::from("/var/lib/gitea-runner/baldur/orca-runner.json")
         );
 
         let o = Layout::managed(Init::Openrc, "freyr", home);
