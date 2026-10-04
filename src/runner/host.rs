@@ -445,24 +445,26 @@ pub fn read_local_db(path: &Path) -> Result<String> {
     }
 }
 
-/// The `:`-separated fields of `name`'s entry in a local account database.
-fn local_entry<'a>(db: &'a str, name: &str) -> Option<Vec<&'a str>> {
+/// The `:`-separated fields of every entry for `name` in a local account
+/// database; a hand-edited file can repeat a name.
+fn local_entries<'a>(db: &'a str, name: &'a str) -> impl Iterator<Item = Vec<&'a str>> {
     db.lines()
         .map(|l| l.split(':').collect::<Vec<_>>())
-        .find(|f| f.first() == Some(&name))
+        .filter(move |f| f.first() == Some(&name))
 }
 
 /// Whether `/etc/passwd`-format `passwd` has an entry for `user`.
 pub fn local_user_exists(passwd: &str, user: &str) -> bool {
-    local_entry(passwd, user).is_some()
+    local_entries(passwd, user).next().is_some()
 }
 
 /// Whether `/etc/group`-format `groups` lists `user` as a member of `group`:
 /// the membership `gpasswd -d` / `delgroup` can remove.
 pub fn local_group_lists(groups: &str, group: &str, user: &str) -> bool {
-    local_entry(groups, group)
-        .and_then(|f| f.get(3).copied())
-        .is_some_and(|members| members.split(',').any(|m| m.trim() == user))
+    local_entries(groups, group).any(|f| {
+        f.get(3)
+            .is_some_and(|members| members.split(',').any(|m| m.trim() == user))
+    })
 }
 
 /// Effective uid (second field) of `/proc/self/status`'s `Uid:` line.
@@ -671,6 +673,8 @@ mod tests {
         assert!(local_group_lists(groups, "docker", "gitea-runner-r1"));
         assert!(!local_group_lists(groups, "docker", "bob"));
         assert!(!local_group_lists(groups, "nope", "alice"));
+        let repeated = "docker:x:999:alice\ndocker:x:999:gitea-runner-r1\n";
+        assert!(local_group_lists(repeated, "docker", "gitea-runner-r1"));
         let passwd = "root:x:0:0::/root:/bin/sh\ngitea-runner-r1:x:990:990::/x:/sbin/nologin\n";
         assert!(local_user_exists(passwd, "gitea-runner-r1"));
         assert!(!local_user_exists(passwd, "gitea-runner"));

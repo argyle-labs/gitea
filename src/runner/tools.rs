@@ -636,12 +636,7 @@ pub async fn gitea_runner_install(args: RunnerInstallArgs, ctx: &ToolCtx) -> Res
         },
         None => plan::AccountFacts::default(),
     };
-    let mut account = plan::account_plan(host.init, l.user.as_deref(), &l.data, docker, facts);
-    let prior = RunnerState::read(&l.state_file());
-    account.record = account.record.union(account_still_applied_here(
-        l.user.as_deref(),
-        prior.as_ref(),
-    )?);
+    let account = plan::account_plan(host.init, l.user.as_deref(), &l.data, docker, facts);
     let mut summary = format!(
         "install runner '{}' {} ({} executor, capacity {}, {}) from {} registering with {instance_url} as {}",
         args.name,
@@ -670,7 +665,6 @@ pub async fn gitea_runner_install(args: RunnerInstallArgs, ctx: &ToolCtx) -> Res
         instance_url,
         scope,
         account,
-        runner_id: prior.and_then(|p| p.runner_id),
     });
     let exec = Executor {
         host: &host,
@@ -1080,32 +1074,6 @@ mod tests {
             account_still_applied(None, Some(&state(true, true)), "", ""),
             rec(true, true)
         );
-    }
-
-    #[test]
-    fn install_merges_the_on_disk_record_only_where_it_still_holds() {
-        let dir = std::env::temp_dir().join(format!("gitea-merge-{}", std::process::id()));
-        let path = dir.join("r1.json");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(&path, state(true, true).to_json()).unwrap();
-        let prior = RunnerState::read(&path);
-        std::fs::remove_dir_all(&dir).ok();
-        let planned = plan::AccountRecord::default();
-        let u = Some("gitea-runner-r1");
-        let merged = planned.union(account_still_applied(u, prior.as_ref(), PASSWD, GROUP));
-        assert!(merged.created && merged.added_docker_group);
-        let stale = planned.union(account_still_applied(
-            u,
-            prior.as_ref(),
-            "",
-            "docker:x:999:\n",
-        ));
-        assert_eq!(
-            stale,
-            plan::AccountRecord::default(),
-            "a prior flag that no longer holds is dropped"
-        );
-        assert_eq!(prior.and_then(|p| p.runner_id), Some(5));
     }
 
     fn local(name: &str, id: Option<i64>) -> LocalInstall {
