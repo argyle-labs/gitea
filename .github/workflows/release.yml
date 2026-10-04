@@ -2,8 +2,9 @@ name: Release
 
 # Thin caller: the whole release flow lives ONCE in the org reusable
 # argyle-labs/.github → .github/workflows/plugin-release.yml. This repo forwards
-# the manual dispatch inputs and requests BOTH host targets (glibc + musl) so the
-# plugin binary is published per host libc. See that file for version math +
+# the manual dispatch inputs and requests every orca-host target: Linux glibc +
+# musl, and arm64 macOS (a Mac runner is managed by the plugin on that Mac).
+# See that file for version math +
 # artifact staging (plugin binary + sha256, built against orca `main`).
 #   Actions → Release → Run workflow → channel (rc | stable) + bump.
 
@@ -37,4 +38,4 @@ jobs:
       channel: ${{ inputs.channel }}
       bump: ${{ inputs.bump }}
       notes: ${{ inputs.notes }}
-      targets: '["x86_64-unknown-linux-gnu", "x86_64-unknown-linux-musl"]'
+      targets: '["x86_64-unknown-linux-gnu", "x86_64-unknown-linux-musl", "aarch64-apple-darwin"]'

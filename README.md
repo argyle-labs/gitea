@@ -149,6 +149,60 @@ gitea.backup  --endpoint home
 gitea.restore --endpoint home --archive /var/lib/gitea/backups/gitea-dump-<ts>.tar.zst
 ```
 
+### Actions runners — `gitea.runner.*`
+
+Installs, registers, supervises, health-checks, heals, upgrades and removes
+Gitea Actions runners on **the orca system the call runs on**; a runner on
+another system is managed by the gitea plugin there. Mutating verbs are
+dry-run by default: they return an `ExecutionPlan` listing every file,
+command, download and API call, and apply only with `--execute` from an
+identified admin caller (a call with no caller identity is refused).
+
+| verb | does |
+|---|---|
+| `gitea.runner.list` | Gitea's runner list (online, busy, labels) joined with this system's installs |
+| `gitea.runner.health` | classifies each local runner: service down, offline-while-running, starved (idle while a matching job waits), launchd throttled priority, host-executor capacity > 1 |
+| `gitea.runner.install` | download a pinned, sha256-verified runner release, render `config.yaml`, register, install the supervised service |
+| `gitea.runner.heal` | applies the health findings' remedies (restart, reload, rewrite unit/config) and reports why |
+| `gitea.runner.upgrade` | swap in a pinned, verified release binary and restart |
+| `gitea.runner.uninstall` | stop and remove the service, deregister from Gitea (under the scope recorded at install), delete files |
+
+Service units: launchd agents set `ProcessType=Interactive` (otherwise macOS
+schedules the runner at background priority), `KeepAlive` and `RunAtLoad`.
+On Linux each runner runs as its own unprivileged account,
+`gitea-runner-<name>` (created by the plan if missing; docker mode adds it to
+the `docker` group so the runner process can start containers). The account
+owns only the install's `data/` (registration, log, cache, job work); the
+binary, `config.yaml` and the unit stay root-owned, and the plugin's state
+record lives outside the install in `/var/lib/gitea-runner/.orca/`. Job
+containers never get the Docker socket (`docker_host: "-"`). systemd
+units use `Restart=always` with no start limit; docker-mode units wait for the
+Docker socket to answer. OpenRC scripts run under `supervise-daemon`. Any
+host-executor label pins capacity to 1, and host labels on a runner that would
+run as root are refused unless `force_host_as_root` is set.
+
+Releases: only versions whose sha256 is pinned in the plugin install
+(`src/runner/release.rs`). Operator config on the orca daemon's environment:
+
+| variable | meaning |
+|---|---|
+| `ORCA_GITEA_RUNNER_RELEASE_SOURCE` | https Gitea repo mirroring the runner releases (default `https://gitea.com/gitea/runner`) |
+| `ORCA_GITEA_RUNNER_RELEASE_HOSTS` | extra hosts the release source may be on |
+| `ORCA_GITEA_RUNNER_PLAINTEXT_ORIGINS` | plain-http Gitea origins a runner may register against |
+
+The runner's `instance_url` must be one of the endpoint's own routes. The
+registration token is passed to `act_runner register` in the environment,
+never argv. Gitea reuses one registration token per scope and has no API to
+rotate it; reset it in Gitea if it may have been exposed. Instance scope needs
+an admin-scoped Gitea token.
+
+```sh
+gitea.runner.install --endpoint home --name mint-macos                # plan
+gitea.runner.install --endpoint home --name mint-macos --execute
+gitea.runner.health  --endpoint home
+gitea.runner.heal    --endpoint home --name mint-macos --execute
+```
+
 ---
 
 ## Layout
@@ -158,6 +212,8 @@ gitea.restore --endpoint home --archive /var/lib/gitea/backups/gitea-dump-<ts>.t
     registry (`#[endpoint_resource]`) + client/token resolution.
   - `deploy.rs` — the `Substrate` abstraction and the `gitea.deploy` verb.
   - `backup.rs` — the `gitea.backup` / `gitea.restore` verbs wrapping `gitea dump`.
+  - `runner/` — `gitea.runner.*`: layout, renderers, release verification,
+    health classification, step plans, the local executor, and the verbs.
   - `lib.rs`, `main.rs` — plugin wiring and the `serve_tool_plugin!` entrypoint.
 - `specs/` — the vendored Gitea API spec (`gitea.swagger2.json` and the
   converted `gitea.openapi.json` the REST surface is generated from).
