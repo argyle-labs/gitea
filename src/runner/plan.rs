@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 
 use plugin_toolkit::contract::plan::PlannedChange;
 use plugin_toolkit::prelude::*;
+use plugin_toolkit::url;
 
 use super::health::{Finding, Remedy, ServiceState};
 use super::host::{local_group_lists, local_user_exists};
@@ -38,19 +39,6 @@ fn validate_segment(kind: &str, s: &str) -> Result<()> {
     Ok(())
 }
 
-/// Percent-encode one URL path segment (everything but RFC 3986 unreserved).
-pub fn encode_segment(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for b in s.bytes() {
-        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
-            out.push(b as char);
-        } else {
-            out.push_str(&format!("%{b:02X}"));
-        }
-    }
-    out
-}
-
 impl std::str::FromStr for Scope {
     type Err = anyhow::Error;
     fn from_str(s: &str) -> Result<Self> {
@@ -76,11 +64,11 @@ impl Scope {
     pub fn runners_path(&self) -> String {
         match self {
             Scope::Instance => "/admin/actions/runners".to_string(),
-            Scope::Org(o) => format!("/orgs/{}/actions/runners", encode_segment(o)),
+            Scope::Org(o) => format!("/orgs/{}/actions/runners", url::encode(o)),
             Scope::Repo(o, r) => format!(
                 "/repos/{}/{}/actions/runners",
-                encode_segment(o),
-                encode_segment(r)
+                url::encode(o),
+                url::encode(r)
             ),
         }
     }
@@ -1002,7 +990,9 @@ mod tests {
         ] {
             assert!(bad.parse::<Scope>().is_err(), "accepted {bad:?}");
         }
-        assert_eq!(encode_segment("a b/?#"), "a%20b%2F%3F%23");
+        assert_eq!(url::encode("a b/?#"), "a%20b%2F%3F%23");
+        assert_eq!(url::encode("Az09-._~"), "Az09-._~");
+        assert_eq!(url::encode("é"), "%C3%A9");
         assert_eq!(
             Scope::Org("we/ird".into()).runners_path(),
             "/orgs/we%2Fird/actions/runners"
