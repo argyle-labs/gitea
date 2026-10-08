@@ -2,7 +2,7 @@
 name = "gitea"
 version = "0.1.0"
 edition = "2024"
-description = "Gitea plugin for orca — full REST API surface + dual-substrate (lxc|docker) deploy + gitea-dump backup/restore"
+description = "Gitea plugin for orca — full REST API surface + dual-substrate (lxc|docker) deploy + gitea-dump backup/restore verbs (not implemented yet)"
 build = "build.rs"
 
 [package.metadata.orca]

@@ -7,7 +7,8 @@
 First-party [orca](https://github.com/argyle-labs/orca) plugin for
 [Gitea](https://gitea.io), the self-hostable Git service: it exposes the **full
 Gitea REST API** as `gitea.*` tools, does **dual-substrate deploy** (LXC or
-Docker), and does **substrate-portable backup/restore** wrapping `gitea dump`.
+Docker), and defines **substrate-portable backup/restore** verbs wrapping
+`gitea dump` (not implemented yet — see below).
 
 Gitea runs perfectly well on its own — you can stand it up by hand with Docker
 Compose or in an LXC container, and orca will happily manage an instance you
@@ -138,16 +139,16 @@ trait + dispatch + spec validation are the stable seam.)*
 
 ### Backup / restore — `gitea.backup` / `gitea.restore`
 
-Both wrap `gitea dump`, which produces one app-consistent archive (DB + repos +
-LFS + config). Because the archive is **portable between substrates**, an LXC
-dump restores into a Docker deploy and vice-versa — so an LXC↔Docker migration
-is just a backup followed by a restore. Archives default to
-`/var/lib/gitea/backups` on the target host.
+Both are meant to wrap `gitea dump`, which produces one app-consistent archive
+(DB + repos + LFS + config). Because the archive is **portable between
+substrates**, an LXC dump restores into a Docker deploy and vice-versa — so an
+LXC↔Docker migration is a backup followed by a restore.
 
-```sh
-gitea.backup  --endpoint home
-gitea.restore --endpoint home --archive /var/lib/gitea/backups/gitea-dump-<ts>.tar.zst
-```
+**Not implemented yet:** both verbs refuse with a `not implemented` error and
+never report success. They need an endpoint → substrate binding, an in-guest
+exec seam that allows `gitea dump` and copies the archive out, and a `gitea`
+backup kind that writes to a backup target with a sha256 checksum verified
+before restore (gitea#7, gitea#9).
 
 ### Actions runners — `gitea.runner.*`
 
