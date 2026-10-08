@@ -7,9 +7,9 @@
 //!   - **Docker** provider drives the docker/dockge plugin to bring up the
 //!     `gitea/gitea` + `postgres` compose stack.
 //!
-//! Both funnel backup/restore through the SAME `gitea dump` (see
-//! [`crate::backup`]) so archives are portable between substrates — which also
-//! makes LXC↔Docker migration a backup+restore.
+//! Backup/restore is meant to funnel both substrates through the SAME
+//! `gitea dump` so archives are portable and LXC↔Docker migration is a
+//! backup+restore; it is not implemented yet (see [`crate::backup`]).
 //!
 //! This module defines the substrate abstraction and the `gitea.deploy` tool.
 //! Provider internals that shell out to peer plugins are driven over the mesh

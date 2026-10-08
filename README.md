@@ -93,7 +93,8 @@ pct exec 200 -- apt-get install -y postgresql
 
 See the [Gitea docs](https://docs.gitea.com/installation/install-from-binary)
 for the full binary-install walkthrough. Whichever way you run it, `gitea dump`
-produces the portable archive orca's backup verbs use (below).
+produces the portable archive orca's backup verbs are meant to use (not
+implemented yet — see below).
 
 ---
 
@@ -234,7 +235,7 @@ gitea.pr.list   --endpoint home --owner argyle-labs
   - `tools.rs` — the `gitea.{list,detail,create,update,delete}` endpoint
     registry (`#[endpoint_resource]`) + client/token resolution.
   - `deploy.rs` — the `Substrate` abstraction and the `gitea.deploy` verb.
-  - `backup.rs` — the `gitea.backup` / `gitea.restore` verbs wrapping `gitea dump`.
+  - `backup.rs` — the `gitea.backup` / `gitea.restore` verbs (not implemented).
   - `runner/` — `gitea.runner.*`: layout, renderers, release verification,
     health classification, step plans, the local executor, and the verbs.
   - `ci.rs` — `gitea.ci.status` / `gitea.pr.list`: CI jobs, runs, stuck-job

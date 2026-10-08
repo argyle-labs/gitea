@@ -1,16 +1,5 @@
-//! `gitea.backup` / `gitea.restore` — app-consistent `gitea dump` backup and
-//! restore, portable across the lxc and docker substrates.
-//!
-//! Neither verb can run yet, so both refuse with a "not implemented" error and
-//! never report success or an archive path. Missing pieces (gitea#7, gitea#9):
-//! - an endpoint → substrate binding: a registered endpoint is a URL + token,
-//!   with no record of which LXC vmid or docker container runs the instance;
-//! - in-guest exec of `gitea`: orca's privileged lxc-exec seam allowlists only
-//!   package/service/read-only diagnostic commands, caps a run at 300s, and has
-//!   no way to pull an archive out of the guest;
-//! - a backup target: the plugin registers no `BackupKindPlugin`, so there is
-//!   no off-rootfs destination to write the dump to, nor a stored sha256 to
-//!   verify before a restore.
+//! `gitea.backup` / `gitea.restore` — not implemented yet; the missing pieces
+//! are listed in [`BACKUP_MISSING`] and [`RESTORE_MISSING`].
 
 use plugin_toolkit::prelude::*;
 
@@ -20,7 +9,8 @@ const BACKUP_MISSING: &str = "no endpoint → substrate (LXC vmid / docker conta
      (gitea#7, gitea#9)";
 
 const RESTORE_MISSING: &str = "no endpoint → substrate (LXC vmid / docker container) binding; \
-     no seam to push a dump archive into the guest and run the multi-step restore; \
+     orca's lxc push seam caps a file at 8 MiB, far too small for a dump archive; \
+     nothing runs the multi-step restore in the guest; \
      no `gitea` BackupKindPlugin holding a sha256 checksum to verify the archive against \
      (gitea#7, gitea#9)";
 
@@ -45,7 +35,8 @@ pub struct GiteaBackupResult {
     verb = "backup",
     data_mutation = true,
     role = "admin",
-    // The default dry-run preview would say the verb "would run"; it cannot.
+    // Ungated so a dry run errors instead of previewing a run that cannot
+    // happen. Restore the gate once the body is implemented.
     execute_gated = false
 )]
 pub async fn gitea_backup(args: GiteaBackupArgs, _ctx: &ToolCtx) -> Result<GiteaBackupResult> {
@@ -78,7 +69,8 @@ pub struct GiteaRestoreResult {
     verb = "restore",
     data_mutation = true,
     role = "admin",
-    // The default dry-run preview would say the verb "would run"; it cannot.
+    // Ungated so a dry run errors instead of previewing a run that cannot
+    // happen. Restore the gate once the body is implemented.
     execute_gated = false
 )]
 pub async fn gitea_restore(args: GiteaRestoreArgs, _ctx: &ToolCtx) -> Result<GiteaRestoreResult> {

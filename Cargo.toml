@@ -28,7 +28,8 @@ path = "src/main.rs"
 #
 # Beyond its tool surface, this plugin owns dual-substrate deploy
 # (`gitea.deploy substrate=lxc|docker`) and substrate-portable backup/restore
-# (`gitea.backup`/`gitea.restore`) wrapping `gitea dump`.
+# (`gitea.backup`/`gitea.restore`) meant to wrap `gitea dump`; backup/restore
+# are not implemented yet and always fail.
 
 [dependencies]
 # The SOLE orca dependency (see proxmox for the full rationale). Tracks orca
