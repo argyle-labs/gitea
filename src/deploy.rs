@@ -1,11 +1,10 @@
-//! Dual-substrate Gitea deploy — the hard requirement.
+//! Dual-substrate Gitea deploy.
 //!
 //! `gitea.deploy(substrate = "lxc" | "docker", spec)` dispatches to a
-//! [`GiteaSubstrate`] provider:
-//!   - **LXC** provider drives the proxmox plugin (create LXC, nesting) then
-//!     configures Gitea + Postgres inside it.
-//!   - **Docker** provider drives the docker/dockge plugin to bring up the
-//!     `gitea/gitea` + `postgres` compose stack.
+//! [`GiteaSubstrate`] provider. The LXC provider is meant to drive the proxmox
+//! plugin (create LXC, nesting) then configure Gitea + Postgres inside it; the
+//! Docker provider is meant to drive the docker/dockge plugin to bring up the
+//! `gitea/gitea` + `postgres` compose stack.
 //!
 //! Backup/restore is meant to funnel both substrates through the SAME
 //! `gitea dump` so archives are portable and LXC↔Docker migration is a
@@ -20,8 +19,8 @@ use plugin_toolkit::prelude::*;
 const LXC_MISSING: &str = "plugin-toolkit has no seam for a plugin tool to invoke another \
      plugin's tools, so the proxmox plugin cannot be driven to create the LXC; \
      orca's lxc-exec seam does not allow the commands that set up Postgres and Gitea \
-     (psql, useradd, the gitea binary), and its push seam caps a file at 8 MiB, too small \
-     for the Gitea binary; nothing registers the new instance as an endpoint";
+     (psql, useradd, the gitea binary); plugin-toolkit exposes no push seam, and orca's \
+     caps a file at 8 MiB, too small for the Gitea binary; nothing registers the new instance as an endpoint";
 
 const DOCKER_MISSING: &str = "plugin-toolkit has no seam for a plugin tool to invoke another \
      plugin's tools, so the docker/dockge plugin cannot be driven to bring up the \
@@ -96,7 +95,7 @@ pub trait GiteaSubstrate: Send + Sync {
     async fn provision(&self, spec: &DeploySpec) -> Result<DeployOutcome>;
 }
 
-/// LXC substrate — drives the proxmox plugin over the mesh.
+/// LXC substrate. Not implemented; see [`LXC_MISSING`].
 pub struct LxcSubstrate;
 
 #[plugin_toolkit::async_trait::async_trait]
@@ -113,7 +112,7 @@ impl GiteaSubstrate for LxcSubstrate {
     }
 }
 
-/// Docker substrate — drives the docker/dockge plugin over the mesh.
+/// Docker substrate. Not implemented; see [`DOCKER_MISSING`].
 pub struct DockerSubstrate;
 
 #[plugin_toolkit::async_trait::async_trait]
@@ -172,7 +171,7 @@ pub struct GiteaDeployArgs {
     data_mutation = true,
     role = "admin",
     // Ungated so a dry run errors instead of previewing a run that cannot
-    // happen. Restore the gate once a provider is implemented.
+    // happen. Re-enable the gate once a provider is implemented.
     execute_gated = false
 )]
 pub async fn gitea_deploy(args: GiteaDeployArgs, _ctx: &ToolCtx) -> Result<DeployOutcome> {

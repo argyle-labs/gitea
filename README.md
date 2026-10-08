@@ -19,14 +19,14 @@ deployed yourself. Both paths are documented below.
 ## Run it without orca (standalone)
 
 Gitea is a single Go binary plus a data directory. The plugin's deploy verb is
-meant to run it two ways (not implemented yet) — a `gitea/gitea` + `postgres` compose stack (docker substrate) or a
-Gitea + Postgres pair inside an LXC container (lxc substrate). You can reproduce
-either by hand.
+meant to run it two ways (not implemented yet) — a `gitea/gitea` + `postgres`
+compose stack (docker substrate) or a Gitea + Postgres pair inside an LXC
+container (lxc substrate). You can reproduce either by hand.
 
 ### Docker Compose
 
-The docker substrate brings up the `gitea/gitea` image against a `postgres`
-backend. A minimal equivalent:
+The docker substrate is meant to run the `gitea/gitea` image against a
+`postgres` backend. A minimal hand-run equivalent:
 
 ```yaml
 services:
@@ -75,8 +75,9 @@ config, and `gitea dump` archives — lives under **`/data`** in the container.
 
 ### LXC
 
-The lxc substrate provisions a Proxmox LXC (with `nesting=1`, `keyctl=1`) and
-installs Gitea + Postgres inside it. By hand:
+The lxc substrate is meant to provision a Proxmox LXC (with `nesting=1`,
+`keyctl=1`) and install Gitea + Postgres inside it. A minimal hand-run
+equivalent:
 
 ```sh
 # on the Proxmox host — create an unprivileged container with nesting enabled
@@ -117,25 +118,28 @@ gitea.list
 
 ### REST surface — `gitea.*`
 
-279 tools generated at build time by `plugin_toolkit_build::openapi` +
+465 tools generated at build time by `plugin_toolkit_build::openapi` +
 `surface::openapi` from the vendored spec (`specs/gitea.openapi.json`). Covers
 repos, orgs, users, teams, issues, PRs, mirrors, actions/runners, packages,
-admin, and more. Reads are `role = "read"`; writes (POST/PUT/PATCH/DELETE) are
-`data_mutation = true` + `role = "admin"`. Every call takes `--endpoint`.
+admin, and more. Writes (POST/PUT/PATCH/DELETE) are `data_mutation = true` +
+`role = "admin"`. Reads set no role and take the `#[orca_tool]` default, which
+is `admin` and dry-run-gated too: their operation-id verbs (`repo_get`,
+`list_…`) are not read-shaped. Every call takes `--endpoint`.
 
 ### Deploy — `gitea.deploy`
 
-`substrate = lxc | docker`. Meant to dispatch to a `GiteaSubstrate` provider:
-the LXC provider driving the proxmox plugin (create LXC with nesting) +
-Gitea/Postgres, the Docker provider driving the docker/dockge plugin
-(`gitea/gitea` + `postgres` compose).
+`substrate = lxc | docker`. Dispatches to a `GiteaSubstrate` provider (LXC:
+meant to drive the proxmox plugin to create an LXC with nesting and set up
+Gitea/Postgres; Docker: meant to drive the docker/dockge plugin to bring up a
+`gitea/gitea` + `postgres` compose stack); neither provider is implemented.
 
 **Not implemented yet:** both providers refuse with a `not implemented` error
-and never report success. They need a plugin-toolkit seam for one plugin's tool
-to invoke another plugin's tools (proxmox, docker/dockge), in-guest setup
-commands the lxc-exec seam does not allow, and registration of the new instance
-as an endpoint. Until then, stand Gitea up by hand (above) and register it with
-orca.
+and never report success; a dry run errors too rather than previewing a run.
+They need a plugin-toolkit seam for one plugin's tool to invoke another plugin's
+tools (proxmox, docker/dockge), in-guest setup commands the lxc-exec seam does
+not allow, a push seam for the Gitea binary (orca's caps a file at 8 MiB), and
+registration of the new instance as an endpoint. Until then, stand Gitea up by
+hand (above) and register it with orca.
 
 ### Backup / restore — `gitea.backup` / `gitea.restore`
 
@@ -145,10 +149,11 @@ substrates**, an LXC dump restores into a Docker deploy and vice-versa — so an
 LXC↔Docker migration is a backup followed by a restore.
 
 **Not implemented yet:** both verbs refuse with a `not implemented` error and
-never report success. They need an endpoint → substrate binding, an in-guest
-exec seam that allows `gitea dump` and copies the archive out, and a `gitea`
-backup kind that writes to a backup target with a sha256 checksum verified
-before restore (gitea#7, gitea#9).
+never report success; a dry run errors too. They need an endpoint → substrate
+binding, an in-guest exec seam that allows `gitea dump` and copies the archive
+out, a way to push an archive back in (orca's lxc push seam caps a file at
+8 MiB, far too small for a dump), and a `gitea` backup kind that writes to a
+backup target with a sha256 checksum verified before restore (gitea#7, gitea#9).
 
 ### Actions runners — `gitea.runner.*`
 

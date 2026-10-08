@@ -36,7 +36,7 @@ pub struct GiteaBackupResult {
     data_mutation = true,
     role = "admin",
     // Ungated so a dry run errors instead of previewing a run that cannot
-    // happen. Restore the gate once the body is implemented.
+    // happen. Re-enable the gate once the body is implemented.
     execute_gated = false
 )]
 pub async fn gitea_backup(args: GiteaBackupArgs, _ctx: &ToolCtx) -> Result<GiteaBackupResult> {
@@ -70,7 +70,7 @@ pub struct GiteaRestoreResult {
     data_mutation = true,
     role = "admin",
     // Ungated so a dry run errors instead of previewing a run that cannot
-    // happen. Restore the gate once the body is implemented.
+    // happen. Re-enable the gate once the body is implemented.
     execute_gated = false
 )]
 pub async fn gitea_restore(args: GiteaRestoreArgs, _ctx: &ToolCtx) -> Result<GiteaRestoreResult> {
