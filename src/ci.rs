@@ -701,9 +701,9 @@ async fn fetch_combined_status(
     let url = format!(
         "{}/repos/{}/{}/commits/{}/status?limit={CHECKS_PAGE}&page=1",
         cfg.base_url.trim_end_matches('/'),
-        crate::runner::plan::encode_segment(o),
-        crate::runner::plan::encode_segment(r),
-        crate::runner::plan::encode_segment(sha),
+        plugin_toolkit::url::encode(o),
+        plugin_toolkit::url::encode(r),
+        plugin_toolkit::url::encode(sha),
     );
     let resp = runner_api::verified_client(cfg)?
         .get(url)
