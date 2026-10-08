@@ -6,9 +6,9 @@
 
 First-party [orca](https://github.com/argyle-labs/orca) plugin for
 [Gitea](https://gitea.io), the self-hostable Git service: it exposes the **full
-Gitea REST API** as `gitea.*` tools, does **dual-substrate deploy** (LXC or
-Docker), and defines **substrate-portable backup/restore** verbs wrapping
-`gitea dump` (not implemented yet — see below).
+Gitea REST API** as `gitea.*` tools, and defines a **dual-substrate deploy**
+verb (LXC or Docker) and **substrate-portable backup/restore** verbs wrapping
+`gitea dump`; neither is implemented yet (see below).
 
 Gitea runs perfectly well on its own — you can stand it up by hand with Docker
 Compose or in an LXC container, and orca will happily manage an instance you
@@ -18,8 +18,8 @@ deployed yourself. Both paths are documented below.
 
 ## Run it without orca (standalone)
 
-Gitea is a single Go binary plus a data directory. The plugin deploys it two
-ways — a `gitea/gitea` + `postgres` compose stack (docker substrate) or a
+Gitea is a single Go binary plus a data directory. The plugin's deploy verb is
+meant to run it two ways (not implemented yet) — a `gitea/gitea` + `postgres` compose stack (docker substrate) or a
 Gitea + Postgres pair inside an LXC container (lxc substrate). You can reproduce
 either by hand.
 
@@ -125,18 +125,17 @@ admin, and more. Reads are `role = "read"`; writes (POST/PUT/PATCH/DELETE) are
 
 ### Deploy — `gitea.deploy`
 
-`substrate = lxc | docker`. Dispatches to a `GiteaSubstrate` provider: the LXC
-provider drives the proxmox plugin (create LXC with nesting) + Gitea/Postgres;
-the Docker provider drives the docker/dockge plugin (`gitea/gitea` + `postgres`
-compose).
+`substrate = lxc | docker`. Meant to dispatch to a `GiteaSubstrate` provider:
+the LXC provider driving the proxmox plugin (create LXC with nesting) +
+Gitea/Postgres, the Docker provider driving the docker/dockge plugin
+(`gitea/gitea` + `postgres` compose).
 
-```sh
-gitea.deploy --substrate docker --host dockge@host --root-url https://gitea.example/
-gitea.deploy --substrate lxc --host pve-node --ip-cidr 10.0.0.20/24
-```
-
-*(Provider execution wiring over `plugin.invoke` is landing incrementally; the
-trait + dispatch + spec validation are the stable seam.)*
+**Not implemented yet:** both providers refuse with a `not implemented` error
+and never report success. They need a plugin-toolkit seam for one plugin's tool
+to invoke another plugin's tools (proxmox, docker/dockge), in-guest setup
+commands the lxc-exec seam does not allow, and registration of the new instance
+as an endpoint. Until then, stand Gitea up by hand (above) and register it with
+orca.
 
 ### Backup / restore — `gitea.backup` / `gitea.restore`
 
@@ -234,7 +233,8 @@ gitea.pr.list   --endpoint home --owner argyle-labs
 - `src/` — the plugin (pure Rust):
   - `tools.rs` — the `gitea.{list,detail,create,update,delete}` endpoint
     registry (`#[endpoint_resource]`) + client/token resolution.
-  - `deploy.rs` — the `Substrate` abstraction and the `gitea.deploy` verb.
+  - `deploy.rs` — the `Substrate` abstraction and the `gitea.deploy` verb (not
+    implemented).
   - `backup.rs` — the `gitea.backup` / `gitea.restore` verbs (not implemented).
   - `runner/` — `gitea.runner.*`: layout, renderers, release verification,
     health classification, step plans, the local executor, and the verbs.

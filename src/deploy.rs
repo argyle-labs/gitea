@@ -11,12 +11,21 @@
 //! `gitea dump` so archives are portable and LXC↔Docker migration is a
 //! backup+restore; it is not implemented yet (see [`crate::backup`]).
 //!
-//! This module defines the substrate abstraction and the `gitea.deploy` tool.
-//! Provider internals that shell out to peer plugins are driven over the mesh
-//! via `plugin.invoke` and are filled in incrementally; the trait + dispatch +
-//! spec validation are the stable seam.
+//! Neither provider can run yet, so `gitea.deploy` refuses with a "not
+//! implemented" error; the missing pieces are listed in [`LXC_MISSING`] and
+//! [`DOCKER_MISSING`].
 
 use plugin_toolkit::prelude::*;
+
+const LXC_MISSING: &str = "plugin-toolkit has no seam for a plugin tool to invoke another \
+     plugin's tools, so the proxmox plugin cannot be driven to create the LXC; \
+     orca's lxc-exec seam does not allow the commands that set up Postgres and Gitea \
+     (psql, useradd, the gitea binary), and its push seam caps a file at 8 MiB, too small \
+     for the Gitea binary; nothing registers the new instance as an endpoint";
+
+const DOCKER_MISSING: &str = "plugin-toolkit has no seam for a plugin tool to invoke another \
+     plugin's tools, so the docker/dockge plugin cannot be driven to bring up the \
+     gitea/gitea + postgres compose stack; nothing registers the new instance as an endpoint";
 
 /// Which substrate hosts the Gitea application.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -96,19 +105,11 @@ impl GiteaSubstrate for LxcSubstrate {
         Substrate::Lxc
     }
     async fn provision(&self, spec: &DeploySpec) -> Result<DeployOutcome> {
-        // Full implementation drives `proxmox.post_create_vm_nodes_node_lxc`
-        // (nesting=1,keyctl=1) via `plugin.invoke`, then configures Gitea +
-        // Postgres inside. Tracked as the next deploy milestone.
-        Ok(DeployOutcome {
-            substrate: "lxc".to_string(),
-            host: spec.host.clone(),
-            name: spec.name.clone(),
-            base_url: spec.root_url.clone(),
-            notes: vec![
-                "lxc substrate selected".to_string(),
-                "provision via proxmox plugin (pct create nesting) — pending wiring".to_string(),
-            ],
-        })
+        bail!(
+            "gitea.deploy lxc {} on {}: not implemented: {LXC_MISSING}",
+            spec.name,
+            spec.host
+        )
     }
 }
 
@@ -121,18 +122,11 @@ impl GiteaSubstrate for DockerSubstrate {
         Substrate::Docker
     }
     async fn provision(&self, spec: &DeploySpec) -> Result<DeployOutcome> {
-        // Full implementation deploys the `gitea/gitea` + `postgres` compose
-        // stack via the dockge/docker plugin. Tracked as the next milestone.
-        Ok(DeployOutcome {
-            substrate: "docker".to_string(),
-            host: spec.host.clone(),
-            name: spec.name.clone(),
-            base_url: spec.root_url.clone(),
-            notes: vec![
-                "docker substrate selected".to_string(),
-                "deploy gitea+postgres compose via dockge plugin — pending wiring".to_string(),
-            ],
-        })
+        bail!(
+            "gitea.deploy docker {} on {}: not implemented: {DOCKER_MISSING}",
+            spec.name,
+            spec.host
+        )
     }
 }
 
@@ -170,13 +164,16 @@ pub struct GiteaDeployArgs {
     pub version: String,
 }
 
-/// Deploy Gitea onto the chosen substrate. `role = "admin"` — this creates
-/// infrastructure.
+/// Deploy Gitea onto the chosen substrate. Always fails until the pieces in
+/// [`LXC_MISSING`] / [`DOCKER_MISSING`] exist. `role = "admin"`.
 #[orca_tool(
     domain = "gitea",
     verb = "deploy",
     data_mutation = true,
-    role = "admin"
+    role = "admin",
+    // Ungated so a dry run errors instead of previewing a run that cannot
+    // happen. Restore the gate once a provider is implemented.
+    execute_gated = false
 )]
 pub async fn gitea_deploy(args: GiteaDeployArgs, _ctx: &ToolCtx) -> Result<DeployOutcome> {
     let substrate: Substrate = args.substrate.parse()?;
@@ -201,5 +198,59 @@ mod tests {
         assert_eq!("docker".parse::<Substrate>().unwrap(), Substrate::Docker);
         assert_eq!("compose".parse::<Substrate>().unwrap(), Substrate::Docker);
         assert!("k8s".parse::<Substrate>().is_err());
+    }
+
+    async fn dispatch_err(args: plugin_toolkit::serde_json::Value) -> String {
+        let ctx = plugin_toolkit::tool_manifest::minimal_ctx();
+        match plugin_toolkit::dispatch::dispatch("gitea.deploy", args, &ctx).await {
+            Ok(out) => panic!("gitea.deploy reported success without doing the work: {out}"),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn deploy_fails_honestly_on_every_substrate() {
+        for (substrate, want) in [
+            ("lxc", "gitea.deploy lxc"),
+            ("docker", "gitea.deploy docker"),
+        ] {
+            for execute in [false, true] {
+                let err = dispatch_err(plugin_toolkit::serde_json::json!({
+                    "substrate": substrate,
+                    "host": "pve",
+                    "name": "gitea",
+                    "root_url": "https://gitea.example/",
+                    "version": "latest",
+                    "execute": execute,
+                }))
+                .await;
+                assert!(err.contains(want), "{err}");
+                assert!(err.contains("not implemented"), "{err}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn providers_never_return_ok() {
+        let spec = DeploySpec {
+            host: "pve".into(),
+            name: "gitea".into(),
+            ip_cidr: None,
+            root_url: Some("https://gitea.example/".into()),
+            version: "latest".into(),
+        };
+        for substrate in [Substrate::Lxc, Substrate::Docker] {
+            let p = provider_for(substrate);
+            assert_eq!(p.kind(), substrate);
+            assert!(p.provision(&spec).await.is_err(), "{substrate:?}");
+        }
+    }
+
+    #[test]
+    fn deploy_requires_admin() {
+        assert_eq!(
+            plugin_toolkit::dispatch::required_role("gitea.deploy"),
+            Some("admin")
+        );
     }
 }
