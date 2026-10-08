@@ -6,8 +6,9 @@
 
 First-party [orca](https://github.com/argyle-labs/orca) plugin for
 [Gitea](https://gitea.io), the self-hostable Git service: it exposes the **full
-Gitea REST API** as `gitea.*` tools, does **dual-substrate deploy** (LXC or
-Docker), and does **substrate-portable backup/restore** wrapping `gitea dump`.
+Gitea REST API** as `gitea.*` tools, and defines a **dual-substrate deploy**
+verb (LXC or Docker) and **substrate-portable backup/restore** verbs wrapping
+`gitea dump`; neither is implemented yet (see below).
 
 Gitea runs perfectly well on its own — you can stand it up by hand with Docker
 Compose or in an LXC container, and orca will happily manage an instance you
@@ -17,15 +18,15 @@ deployed yourself. Both paths are documented below.
 
 ## Run it without orca (standalone)
 
-Gitea is a single Go binary plus a data directory. The plugin deploys it two
-ways — a `gitea/gitea` + `postgres` compose stack (docker substrate) or a
-Gitea + Postgres pair inside an LXC container (lxc substrate). You can reproduce
-either by hand.
+Gitea is a single Go binary plus a data directory. The plugin's deploy verb is
+meant to run it two ways (not implemented yet) — a `gitea/gitea` + `postgres`
+compose stack (docker substrate) or a Gitea + Postgres pair inside an LXC
+container (lxc substrate). You can reproduce either by hand.
 
 ### Docker Compose
 
-The docker substrate brings up the `gitea/gitea` image against a `postgres`
-backend. A minimal equivalent:
+The docker substrate is meant to run the `gitea/gitea` image against a
+`postgres` backend. A minimal hand-run equivalent:
 
 ```yaml
 services:
@@ -74,8 +75,9 @@ config, and `gitea dump` archives — lives under **`/data`** in the container.
 
 ### LXC
 
-The lxc substrate provisions a Proxmox LXC (with `nesting=1`, `keyctl=1`) and
-installs Gitea + Postgres inside it. By hand:
+The lxc substrate is meant to provision a Proxmox LXC (with `nesting=1`,
+`keyctl=1`) and install Gitea + Postgres inside it. A minimal hand-run
+equivalent:
 
 ```sh
 # on the Proxmox host — create an unprivileged container with nesting enabled
@@ -92,7 +94,8 @@ pct exec 200 -- apt-get install -y postgresql
 
 See the [Gitea docs](https://docs.gitea.com/installation/install-from-binary)
 for the full binary-install walkthrough. Whichever way you run it, `gitea dump`
-produces the portable archive orca's backup verbs use (below).
+produces the portable archive orca's backup verbs are meant to use (not
+implemented yet — see below).
 
 ---
 
@@ -115,39 +118,42 @@ gitea.list
 
 ### REST surface — `gitea.*`
 
-279 tools generated at build time by `plugin_toolkit_build::openapi` +
+465 tools generated at build time by `plugin_toolkit_build::openapi` +
 `surface::openapi` from the vendored spec (`specs/gitea.openapi.json`). Covers
 repos, orgs, users, teams, issues, PRs, mirrors, actions/runners, packages,
-admin, and more. Reads are `role = "read"`; writes (POST/PUT/PATCH/DELETE) are
-`data_mutation = true` + `role = "admin"`. Every call takes `--endpoint`.
+admin, and more. Writes (POST/PUT/PATCH/DELETE) are `data_mutation = true` +
+`role = "admin"`. Reads set no role and take the `#[orca_tool]` default, which
+is `admin` and dry-run-gated too: their operation-id verbs (`repo_get`,
+`list_…`) are not read-shaped. Every call takes `--endpoint`.
 
 ### Deploy — `gitea.deploy`
 
-`substrate = lxc | docker`. Dispatches to a `GiteaSubstrate` provider: the LXC
-provider drives the proxmox plugin (create LXC with nesting) + Gitea/Postgres;
-the Docker provider drives the docker/dockge plugin (`gitea/gitea` + `postgres`
-compose).
+`substrate = lxc | docker`. Dispatches to a `GiteaSubstrate` provider (LXC:
+meant to drive the proxmox plugin to create an LXC with nesting and set up
+Gitea/Postgres; Docker: meant to drive the docker/dockge plugin to bring up a
+`gitea/gitea` + `postgres` compose stack); neither provider is implemented.
 
-```sh
-gitea.deploy --substrate docker --host dockge@host --root-url https://gitea.example/
-gitea.deploy --substrate lxc --host pve-node --ip-cidr 10.0.0.20/24
-```
-
-*(Provider execution wiring over `plugin.invoke` is landing incrementally; the
-trait + dispatch + spec validation are the stable seam.)*
+**Not implemented yet:** both providers refuse with a `not implemented` error
+and never report success; a dry run errors too rather than previewing a run.
+They need a plugin-toolkit seam for one plugin's tool to invoke another plugin's
+tools (proxmox, docker/dockge), in-guest setup commands the lxc-exec seam does
+not allow, a push seam for the Gitea binary (orca's caps a file at 8 MiB), and
+registration of the new instance as an endpoint. Until then, stand Gitea up by
+hand (above) and register it with orca.
 
 ### Backup / restore — `gitea.backup` / `gitea.restore`
 
-Both wrap `gitea dump`, which produces one app-consistent archive (DB + repos +
-LFS + config). Because the archive is **portable between substrates**, an LXC
-dump restores into a Docker deploy and vice-versa — so an LXC↔Docker migration
-is just a backup followed by a restore. Archives default to
-`/var/lib/gitea/backups` on the target host.
+Both are meant to wrap `gitea dump`, which produces one app-consistent archive
+(DB + repos + LFS + config). Because the archive is **portable between
+substrates**, an LXC dump restores into a Docker deploy and vice-versa — so an
+LXC↔Docker migration is a backup followed by a restore.
 
-```sh
-gitea.backup  --endpoint home
-gitea.restore --endpoint home --archive /var/lib/gitea/backups/gitea-dump-<ts>.tar.zst
-```
+**Not implemented yet:** both verbs refuse with a `not implemented` error and
+never report success; a dry run errors too. They need an endpoint → substrate
+binding, an in-guest exec seam that allows `gitea dump` and copies the archive
+out, a way to push an archive back in (orca's lxc push seam caps a file at
+8 MiB, far too small for a dump), and a `gitea` backup kind that writes to a
+backup target with a sha256 checksum verified before restore (gitea#7, gitea#9).
 
 ### Actions runners — `gitea.runner.*`
 
@@ -232,8 +238,9 @@ gitea.pr.list   --endpoint home --owner argyle-labs
 - `src/` — the plugin (pure Rust):
   - `tools.rs` — the `gitea.{list,detail,create,update,delete}` endpoint
     registry (`#[endpoint_resource]`) + client/token resolution.
-  - `deploy.rs` — the `Substrate` abstraction and the `gitea.deploy` verb.
-  - `backup.rs` — the `gitea.backup` / `gitea.restore` verbs wrapping `gitea dump`.
+  - `deploy.rs` — the `Substrate` abstraction and the `gitea.deploy` verb (not
+    implemented).
+  - `backup.rs` — the `gitea.backup` / `gitea.restore` verbs (not implemented).
   - `runner/` — `gitea.runner.*`: layout, renderers, release verification,
     health classification, step plans, the local executor, and the verbs.
   - `ci.rs` — `gitea.ci.status` / `gitea.pr.list`: CI jobs, runs, stuck-job
