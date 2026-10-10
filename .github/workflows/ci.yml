@@ -12,3 +12,9 @@ jobs:
   ci:
     uses: argyle-labs/.github/.github/workflows/plugin-ci.yml@main
     secrets: inherit
+    # The generated client and tool surface compile as one giant rustc that
+    # OOMs the runner unless the build is serialized and debuginfo dropped.
+    with:
+      build-jobs: '1'
+      debuginfo: '0'
+      runs-on: ci-large
