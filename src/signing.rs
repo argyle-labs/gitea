@@ -1970,10 +1970,20 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// `existing_key` only spawns ssh-keygen, so the init system is irrelevant;
+    /// `LocalHost::current` would fail on hosts without a service manager.
+    fn keygen_host(home: &Path) -> LocalHost {
+        LocalHost {
+            init: Init::Systemd,
+            home: home.to_path_buf(),
+            uid: 501,
+        }
+    }
+
     #[tokio::test]
     async fn apply_refuses_until_the_key_is_provisioned() {
         let dir = scratch("nokey");
-        let host = LocalHost::current().unwrap();
+        let host = keygen_host(&dir);
         let deadline = Instant::now() + Duration::from_secs(5);
         let err = existing_key(&host, &dir.join("k"), "s", deadline)
             .await
@@ -1995,7 +2005,7 @@ mod tests {
     #[tokio::test]
     async fn apply_reports_a_key_check_timeout_as_a_timeout() {
         let dir = scratch("keytimeout");
-        let host = LocalHost::current().unwrap();
+        let host = keygen_host(&dir);
         std::fs::write(dir.join("k"), "not a key").unwrap();
         let err = format!(
             "{:#}",
