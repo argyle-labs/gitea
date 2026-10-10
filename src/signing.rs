@@ -42,6 +42,8 @@ const RESTART_SECS: u64 = 8;
 const MIN_VERIFY_SECS: u64 = 3;
 /// Each HTTP attempt inside `verify` / `wait_up`.
 const REQUEST_SECS: u64 = 5;
+/// Reading the key Gitea serves, carved out of setup before the other steps.
+const SERVED_KEY_SECS: u64 = 3;
 /// Whole `gitea.signing.key` call, under orca's 35s plugin-call timeout.
 const KEY_SECS: u64 = 30;
 /// Total budget of one `gitea.update_style` call, under orca's 35s timeout.
@@ -292,8 +294,8 @@ pub struct Facts {
     pub init: Init,
     /// Public key on the host, already checked against orca secrets.
     pub public_key: String,
-    /// What Gitea serves now; `None` if it could not be read.
-    pub served_key: Option<String>,
+    /// What Gitea serves now, or why it could not be read.
+    pub served_key: std::result::Result<String, String>,
 }
 
 pub fn plan(args: &SigningArgs, facts: &Facts, instance: &str) -> Result<Vec<Step>> {
@@ -313,7 +315,9 @@ pub fn plan(args: &SigningArgs, facts: &Facts, instance: &str) -> Result<Vec<Ste
         });
     }
     // Gitea reads the key at start, so a key it does not serve yet needs one.
-    if ini_changed || facts.served_key.as_deref() != Some(facts.public_key.as_str()) {
+    // An unreadable served key is no evidence of that: it must not restart.
+    let stale = matches!(&facts.served_key, Ok(k) if *k != facts.public_key);
+    if args.force_restart || ini_changed || stale {
         steps.push(Step::Restart {
             argv: restart_argv(facts.init, &args.service)?,
         });
@@ -432,11 +436,19 @@ fn prepare_key_dir(key_path: &Path) -> Result<bool> {
     Ok(false)
 }
 
+/// Through an `O_NOFOLLOW` fd, so a symlink swapped in at `path` (its dir is
+/// owned by the service account) cannot redirect root's chmod/chown.
 fn set_mode_owner(path: &Path, mode: u32, uid: u32, gid: u32) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .with_context(|| format!("open {}", path.display()))?;
+    file.set_permissions(std::fs::Permissions::from_mode(mode))
         .with_context(|| format!("chmod {}", path.display()))?;
-    chown(path, Some(uid), gid, false)
+    std::os::unix::fs::fchown(&file, Some(uid), Some(gid))
+        .with_context(|| format!("chown {}", path.display()))
 }
 
 fn corrupt_host_key(key_path: &Path, e: anyhow::Error, remedy: &str) -> anyhow::Error {
@@ -801,6 +813,10 @@ pub struct SigningArgs {
     #[arg(long)]
     #[serde(default)]
     pub execute: bool,
+    /// Restart Gitea even when app.ini and the served key look current.
+    #[arg(long)]
+    #[serde(default)]
+    pub force_restart: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -845,31 +861,40 @@ pub async fn gitea_signing(args: SigningArgs, ctx: &ToolCtx) -> Result<SigningOu
     let host = LocalHost::current()?;
     // Everything before WriteIni must leave `reserve` for restart, verify and rollback.
     let pre = Instant::now() + budget.pre_limit();
+    let setup = pre - Duration::from_secs(SERVED_KEY_SECS);
     let endpoint = args.endpoint.clone();
     let runtime = tokio::runtime::Handle::current();
-    let cfg = blocking(left(pre), "resolve the endpoint", move || {
+    let cfg = blocking(left(setup), "resolve the endpoint", move || {
         runtime.block_on(crate::tools::resolve_config(&endpoint))
     })
     .await?;
     let key_path = PathBuf::from(&args.key_path);
-    let public_key = existing_key(&host, &key_path, &secret_name(&args.endpoint), pre).await?;
+    let public_key = existing_key(&host, &key_path, &secret_name(&args.endpoint), setup).await?;
     let instance = instance_url(&cfg);
     let served_url = format!("{}/api/v1/signing-key.pub", instance.trim_end_matches('/'));
     let facts = Facts {
         ini: read_ini(&args.app_ini)?,
         init: host.init,
-        served_key: attempt(pre, fetch_public_key(&cfg, &served_url)).await.ok(),
+        served_key: attempt(pre, fetch_public_key(&cfg, &served_url))
+            .await
+            .map_err(|e| format!("{e:#}")),
         public_key: public_key.clone(),
     };
     let steps = plan(&args, &facts, &instance)?;
     let execution_plan = to_plan(TOOL, &args, &steps)?;
+    let notes = match &facts.served_key {
+        Err(e) if !steps.iter().any(|s| matches!(s, Step::Restart { .. })) => {
+            vec![format!("already configured; served key unreadable: {e}")]
+        }
+        _ => vec![],
+    };
     if !args.execute {
         return Ok(SigningOutput {
             dry_run: true,
             plan: execution_plan,
             applied: vec![],
             public_key: Some(public_key),
-            notes: vec![],
+            notes,
         });
     }
     let live = Live {
@@ -883,7 +908,7 @@ pub async fn gitea_signing(args: SigningArgs, ctx: &ToolCtx) -> Result<SigningOu
         plan: execution_plan,
         applied,
         public_key: Some(public_key),
-        notes: vec![],
+        notes,
     })
 }
 
@@ -964,7 +989,8 @@ impl Budget {
         self.restart * 2 + Duration::from_secs(MIN_VERIFY_SECS + ROLLBACK_UP_SECS)
     }
 
-    /// What resolving the endpoint and checking the key may take.
+    /// What setup may take: resolving the endpoint, checking the key and the
+    /// `SERVED_KEY_SECS` served-key read. Live: 30s run - 26s reserve = 4s.
     fn pre_limit(&self) -> Duration {
         left(self.deadline).saturating_sub(self.reserve())
     }
@@ -1165,7 +1191,9 @@ pub async fn gitea_signing_key(args: SigningKeyArgs, ctx: &ToolCtx) -> Result<Si
     let notes = vec!["then run `gitea.signing` to configure Gitea to sign with it".to_string()];
     if !args.execute {
         let public_key = if key_path.exists() {
-            public_of(&host, &key_path).await.ok()
+            plugin_toolkit::time::timeout(left(deadline), public_of(&host, &key_path))
+                .await
+                .and_then(Result::ok)
         } else {
             None
         };
@@ -1380,6 +1408,7 @@ mod tests {
             signing_email: None,
             verify_secs: DEFAULT_VERIFY_SECS,
             execute,
+            force_restart: false,
         }
     }
 
@@ -1392,7 +1421,9 @@ mod tests {
             ini: ini.into(),
             init: Init::Systemd,
             public_key: PUBLIC.into(),
-            served_key: served.map(str::to_string),
+            served_key: served
+                .map(str::to_string)
+                .ok_or_else(|| "timed out".to_string()),
         }
     }
 
@@ -1468,7 +1499,26 @@ mod tests {
         };
         assert_eq!(actions(Some(PUBLIC)), ["verify"]);
         assert_eq!(actions(Some("ssh-ed25519 OLD")), ["restart", "verify"]);
-        assert_eq!(actions(None), ["restart", "verify"]);
+        assert_eq!(actions(None), ["verify"]);
+    }
+
+    #[test]
+    fn force_restart_restarts_a_configured_server() {
+        let done = ini_set(
+            INI,
+            SECTION,
+            &signing_settings(Path::new(DEFAULT_KEY_PATH), "Gitea", "gitea@git.example"),
+        );
+        let mut a = args(false);
+        a.force_restart = true;
+        for served in [Some(PUBLIC), None] {
+            let actions: Vec<_> = plan(&a, &facts(&done, served), "https://g")
+                .unwrap()
+                .iter()
+                .map(|s| s.to_change().action)
+                .collect();
+            assert_eq!(actions, ["restart", "verify"]);
+        }
     }
 
     #[test]
