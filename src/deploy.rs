@@ -196,6 +196,7 @@ pub struct GiteaDeployArgs {
     pub host: String,
     /// Instance name / hostname.
     #[arg(long, default_value = "gitea")]
+    #[serde(default = "default_name")]
     pub name: String,
     /// Static IP in CIDR form (lxc only).
     #[arg(long)]
@@ -205,6 +206,7 @@ pub struct GiteaDeployArgs {
     pub root_url: Option<String>,
     /// Gitea version / image tag.
     #[arg(long, default_value = "latest")]
+    #[serde(default = "default_version")]
     pub version: String,
 }
 
@@ -372,10 +374,22 @@ mod tests {
             "substrate": "lxc",
             "host": "pve",
             "name": "Bad_Name",
-            "version": "latest",
         }))
         .await;
         assert!(err.contains("invalid spec"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn json_callers_get_the_cli_defaults() {
+        let err = dispatch_err(plugin_toolkit::serde_json::json!({
+            "substrate": "docker",
+            "host": "pve",
+        }))
+        .await;
+        assert!(
+            err.contains("gitea.deploy docker gitea on pve: not implemented"),
+            "{err}"
+        );
     }
 
     #[test]
