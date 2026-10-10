@@ -9,6 +9,7 @@
 //! in the key file Gitea reads; it is never part of any output.
 
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use plugin_toolkit::contract::plan::{ExecutionPlan, PlannedChange};
 use plugin_toolkit::prelude::*;
@@ -24,11 +25,17 @@ pub const SECTION: &str = "repository.signing";
 const DEFAULT_APP_INI: &str = "/etc/gitea/app.ini";
 const DEFAULT_KEY_PATH: &str = "/var/lib/gitea/signing/gitea_signing_ed25519";
 const DEFAULT_RUN_USER: &str = "git";
-/// Below orca's 35s plugin-call timeout, leaving room for the restart itself.
-/// Also the cap on `--verify-secs`.
+/// Cap on `--verify-secs`. The verify actually gets less when the run's
+/// deadline must still fit a rollback (see [`verify_budget`]).
 const DEFAULT_VERIFY_SECS: u64 = 20;
 /// After a rollback restart, how long to wait for Gitea to answer HTTP at all.
 const ROLLBACK_UP_SECS: u64 = 10;
+/// Whole `gitea.signing` execute, under orca's 35s plugin-call timeout.
+const RUN_SECS: u64 = 30;
+/// Each service restart; a hung restart counts as failed.
+const RESTART_SECS: u64 = 8;
+/// Each HTTP attempt inside `verify` / `wait_up`.
+const REQUEST_SECS: u64 = 5;
 /// Total budget of one `gitea.update_style` call, under orca's 35s timeout.
 const UPDATE_STYLE_SECS: u64 = 25;
 
@@ -479,18 +486,35 @@ async fn fetch_public_key(cfg: &Config, url: &str) -> Result<String> {
     Ok(key_body(&body))
 }
 
+fn left(deadline: Instant) -> Duration {
+    deadline.saturating_duration_since(Instant::now())
+}
+
+/// Await `fut` for at most `REQUEST_SECS`, and never past `deadline`.
+async fn attempt<T>(deadline: Instant, fut: impl Future<Output = Result<T>>) -> Result<T> {
+    let limit = left(deadline).min(Duration::from_secs(REQUEST_SECS));
+    plugin_toolkit::time::timeout(limit, fut)
+        .await
+        .unwrap_or_else(|| Err(anyhow!("no answer within {}s", limit.as_secs())))
+}
+
+/// Sleep 2s between attempts, cut short at `deadline`.
+async fn pause(deadline: Instant) {
+    plugin_toolkit::time::sleep(left(deadline).min(Duration::from_secs(2))).await;
+}
+
 async fn verify(cfg: &Config, url: &str, expected: &str, wait_secs: u64) -> Result<()> {
-    let deadline = plugin_toolkit::time::Deadline::after(std::time::Duration::from_secs(wait_secs));
+    let deadline = Instant::now() + Duration::from_secs(wait_secs);
     loop {
-        let last = match fetch_public_key(cfg, url).await {
+        let last = match attempt(deadline, fetch_public_key(cfg, url)).await {
             Ok(got) if got == expected => return Ok(()),
             Ok(got) => format!("it serves a different key ({got})"),
             Err(e) => format!("{e:#}"),
         };
-        if deadline.reached() {
+        if left(deadline).is_zero() {
             bail!("Gitea did not serve the new signing key within {wait_secs}s: {last}");
         }
-        plugin_toolkit::time::sleep(std::time::Duration::from_secs(2)).await;
+        pause(deadline).await;
     }
 }
 
@@ -702,7 +726,7 @@ pub async fn gitea_signing(args: SigningArgs, ctx: &ToolCtx) -> Result<SigningOu
         cfg: &cfg,
         instance: instance_url(&cfg),
     };
-    let (applied, public_key) = run(&live, &steps).await?;
+    let (applied, public_key) = run(&live, &steps, Budget::live()).await?;
     Ok(SigningOutput {
         dry_run: false,
         plan: execution_plan,
@@ -768,22 +792,57 @@ impl Service for Live<'_> {
     }
     async fn wait_up(&self, wait_secs: u64) -> Result<()> {
         let client = verified_client(self.cfg)?;
-        let deadline =
-            plugin_toolkit::time::Deadline::after(std::time::Duration::from_secs(wait_secs));
+        let deadline = Instant::now() + Duration::from_secs(wait_secs);
         loop {
-            let last = match client.get(&self.instance).send().await {
+            let send = async { Ok(client.get(&self.instance).send().await?) };
+            let last = match attempt(deadline, send).await {
                 Ok(_) => return Ok(()),
-                Err(e) => e.to_string(),
+                Err(e) => format!("{e:#}"),
             };
-            if deadline.reached() {
+            if left(deadline).is_zero() {
                 bail!(
                     "no HTTP answer from {} within {wait_secs}s: {last}",
                     self.instance
                 );
             }
-            plugin_toolkit::time::sleep(std::time::Duration::from_secs(2)).await;
+            pause(deadline).await;
         }
     }
+}
+
+/// Time limits of one run: its overall deadline and each restart's cap.
+#[derive(Clone, Copy)]
+struct Budget {
+    deadline: Instant,
+    restart: Duration,
+}
+
+impl Budget {
+    fn live() -> Self {
+        Budget {
+            deadline: Instant::now() + Duration::from_secs(RUN_SECS),
+            restart: Duration::from_secs(RESTART_SECS),
+        }
+    }
+}
+
+/// Seconds the verify may take: at most `wanted`, and short enough that a
+/// rollback restart plus its `ROLLBACK_UP_SECS` wait still fit in `remaining`.
+fn verify_budget(wanted: u64, remaining: Duration, restart: Duration) -> u64 {
+    let reserve = restart + Duration::from_secs(ROLLBACK_UP_SECS);
+    wanted.min(remaining.saturating_sub(reserve).as_secs())
+}
+
+async fn restart_within(svc: &impl Service, argv: &[String], limit: Duration) -> Result<()> {
+    plugin_toolkit::time::timeout(limit, svc.restart(argv))
+        .await
+        .unwrap_or_else(|| {
+            Err(anyhow!(
+                "`{}` did not finish within {}s",
+                argv.join(" "),
+                limit.as_secs()
+            ))
+        })
 }
 
 /// After a failed restart or verify: put the previous app.ini back, restart,
@@ -792,6 +851,7 @@ async fn roll_back(
     svc: &impl Service,
     previous_ini: &Option<(PathBuf, String)>,
     argv: &[String],
+    budget: Budget,
     cause: anyhow::Error,
 ) -> anyhow::Error {
     let Some((path, old)) = previous_ini else {
@@ -799,7 +859,9 @@ async fn roll_back(
     };
     let result = async {
         write_ini(path, old).context("restore app.ini")?;
-        svc.restart(argv).await.context("restart")?;
+        restart_within(svc, argv, budget.restart)
+            .await
+            .context("restart")?;
         svc.wait_up(ROLLBACK_UP_SECS).await
     }
     .await;
@@ -823,8 +885,9 @@ async fn roll_back(
 }
 
 /// Run `steps`; a failure names what already ran. If the restart or the
-/// verify fails, the previous app.ini is put back and Gitea restarted.
-async fn run(svc: &impl Service, steps: &[Step]) -> Result<(Vec<String>, String)> {
+/// verify fails, the previous app.ini is put back and Gitea restarted. The
+/// verify is shortened so the rollback still finishes by `budget.deadline`.
+async fn run(svc: &impl Service, steps: &[Step], budget: Budget) -> Result<(Vec<String>, String)> {
     let mut done = Vec::new();
     let mut public = None;
     let mut previous_ini: Option<(PathBuf, String)> = None;
@@ -850,17 +913,18 @@ async fn run(svc: &impl Service, steps: &[Step]) -> Result<(Vec<String>, String)
                 }
                 Step::Restart { argv } => {
                     restart = Some(argv.clone());
-                    if let Err(e) = svc.restart(argv).await {
-                        return Err(roll_back(svc, &previous_ini, argv, e).await);
+                    if let Err(e) = restart_within(svc, argv, budget.restart).await {
+                        return Err(roll_back(svc, &previous_ini, argv, budget, e).await);
                     }
                 }
                 Step::Verify { url, wait_secs } => {
                     let expected = public
                         .as_deref()
                         .ok_or_else(|| anyhow!("no key to verify"))?;
-                    if let Err(e) = svc.verify(url, expected, *wait_secs).await {
+                    let secs = verify_budget(*wait_secs, left(budget.deadline), budget.restart);
+                    if let Err(e) = svc.verify(url, expected, secs).await {
                         return Err(match &restart {
-                            Some(argv) => roll_back(svc, &previous_ini, argv, e).await,
+                            Some(argv) => roll_back(svc, &previous_ini, argv, budget, e).await,
                             None => e,
                         });
                     }
@@ -952,7 +1016,7 @@ pub async fn gitea_update_style(args: UpdateStyleArgs, ctx: &ToolCtx) -> Result<
         "set-default-update-style",
     )
     .with_detail(format!(
-        "default_update_style = {}: {}",
+        "default_update_style = {} (replacing each repo's current value, custom ones included): {}",
         args.style,
         repos.join(", ")
     ));
@@ -1045,11 +1109,9 @@ pub fn signing_actions(config: &std::collections::BTreeMap<String, String>) -> V
 }
 
 /// Is a signing key configured and served, and which actions sign.
-#[orca_tool(domain = "gitea", verb = "signing.status", role = "read")]
-pub async fn gitea_signing_status(
-    args: SigningStatusArgs,
-    _ctx: &ToolCtx,
-) -> Result<SigningStatus> {
+#[orca_tool(domain = "gitea", verb = "signing.status", role = "admin")]
+pub async fn gitea_signing_status(args: SigningStatusArgs, ctx: &ToolCtx) -> Result<SigningStatus> {
+    require_admin("gitea.signing.status", ctx)?;
     let cfg = crate::tools::resolve_config(&args.endpoint).await?;
     let url = format!("{}/api/v1/signing-key.pub", instance_url(&cfg));
     let (public_key, served_error) = match fetch_public_key(&cfg, &url).await {
@@ -1250,6 +1312,7 @@ mod tests {
 
     struct Fake {
         restarts: std::cell::RefCell<std::collections::VecDeque<bool>>,
+        hang_first_restart: std::cell::Cell<bool>,
         verify_ok: bool,
         up_ok: bool,
         calls: std::cell::RefCell<Vec<&'static str>>,
@@ -1259,6 +1322,7 @@ mod tests {
         fn new(restarts: &[bool], verify_ok: bool, up_ok: bool) -> Self {
             Fake {
                 restarts: std::cell::RefCell::new(restarts.iter().copied().collect()),
+                hang_first_restart: Default::default(),
                 verify_ok,
                 up_ok,
                 calls: Default::default(),
@@ -1279,6 +1343,9 @@ mod tests {
         }
         async fn restart(&self, _: &[String]) -> Result<()> {
             self.calls.borrow_mut().push("restart");
+            if self.hang_first_restart.replace(false) {
+                std::future::pending::<()>().await;
+            }
             if self.restarts.borrow_mut().pop_front().unwrap() {
                 Ok(())
             } else {
@@ -1301,6 +1368,45 @@ mod tests {
                 bail!("no answer")
             }
         }
+    }
+
+    fn test_budget() -> Budget {
+        Budget {
+            deadline: Instant::now() + Duration::from_secs(RUN_SECS),
+            restart: Duration::from_millis(50),
+        }
+    }
+
+    #[test]
+    fn verify_leaves_room_for_the_rollback() {
+        let restart = Duration::from_secs(RESTART_SECS);
+        let reserve = RESTART_SECS + ROLLBACK_UP_SECS;
+        assert_eq!(
+            verify_budget(20, Duration::from_secs(RUN_SECS), restart),
+            RUN_SECS - reserve
+        );
+        assert_eq!(verify_budget(3, Duration::from_secs(RUN_SECS), restart), 3);
+        assert_eq!(verify_budget(20, Duration::from_secs(reserve), restart), 0);
+        assert_eq!(verify_budget(20, Duration::from_secs(5), restart), 0);
+        const { assert!(RUN_SECS < 35) };
+    }
+
+    #[tokio::test]
+    async fn a_hung_restart_times_out_and_rolls_back() {
+        let dir = scratch("hung");
+        let ini = dir.join("app.ini");
+        std::fs::write(&ini, INI).unwrap();
+        let fake = Fake::new(&[true, true], true, true);
+        fake.hang_first_restart.set(true);
+        let err = run(&fake, &run_steps(&ini), test_budget())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("did not finish within"), "{err}");
+        assert!(err.contains("restored the previous"), "{err}");
+        assert_eq!(std::fs::read_to_string(&ini).unwrap(), INI);
+        assert_eq!(*fake.calls.borrow(), ["restart", "restart", "wait_up"]);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     fn run_steps(ini: &Path) -> Vec<Step> {
@@ -1332,7 +1438,10 @@ mod tests {
         let ini = dir.join("app.ini");
         std::fs::write(&ini, INI).unwrap();
         let fake = Fake::new(&[false, true], true, true);
-        let err = run(&fake, &run_steps(&ini)).await.unwrap_err().to_string();
+        let err = run(&fake, &run_steps(&ini), test_budget())
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("restored the previous"), "{err}");
         assert_eq!(std::fs::read_to_string(&ini).unwrap(), INI);
         assert_eq!(*fake.calls.borrow(), ["restart", "restart", "wait_up"]);
@@ -1345,7 +1454,10 @@ mod tests {
         let ini = dir.join("app.ini");
         std::fs::write(&ini, INI).unwrap();
         let fake = Fake::new(&[true, true], false, true);
-        let err = run(&fake, &run_steps(&ini)).await.unwrap_err().to_string();
+        let err = run(&fake, &run_steps(&ini), test_budget())
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("restored the previous"), "{err}");
         assert_eq!(std::fs::read_to_string(&ini).unwrap(), INI);
         assert_eq!(
@@ -1361,11 +1473,17 @@ mod tests {
         let ini = dir.join("app.ini");
         std::fs::write(&ini, INI).unwrap();
         let fake = Fake::new(&[false, false], true, true);
-        let err = run(&fake, &run_steps(&ini)).await.unwrap_err().to_string();
+        let err = run(&fake, &run_steps(&ini), test_budget())
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("Gitea may be DOWN"), "{err}");
         assert!(err.contains("PREVIOUS app.ini is in place"), "{err}");
         let fake = Fake::new(&[true, true], false, false);
-        let err = run(&fake, &run_steps(&ini)).await.unwrap_err().to_string();
+        let err = run(&fake, &run_steps(&ini), test_budget())
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("Gitea may be DOWN"), "{err}");
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1412,6 +1530,15 @@ mod tests {
             .to_string();
             assert!(err.contains("no caller identity"), "{err}");
         }
+        let err = plugin_toolkit::dispatch::dispatch(
+            "gitea.signing.status",
+            json!({"endpoint": "home", "app_ini": ini}),
+            &ctx,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("no caller identity"), "{err}");
         assert_eq!(std::fs::read_to_string(&ini).unwrap(), INI);
         assert!(!dir.join("k").exists());
         std::fs::remove_dir_all(&dir).ok();
@@ -1440,7 +1567,7 @@ mod tests {
         );
         assert_eq!(
             plugin_toolkit::dispatch::required_role("gitea.signing.status"),
-            Some("read")
+            Some("admin")
         );
         assert_eq!(
             plugin_toolkit::dispatch::required_role("gitea.update_style"),
