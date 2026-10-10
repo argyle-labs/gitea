@@ -67,6 +67,51 @@ pub struct DeploySpec {
     pub version: String,
 }
 
+impl DeploySpec {
+    /// Reject a spec no provider could honor, before any provider runs.
+    pub fn validate(&self, substrate: Substrate) -> Result<()> {
+        if self.host.trim().is_empty() {
+            bail!("host is empty");
+        }
+        let n = &self.name;
+        let label_ok = (1..=63).contains(&n.len())
+            && n.bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+            && !n.starts_with('-')
+            && !n.ends_with('-');
+        if !label_ok {
+            bail!(
+                "name `{n}` is not a hostname label (1-63 of a-z, 0-9, '-'; no leading/trailing '-')"
+            );
+        }
+        if self.version.trim().is_empty() || self.version.contains(char::is_whitespace) {
+            bail!("version `{}` is empty or contains whitespace", self.version);
+        }
+        if let Some(url) = &self.root_url
+            && (!(url.starts_with("https://") || url.starts_with("http://")) || !url.ends_with('/'))
+        {
+            bail!("root_url `{url}` must be http(s):// and end with '/'");
+        }
+        if let Some(cidr) = &self.ip_cidr {
+            if substrate != Substrate::Lxc {
+                bail!("ip_cidr applies to the lxc substrate only");
+            }
+            let (ip, prefix) = cidr
+                .split_once('/')
+                .ok_or_else(|| anyhow!("ip_cidr `{cidr}` has no /prefix"))?;
+            let ip: std::net::IpAddr = ip
+                .parse()
+                .map_err(|_| anyhow!("ip_cidr `{cidr}`: `{ip}` is not an IP address"))?;
+            let max = if ip.is_ipv4() { 32 } else { 128 };
+            match prefix.parse::<u8>() {
+                Ok(p) if p <= max => {}
+                _ => bail!("ip_cidr `{cidr}`: prefix must be 0-{max}"),
+            }
+        }
+        Ok(())
+    }
+}
+
 fn default_name() -> String {
     "gitea".to_string()
 }
@@ -183,6 +228,8 @@ pub async fn gitea_deploy(args: GiteaDeployArgs, _ctx: &ToolCtx) -> Result<Deplo
         root_url: args.root_url,
         version: args.version,
     };
+    spec.validate(substrate)
+        .with_context(|| format!("gitea.deploy {}: invalid spec", spec.name))?;
     provider_for(substrate).provision(&spec).await
 }
 
@@ -243,6 +290,92 @@ mod tests {
             assert_eq!(p.kind(), substrate);
             assert!(p.provision(&spec).await.is_err(), "{substrate:?}");
         }
+    }
+
+    fn spec() -> DeploySpec {
+        DeploySpec {
+            host: "pve".into(),
+            name: "gitea".into(),
+            ip_cidr: Some("10.0.0.5/24".into()),
+            root_url: Some("https://gitea.example/".into()),
+            version: "1.22.0".into(),
+        }
+    }
+
+    #[test]
+    fn valid_spec_passes() {
+        spec().validate(Substrate::Lxc).unwrap();
+        DeploySpec {
+            ip_cidr: None,
+            ..spec()
+        }
+        .validate(Substrate::Docker)
+        .unwrap();
+    }
+
+    #[test]
+    fn invalid_specs_are_rejected() {
+        let bad = [
+            DeploySpec {
+                host: " ".into(),
+                ..spec()
+            },
+            DeploySpec {
+                name: "Gitea".into(),
+                ..spec()
+            },
+            DeploySpec {
+                name: "-gitea".into(),
+                ..spec()
+            },
+            DeploySpec {
+                name: "a".repeat(64),
+                ..spec()
+            },
+            DeploySpec {
+                version: "1.22 rc".into(),
+                ..spec()
+            },
+            DeploySpec {
+                root_url: Some("https://gitea.example".into()),
+                ..spec()
+            },
+            DeploySpec {
+                root_url: Some("gitea.example/".into()),
+                ..spec()
+            },
+            DeploySpec {
+                ip_cidr: Some("10.0.0.5".into()),
+                ..spec()
+            },
+            DeploySpec {
+                ip_cidr: Some("10.0.0.5/33".into()),
+                ..spec()
+            },
+            DeploySpec {
+                ip_cidr: Some("10.0.0.300/24".into()),
+                ..spec()
+            },
+        ];
+        for s in bad {
+            assert!(s.validate(Substrate::Lxc).is_err(), "{s:?}");
+        }
+        assert!(
+            spec().validate(Substrate::Docker).is_err(),
+            "ip_cidr is lxc-only"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_spec_fails_before_the_provider() {
+        let err = dispatch_err(plugin_toolkit::serde_json::json!({
+            "substrate": "lxc",
+            "host": "pve",
+            "name": "Bad_Name",
+            "version": "latest",
+        }))
+        .await;
+        assert!(err.contains("invalid spec"), "{err}");
     }
 
     #[test]
