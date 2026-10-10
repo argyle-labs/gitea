@@ -43,7 +43,7 @@ const MIN_VERIFY_SECS: u64 = 3;
 /// Each HTTP attempt inside `verify` / `wait_up`.
 const REQUEST_SECS: u64 = 5;
 /// Reading the key Gitea serves, carved out of setup before the other steps.
-const SERVED_KEY_SECS: u64 = 3;
+const SERVED_KEY_SECS: u64 = 2;
 /// Whole `gitea.signing.key` call, under orca's 35s plugin-call timeout.
 const KEY_SECS: u64 = 30;
 /// Total budget of one `gitea.update_style` call, under orca's 35s timeout.
@@ -644,6 +644,16 @@ async fn fetch_public_key(cfg: &Config, url: &str) -> Result<String> {
     Ok(key_body(&body))
 }
 
+/// Names the slow step when `e` came from setup running out of time.
+fn setup_expired(e: anyhow::Error, setup: Instant, step: &str) -> anyhow::Error {
+    if !left(setup).is_zero() {
+        return e;
+    }
+    e.context(format!(
+        "setup ran out of time while {step}; nothing was changed, retry the call"
+    ))
+}
+
 fn left(deadline: Instant) -> Duration {
     deadline.saturating_duration_since(Instant::now())
 }
@@ -867,9 +877,12 @@ pub async fn gitea_signing(args: SigningArgs, ctx: &ToolCtx) -> Result<SigningOu
     let cfg = blocking(left(setup), "resolve the endpoint", move || {
         runtime.block_on(crate::tools::resolve_config(&endpoint))
     })
-    .await?;
+    .await
+    .map_err(|e| setup_expired(e, setup, "resolving the endpoint"))?;
     let key_path = PathBuf::from(&args.key_path);
-    let public_key = existing_key(&host, &key_path, &secret_name(&args.endpoint), setup).await?;
+    let public_key = existing_key(&host, &key_path, &secret_name(&args.endpoint), setup)
+        .await
+        .map_err(|e| setup_expired(e, setup, "checking the key against the orca secret"))?;
     let instance = instance_url(&cfg);
     let served_url = format!("{}/api/v1/signing-key.pub", instance.trim_end_matches('/'));
     let facts = Facts {
@@ -990,7 +1003,8 @@ impl Budget {
     }
 
     /// What setup may take: resolving the endpoint, checking the key and the
-    /// `SERVED_KEY_SECS` served-key read. Live: 30s run - 26s reserve = 4s.
+    /// `SERVED_KEY_SECS` served-key read. Live: 30s run - 26s reserve = 4s,
+    /// of which 2s is the served-key read and 2s the rest of setup.
     fn pre_limit(&self) -> Duration {
         left(self.deadline).saturating_sub(self.reserve())
     }
@@ -1671,6 +1685,19 @@ mod tests {
     }
 
     #[test]
+    fn setup_timeout_names_the_step_and_changes_nothing() {
+        let e = setup_expired(anyhow!("slow"), Instant::now(), "resolving the endpoint");
+        let msg = format!("{e:#}");
+        assert!(msg.contains("resolving the endpoint"), "{msg}");
+        assert!(msg.contains("nothing was changed"), "{msg}");
+        let later = Instant::now() + Duration::from_secs(60);
+        assert_eq!(
+            format!("{:#}", setup_expired(anyhow!("bad key"), later, "x")),
+            "bad key"
+        );
+    }
+
+    #[test]
     fn reserve_covers_restart_verify_and_rollback() {
         let b = Budget::live();
         assert_eq!(
@@ -1679,6 +1706,14 @@ mod tests {
         );
         assert!(b.pre_limit() <= Duration::from_secs(RUN_SECS) - b.reserve());
         assert!(b.pre_limit() > Duration::from_secs(3));
+        const {
+            assert!(
+                RUN_SECS
+                    - (2 * RESTART_SECS + MIN_VERIFY_SECS + ROLLBACK_UP_SECS)
+                    - SERVED_KEY_SECS
+                    >= 2
+            )
+        };
         // Worst path: pre-run checks, write, restart, verify, rollback restart, wait_up.
         const {
             assert!(
