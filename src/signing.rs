@@ -34,6 +34,8 @@ const ROLLBACK_UP_SECS: u64 = 10;
 const RUN_SECS: u64 = 30;
 /// Each service restart; a hung restart counts as failed.
 const RESTART_SECS: u64 = 8;
+/// Least verify worth starting; below it a correct config would just roll back.
+const MIN_VERIFY_SECS: u64 = 3;
 /// Each HTTP attempt inside `verify` / `wait_up`.
 const REQUEST_SECS: u64 = 5;
 /// Total budget of one `gitea.update_style` call, under orca's 35s timeout.
@@ -694,6 +696,7 @@ fn read_ini(path: &str) -> Result<String> {
 )]
 pub async fn gitea_signing(args: SigningArgs, ctx: &ToolCtx) -> Result<SigningOutput> {
     const TOOL: &str = "gitea.signing";
+    let budget = Budget::live();
     require_admin(TOOL, ctx)?;
     let host = LocalHost::current()?;
     let cfg = crate::tools::resolve_config(&args.endpoint).await?;
@@ -726,7 +729,7 @@ pub async fn gitea_signing(args: SigningArgs, ctx: &ToolCtx) -> Result<SigningOu
         cfg: &cfg,
         instance: instance_url(&cfg),
     };
-    let (applied, public_key) = run(&live, &steps, Budget::live()).await?;
+    let (applied, public_key) = run(&live, &steps, budget).await?;
     Ok(SigningOutput {
         dry_run: false,
         plan: execution_plan,
@@ -824,6 +827,17 @@ impl Budget {
             restart: Duration::from_secs(RESTART_SECS),
         }
     }
+
+    /// Time that must remain at WriteIni: restart, a minimal verify, then a
+    /// rollback restart and its wait.
+    fn reserve(&self) -> Duration {
+        self.restart * 2 + Duration::from_secs(MIN_VERIFY_SECS + ROLLBACK_UP_SECS)
+    }
+
+    /// What the key step may take so `reserve` still fits.
+    fn key_limit(&self) -> Duration {
+        left(self.deadline).saturating_sub(self.reserve())
+    }
 }
 
 /// Seconds the verify may take: at most `wanted`, and short enough that a
@@ -902,12 +916,27 @@ async fn run(svc: &impl Service, steps: &[Step], budget: Budget) -> Result<(Vec<
                     secret,
                     comment,
                 } => {
+                    let limit = budget.key_limit();
+                    let key = svc.apply_key(source, key_path, owner, secret, comment);
                     public = Some(
-                        svc.apply_key(source, key_path, owner, secret, comment)
-                            .await?,
+                        plugin_toolkit::time::timeout(limit, key)
+                            .await
+                            .unwrap_or_else(|| {
+                                Err(anyhow!(
+                                    "key step did not finish within {}s",
+                                    limit.as_secs()
+                                ))
+                            })?,
                     );
                 }
                 Step::WriteIni { path, contents } => {
+                    if left(budget.deadline) < budget.reserve() {
+                        bail!(
+                            "too little time left to write, restart, verify and roll back; \
+                             {} and the service are unchanged (rerun to finish)",
+                            path.display()
+                        );
+                    }
                     previous_ini = Some((path.clone(), std::fs::read_to_string(path)?));
                     write_ini(path, contents)?;
                 }
@@ -1313,6 +1342,7 @@ mod tests {
     struct Fake {
         restarts: std::cell::RefCell<std::collections::VecDeque<bool>>,
         hang_first_restart: std::cell::Cell<bool>,
+        key_delay: std::cell::Cell<Option<Duration>>,
         verify_ok: bool,
         up_ok: bool,
         calls: std::cell::RefCell<Vec<&'static str>>,
@@ -1323,6 +1353,7 @@ mod tests {
             Fake {
                 restarts: std::cell::RefCell::new(restarts.iter().copied().collect()),
                 hang_first_restart: Default::default(),
+                key_delay: Default::default(),
                 verify_ok,
                 up_ok,
                 calls: Default::default(),
@@ -1339,6 +1370,9 @@ mod tests {
             _: &str,
             _: &str,
         ) -> Result<String> {
+            if let Some(d) = self.key_delay.get() {
+                tokio::time::sleep(d).await;
+            }
             Ok("ssh-ed25519 AAAA".into())
         }
         async fn restart(&self, _: &[String]) -> Result<()> {
@@ -1389,6 +1423,59 @@ mod tests {
         assert_eq!(verify_budget(20, Duration::from_secs(reserve), restart), 0);
         assert_eq!(verify_budget(20, Duration::from_secs(5), restart), 0);
         const { assert!(RUN_SECS < 35) };
+    }
+
+    #[test]
+    fn reserve_covers_restart_verify_and_rollback() {
+        let b = Budget::live();
+        assert_eq!(
+            b.reserve(),
+            Duration::from_secs(2 * RESTART_SECS + MIN_VERIFY_SECS + ROLLBACK_UP_SECS)
+        );
+        assert!(b.key_limit() <= Duration::from_secs(RUN_SECS) - b.reserve());
+        let spent = Budget {
+            deadline: Instant::now(),
+            restart: b.restart,
+        };
+        assert_eq!(spent.key_limit(), Duration::ZERO);
+        const { assert!(2 * RESTART_SECS + MIN_VERIFY_SECS + ROLLBACK_UP_SECS < RUN_SECS) };
+    }
+
+    #[tokio::test]
+    async fn a_slow_key_step_refuses_before_writing_app_ini() {
+        let dir = scratch("slowkey");
+        let ini = dir.join("app.ini");
+        std::fs::write(&ini, INI).unwrap();
+        let fake = Fake::new(&[true, true], true, true);
+        fake.key_delay.set(Some(Duration::from_millis(300)));
+        let mut budget = test_budget();
+        budget.deadline = Instant::now() + budget.reserve() + Duration::from_millis(100);
+        let err = run(&fake, &run_steps(&ini), budget)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("key step did not finish"), "{err}");
+        assert_eq!(std::fs::read_to_string(&ini).unwrap(), INI);
+        assert!(fake.calls.borrow().is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn too_little_time_at_write_ini_leaves_app_ini_unchanged() {
+        let dir = scratch("late");
+        let ini = dir.join("app.ini");
+        std::fs::write(&ini, INI).unwrap();
+        let fake = Fake::new(&[true, true], true, true);
+        let mut budget = test_budget();
+        budget.deadline = Instant::now() + budget.reserve() - Duration::from_millis(1);
+        let err = run(&fake, &run_steps(&ini)[1..], budget)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unchanged"), "{err}");
+        assert_eq!(std::fs::read_to_string(&ini).unwrap(), INI);
+        assert!(fake.calls.borrow().is_empty());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]
