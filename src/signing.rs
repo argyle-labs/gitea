@@ -29,11 +29,11 @@ const DEFAULT_RUN_USER: &str = "git";
 /// deadline must still fit a rollback (see [`verify_budget`]).
 const DEFAULT_VERIFY_SECS: u64 = 20;
 /// After a rollback restart, how long to wait for Gitea to answer HTTP at all.
-const ROLLBACK_UP_SECS: u64 = 10;
+const ROLLBACK_UP_SECS: u64 = 6;
 /// Whole `gitea.signing` execute, under orca's 35s plugin-call timeout.
 const RUN_SECS: u64 = 30;
 /// Each service restart; a hung restart counts as failed.
-const RESTART_SECS: u64 = 8;
+const RESTART_SECS: u64 = 6;
 /// Least verify worth starting; below it a correct config would just roll back.
 const MIN_VERIFY_SECS: u64 = 3;
 /// Each HTTP attempt inside `verify` / `wait_up`.
@@ -931,9 +931,14 @@ async fn run(svc: &impl Service, steps: &[Step], budget: Budget) -> Result<(Vec<
                 }
                 Step::WriteIni { path, contents } => {
                     if left(budget.deadline) < budget.reserve() {
+                        let key_note = if public.is_some() {
+                            "; the key is now in place, so a rerun skips the key step"
+                        } else {
+                            ""
+                        };
                         bail!(
                             "too little time left to write, restart, verify and roll back; \
-                             {} and the service are unchanged (rerun to finish)",
+                             {} and the service are unchanged (rerun to finish){key_note}",
                             path.display()
                         );
                     }
@@ -1433,6 +1438,18 @@ mod tests {
             Duration::from_secs(2 * RESTART_SECS + MIN_VERIFY_SECS + ROLLBACK_UP_SECS)
         );
         assert!(b.key_limit() <= Duration::from_secs(RUN_SECS) - b.reserve());
+        assert!(b.key_limit() > Duration::from_secs(8));
+        // Worst failure path: key, restart, verify, rollback restart, wait_up.
+        const {
+            assert!(
+                (RUN_SECS - (2 * RESTART_SECS + MIN_VERIFY_SECS + ROLLBACK_UP_SECS))
+                    + RESTART_SECS
+                    + MIN_VERIFY_SECS
+                    + RESTART_SECS
+                    + ROLLBACK_UP_SECS
+                    <= RUN_SECS
+            )
+        };
         let spent = Budget {
             deadline: Instant::now(),
             restart: b.restart,
