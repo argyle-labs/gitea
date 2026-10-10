@@ -1,9 +1,13 @@
-//! `gitea.signing` / `gitea.signing.status`: give the Gitea server an SSH
-//! signing key so the commits it authors (web merges, "Update branch",
-//! squash merges, web edits, wiki edits) are signed.
+//! `gitea.signing.key` / `gitea.signing` / `gitea.signing.status`: give the
+//! Gitea server an SSH signing key so the commits it authors (web merges,
+//! "Update branch", squash merges, web edits, wiki edits) are signed.
 //!
-//! Both verbs act on the orca system they run on, which must be the Gitea
-//! host: they read and edit its `app.ini` and restart its service.
+//! `gitea.signing.key` provisions the key file only. `gitea.signing` then
+//! points app.ini at it, restarts Gitea and verifies, rolling back on failure;
+//! it refuses to run until the key is in place.
+//!
+//! All verbs act on the orca system they run on, which must be the Gitea
+//! host: they read its key and `app.ini`, and `gitea.signing` restarts it.
 //!
 //! The private key lives in orca secrets (`gitea.<endpoint>.signing_key`) and
 //! in the key file Gitea reads; it is never part of any output.
@@ -29,17 +33,20 @@ const DEFAULT_RUN_USER: &str = "git";
 /// deadline must still fit a rollback (see [`verify_budget`]).
 const DEFAULT_VERIFY_SECS: u64 = 20;
 /// After a rollback restart, how long to wait for Gitea to answer HTTP at all.
-const ROLLBACK_UP_SECS: u64 = 6;
-/// Whole `gitea.signing` execute, under orca's 35s plugin-call timeout.
+const ROLLBACK_UP_SECS: u64 = 7;
+/// Whole `gitea.signing` call, under orca's 35s plugin-call timeout.
 const RUN_SECS: u64 = 30;
 /// Each service restart; a hung restart counts as failed.
-const RESTART_SECS: u64 = 6;
+const RESTART_SECS: u64 = 8;
 /// Least verify worth starting; below it a correct config would just roll back.
 const MIN_VERIFY_SECS: u64 = 3;
 /// Each HTTP attempt inside `verify` / `wait_up`.
 const REQUEST_SECS: u64 = 5;
+/// Whole `gitea.signing.key` call, under orca's 35s plugin-call timeout.
+const KEY_SECS: u64 = 30;
 /// Total budget of one `gitea.update_style` call, under orca's 35s timeout.
 const UPDATE_STYLE_SECS: u64 = 25;
+const RUN_KEY_FIRST: &str = "run `gitea.signing.key` first";
 
 fn secret_name(endpoint: &str) -> String {
     plugin_toolkit::secrets::scoped_name("gitea", endpoint, "signing_key")
@@ -204,60 +211,48 @@ impl KeySource {
             (true, true) => KeySource::CheckMatch,
         }
     }
+
+    pub fn to_change(&self, key_path: &Path, owner: &str, secret: &str) -> PlannedChange {
+        let (action, detail) = match self {
+            KeySource::Generate => (
+                "generate-key",
+                format!(
+                    "new ed25519 key; private half stored in orca secret '{secret}' and written 0600 owned by '{owner}'"
+                ),
+            ),
+            KeySource::Adopt => (
+                "adopt-key",
+                format!(
+                    "validate the existing key, store it in orca secret '{secret}'; fix mode 0600 and owner '{owner}'"
+                ),
+            ),
+            KeySource::Install => (
+                "install-key",
+                format!(
+                    "validate and write the key from orca secret '{secret}', 0600 owned by '{owner}'"
+                ),
+            ),
+            KeySource::CheckMatch => (
+                "check-key",
+                format!(
+                    "host key must be valid and match orca secret '{secret}'; fix mode 0600 and owner '{owner}'"
+                ),
+            ),
+        };
+        PlannedChange::new(key_path.display().to_string(), action).with_detail(detail)
+    }
 }
 
 #[derive(Debug, Clone)]
 pub enum Step {
-    Key {
-        source: KeySource,
-        key_path: PathBuf,
-        owner: String,
-        secret: String,
-        comment: String,
-    },
-    WriteIni {
-        path: PathBuf,
-        contents: String,
-    },
-    Restart {
-        argv: Vec<String>,
-    },
-    Verify {
-        url: String,
-        wait_secs: u64,
-    },
+    WriteIni { path: PathBuf, contents: String },
+    Restart { argv: Vec<String> },
+    Verify { url: String, wait_secs: u64 },
 }
 
 impl Step {
     pub fn to_change(&self) -> PlannedChange {
         match self {
-            Step::Key {
-                source,
-                key_path,
-                owner,
-                secret,
-                ..
-            } => {
-                let (action, detail) = match source {
-                    KeySource::Generate => (
-                        "generate-key",
-                        format!("new ed25519 key; private half stored in orca secret '{secret}' and written 0600 owned by '{owner}'"),
-                    ),
-                    KeySource::Adopt => (
-                        "adopt-key",
-                        format!("store the existing key in orca secret '{secret}'; fix mode 0600 and owner '{owner}'"),
-                    ),
-                    KeySource::Install => (
-                        "install-key",
-                        format!("write the key from orca secret '{secret}', 0600 owned by '{owner}'"),
-                    ),
-                    KeySource::CheckMatch => (
-                        "check-key",
-                        format!("host key must match orca secret '{secret}'; fix mode 0600 and owner '{owner}'"),
-                    ),
-                };
-                PlannedChange::new(key_path.display().to_string(), action).with_detail(detail)
-            }
             Step::WriteIni { path, .. } => PlannedChange::new(path.display().to_string(), "write")
                 .with_detail(format!("set [{SECTION}]: SSH signing for initial commits, web edits, wiki and merges; OVERWRITES any custom SIGNING_*, INITIAL_COMMIT, CRUD_ACTIONS, WIKI and MERGES values, and inline comments on those lines")),
             Step::Restart { argv } => PlannedChange::new(argv.join(" "), "restart").with_detail(
@@ -277,31 +272,34 @@ fn restart_argv(init: Init, service: &str) -> Result<Vec<String>> {
     })
 }
 
-/// What the plan needs from the host, the secret store and Gitea.
+fn run_user(ini: &str) -> String {
+    ini_get(ini, "", "RUN_USER").unwrap_or_else(|| DEFAULT_RUN_USER.into())
+}
+
+fn signing_email(explicit: &Option<String>, ini: &str) -> Result<String> {
+    match explicit {
+        Some(e) => Ok(e.clone()),
+        None => match ini_get(ini, "server", "DOMAIN") {
+            Some(d) if !d.is_empty() => Ok(format!("gitea@{d}")),
+            _ => bail!("app.ini has no [server] DOMAIN; pass --signing-email"),
+        },
+    }
+}
+
+/// What the plan needs from the host and Gitea.
 pub struct Facts {
     pub ini: String,
     pub init: Init,
-    pub key_on_host: bool,
-    pub key_in_secrets: bool,
+    /// Public key on the host, already checked against orca secrets.
+    pub public_key: String,
+    /// What Gitea serves now; `None` if it could not be read.
+    pub served_key: Option<String>,
 }
 
 pub fn plan(args: &SigningArgs, facts: &Facts, instance: &str) -> Result<Vec<Step>> {
-    let owner = ini_get(&facts.ini, "", "RUN_USER").unwrap_or_else(|| DEFAULT_RUN_USER.into());
-    let email = match &args.signing_email {
-        Some(e) => e.clone(),
-        None => match ini_get(&facts.ini, "server", "DOMAIN") {
-            Some(d) if !d.is_empty() => format!("gitea@{d}"),
-            _ => bail!("app.ini has no [server] DOMAIN; pass --signing-email"),
-        },
-    };
+    let email = signing_email(&args.signing_email, &facts.ini)?;
     let key_path = PathBuf::from(&args.key_path);
-    let mut steps = vec![Step::Key {
-        source: KeySource::decide(facts.key_in_secrets, facts.key_on_host),
-        key_path: key_path.clone(),
-        owner,
-        secret: secret_name(&args.endpoint),
-        comment: email.clone(),
-    }];
+    let mut steps = Vec::new();
     let ini = ini_set(
         &facts.ini,
         SECTION,
@@ -314,8 +312,8 @@ pub fn plan(args: &SigningArgs, facts: &Facts, instance: &str) -> Result<Vec<Ste
             contents: ini,
         });
     }
-    // A new or replaced key file needs a restart too: Gitea reads it at start.
-    if ini_changed || !facts.key_on_host {
+    // Gitea reads the key at start, so a key it does not serve yet needs one.
+    if ini_changed || facts.served_key.as_deref() != Some(facts.public_key.as_str()) {
         steps.push(Step::Restart {
             argv: restart_argv(facts.init, &args.service)?,
         });
@@ -341,9 +339,17 @@ async fn ssh_keygen(host: &LocalHost, args: &[&str]) -> Result<String> {
 }
 
 /// The public half of the key at `key_path`, as `type base64` (no comment).
+/// Fails unless the file is a readable, unencrypted private key.
 async fn public_of(host: &LocalHost, key_path: &Path) -> Result<String> {
-    let line = ssh_keygen(host, &["-y", "-f", &key_path.to_string_lossy()]).await?;
-    Ok(key_body(&line))
+    let line = ssh_keygen(host, &["-y", "-P", "", "-f", &key_path.to_string_lossy()]).await?;
+    let body = key_body(&line);
+    if body.split_whitespace().count() != 2 {
+        bail!(
+            "ssh-keygen printed no public key for {}",
+            key_path.display()
+        );
+    }
+    Ok(body)
 }
 
 /// `type base64` of an OpenSSH public key line, dropping any comment.
@@ -354,9 +360,47 @@ pub fn key_body(line: &str) -> String {
         .join(" ")
 }
 
+/// Run blocking `f` off the async runtime, giving up after `limit`.
+async fn blocking<T: Send + 'static>(
+    limit: Duration,
+    what: &str,
+    f: impl FnOnce() -> Result<T> + Send + 'static,
+) -> Result<T> {
+    match plugin_toolkit::time::timeout(limit, tokio::task::spawn_blocking(f)).await {
+        Some(joined) => joined.map_err(|e| anyhow!("{what}: {e}"))?,
+        None => bail!("{what} did not finish within {}s", limit.as_secs()),
+    }
+}
+
+async fn secret_get(limit: Duration, secret: &str) -> Result<Option<String>> {
+    let name = secret.to_string();
+    blocking(limit, "read orca secret", move || {
+        plugin_toolkit::secrets::get(&name)
+    })
+    .await
+}
+
+async fn secret_set(limit: Duration, secret: &str, value: &str) -> Result<()> {
+    let (name, value) = (secret.to_string(), value.to_string());
+    blocking(limit, "store orca secret", move || {
+        plugin_toolkit::secrets::set(&name, &value, Some("Gitea server commit-signing key"))
+            .map(|_| ())
+    })
+    .await
+}
+
+/// Where a new key is built before it is renamed over `key_path`.
+fn temp_key_path(key_path: &Path) -> PathBuf {
+    let mut name = std::ffi::OsString::from(".");
+    name.push(key_path.file_name().unwrap_or_default());
+    name.push(".orca-new");
+    key_path.with_file_name(name)
+}
+
 /// Ensure the key's directory exists; `true` when this call created it, so
 /// only then may its mode and owner be changed. An existing directory must
-/// be dedicated to the key: holding nothing but the key and its `.pub`.
+/// be dedicated to the key: holding nothing but the key, its `.pub` and a
+/// leftover temp key from an interrupted run.
 fn prepare_key_dir(key_path: &Path) -> Result<bool> {
     let dir = key_path
         .parent()
@@ -365,11 +409,19 @@ fn prepare_key_dir(key_path: &Path) -> Result<bool> {
         std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
         return Ok(true);
     }
-    let pub_file = pub_path(key_path);
-    let allowed = [key_path.file_name(), pub_file.file_name()];
+    let tmp = temp_key_path(key_path);
+    let allowed = [
+        key_path.to_path_buf(),
+        pub_path(key_path),
+        tmp.clone(),
+        pub_path(&tmp),
+    ];
     for entry in std::fs::read_dir(dir).with_context(|| format!("read {}", dir.display()))? {
         let name = entry?.file_name();
-        if !allowed.contains(&Some(name.as_os_str())) {
+        if !allowed
+            .iter()
+            .any(|a| a.file_name() == Some(name.as_os_str()))
+        {
             bail!(
                 "{} already exists and holds {:?}, so it is not a dedicated key directory; pass a --key-path in a new or key-only directory",
                 dir.display(),
@@ -380,13 +432,30 @@ fn prepare_key_dir(key_path: &Path) -> Result<bool> {
     Ok(false)
 }
 
-async fn apply_key(
+fn set_mode_owner(path: &Path, mode: u32, uid: u32, gid: u32) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+        .with_context(|| format!("chmod {}", path.display()))?;
+    chown(path, Some(uid), gid, false)
+}
+
+fn corrupt_host_key(key_path: &Path, e: anyhow::Error, remedy: &str) -> anyhow::Error {
+    e.context(format!(
+        "{} is not a valid unencrypted private key. Move it aside (`mv {0} {0}.bad`) and re-run `gitea.signing.key` to {remedy}",
+        key_path.display()
+    ))
+}
+
+/// Provision the key at `key_path` per `source`; returns its public half.
+/// Nothing is stored or compared before `public_of` accepts it.
+async fn provision_key(
     host: &LocalHost,
     source: &KeySource,
     key_path: &Path,
     owner: &str,
     secret: &str,
     comment: &str,
+    deadline: Instant,
 ) -> Result<String> {
     let (uid, gid) = lookup_user(owner)?
         .ok_or_else(|| anyhow!("Gitea's RUN_USER '{owner}' does not exist on this host"))?;
@@ -394,68 +463,114 @@ async fn apply_key(
         .parent()
         .ok_or_else(|| anyhow!("{} has no parent", key_path.display()))?;
     if prepare_key_dir(key_path)? {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
-            .with_context(|| format!("chmod {}", dir.display()))?;
-        chown(dir, Some(uid), gid, false)?;
+        set_mode_owner(dir, 0o700, uid, gid)?;
     }
-    let read_private = || {
-        std::fs::read_to_string(key_path).with_context(|| format!("read {}", key_path.display()))
-    };
-    match source {
-        KeySource::Generate => {
-            ssh_keygen(
-                host,
-                &[
-                    "-q",
-                    "-t",
-                    "ed25519",
-                    "-N",
-                    "",
-                    "-C",
-                    comment,
-                    "-f",
-                    &key_path.to_string_lossy(),
-                ],
-            )
-            .await?;
-            plugin_toolkit::secrets::set(
-                secret,
-                &read_private()?,
-                Some("Gitea server commit-signing key"),
-            )?;
+    let read =
+        |p: &Path| std::fs::read_to_string(p).with_context(|| format!("read {}", p.display()));
+    let tmp = temp_key_path(key_path);
+    let public = match source {
+        KeySource::Generate | KeySource::Install => {
+            std::fs::remove_file(&tmp).ok();
+            std::fs::remove_file(pub_path(&tmp)).ok();
+            let result = async {
+                let public = if *source == KeySource::Generate {
+                    let tmp_arg = tmp.to_string_lossy();
+                    let argv = ["-q", "-t", "ed25519", "-N", "", "-C", comment, "-f", &tmp_arg];
+                    ssh_keygen(host, &argv).await?;
+                    let public = public_of(host, &tmp).await?;
+                    let private = read(&tmp)?;
+                    secret_set(left(deadline), secret, &private).await?;
+                    let stored = secret_get(left(deadline), secret).await?;
+                    if stored.as_deref().map(str::trim) != Some(private.trim()) {
+                        bail!("orca secret '{secret}' does not read back as the key just stored");
+                    }
+                    public
+                } else {
+                    let private = secret_get(left(deadline), secret)
+                        .await?
+                        .ok_or_else(|| anyhow!("orca secret '{secret}' disappeared"))?;
+                    write_atomic(&tmp, private.as_bytes(), 0o600)?;
+                    public_of(host, &tmp).await.with_context(|| {
+                        format!("orca secret '{secret}' does not hold a valid private key; delete it and re-run `gitea.signing.key` to generate one")
+                    })?
+                };
+                set_mode_owner(&tmp, 0o600, uid, gid)?;
+                std::fs::rename(&tmp, key_path).with_context(|| {
+                    format!("rename {} to {}", tmp.display(), key_path.display())
+                })?;
+                Ok(public)
+            }
+            .await;
+            std::fs::remove_file(&tmp).ok();
+            std::fs::remove_file(pub_path(&tmp)).ok();
+            result?
         }
         KeySource::Adopt => {
-            plugin_toolkit::secrets::set(
-                secret,
-                &read_private()?,
-                Some("Gitea server commit-signing key"),
-            )?;
-        }
-        KeySource::Install => {
-            let private = plugin_toolkit::secrets::get_required(secret)?;
-            write_atomic(key_path, private.as_bytes(), 0o600)?;
+            let public = public_of(host, key_path)
+                .await
+                .map_err(|e| corrupt_host_key(key_path, e, "generate a new key"))?;
+            let private = read(key_path)?;
+            secret_set(left(deadline), secret, &private).await?;
+            let stored = secret_get(left(deadline), secret).await?;
+            if stored.as_deref().map(str::trim) != Some(private.trim()) {
+                bail!("orca secret '{secret}' does not read back as the key just stored");
+            }
+            set_mode_owner(key_path, 0o600, uid, gid)?;
+            public
         }
         KeySource::CheckMatch => {
-            let private = plugin_toolkit::secrets::get_required(secret)?;
-            if private.trim() != read_private()?.trim() {
-                bail!(
-                    "{} differs from orca secret '{secret}'; refusing to choose one. Remove the stale copy and re-run",
-                    key_path.display()
-                );
-            }
+            let public = public_of(host, key_path)
+                .await
+                .map_err(|e| corrupt_host_key(key_path, e, "reinstall it from orca secrets"))?;
+            check_matches_secret(key_path, secret, left(deadline)).await?;
+            set_mode_owner(key_path, 0o600, uid, gid)?;
+            public
         }
-    }
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(key_path, std::fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("chmod {}", key_path.display()))?;
-    }
-    chown(key_path, Some(uid), gid, false)?;
-    let public = public_of(host, key_path).await?;
+    };
     let pub_file = pub_path(key_path);
     write_atomic(&pub_file, format!("{public} {comment}\n").as_bytes(), 0o644)?;
     chown(&pub_file, Some(uid), gid, false)?;
+    Ok(public)
+}
+
+async fn check_matches_secret(key_path: &Path, secret: &str, limit: Duration) -> Result<()> {
+    let stored = secret_get(limit, secret)
+        .await?
+        .ok_or_else(|| anyhow!("orca secret '{secret}' does not exist"))?;
+    let on_host = std::fs::read_to_string(key_path)
+        .with_context(|| format!("read {}", key_path.display()))?;
+    if stored.trim() != on_host.trim() {
+        bail!(
+            "{} differs from orca secret '{secret}'; refusing to choose one. Move the stale copy aside and re-run",
+            key_path.display()
+        );
+    }
+    Ok(())
+}
+
+/// The key `gitea.signing` needs: on the host, a valid private key, and the
+/// one in orca secrets. Returns its public half.
+async fn existing_key(
+    host: &LocalHost,
+    key_path: &Path,
+    secret: &str,
+    deadline: Instant,
+) -> Result<String> {
+    if !key_path.exists() {
+        bail!("no signing key at {}; {RUN_KEY_FIRST}", key_path.display());
+    }
+    let public = plugin_toolkit::time::timeout(left(deadline), public_of(host, key_path))
+        .await
+        .unwrap_or_else(|| Err(anyhow!("ssh-keygen did not finish in time")))
+        .with_context(|| {
+            format!(
+                "{} is not a valid private key; {RUN_KEY_FIRST}",
+                key_path.display()
+            )
+        })?;
+    check_matches_secret(key_path, secret, left(deadline))
+        .await
+        .context(RUN_KEY_FIRST)?;
     Ok(public)
 }
 
@@ -463,12 +578,41 @@ async fn apply_key(
 fn write_ini(path: &Path, contents: &str) -> Result<()> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     let meta = std::fs::metadata(path).with_context(|| format!("stat {}", path.display()))?;
-    write_atomic(
+    let previous = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
+    install_ini(
         path,
         contents.as_bytes(),
+        &previous,
         meta.permissions().mode() & 0o7777,
-    )?;
-    chown(path, Some(meta.uid()), meta.gid(), false)
+        |p| chown(p, Some(meta.uid()), meta.gid(), false),
+    )
+}
+
+/// Atomically install `contents`, then `finish` it (chown). If `finish`
+/// fails, `previous` is put back; the error says which file is in place.
+fn install_ini(
+    path: &Path,
+    contents: &[u8],
+    previous: &[u8],
+    mode: u32,
+    finish: impl Fn(&Path) -> Result<()>,
+) -> Result<()> {
+    write_atomic(path, contents, mode)?;
+    let Err(e) = finish(path) else {
+        return Ok(());
+    };
+    let shown = path.display();
+    Err(match write_atomic(path, previous, mode) {
+        Err(r) => e.context(format!(
+            "restoring the previous {shown} failed ({r:#}); the NEW app.ini is in place"
+        )),
+        Ok(()) => match finish(path) {
+            Ok(()) => e.context(format!("the PREVIOUS {shown} is back in place")),
+            Err(r) => e.context(format!(
+                "the PREVIOUS {shown} is back in place, but its owner could not be restored ({r:#})"
+            )),
+        },
+    })
 }
 
 async fn fetch_public_key(cfg: &Config, url: &str) -> Result<String> {
@@ -633,7 +777,7 @@ pub struct SigningArgs {
     #[arg(long, default_value = DEFAULT_APP_INI)]
     #[serde(default = "default_app_ini")]
     pub app_ini: String,
-    /// Private key path; the public key is written beside it as `.pub`.
+    /// Key provisioned by `gitea.signing.key`.
     #[arg(long, default_value = DEFAULT_KEY_PATH)]
     #[serde(default = "default_key_path")]
     pub key_path: String,
@@ -686,8 +830,8 @@ fn read_ini(path: &str) -> Result<String> {
     std::fs::read_to_string(path).with_context(|| format!("read {path}"))
 }
 
-/// Give the Gitea server an SSH signing key and make it sign initial commits,
-/// web edits, wiki edits and merges. Restarts Gitea.
+/// Point app.ini at the key `gitea.signing.key` provisioned and make Gitea
+/// sign initial commits, web edits, wiki edits and merges. Restarts Gitea.
 #[orca_tool(
     domain = "gitea",
     verb = "signing",
@@ -699,37 +843,41 @@ pub async fn gitea_signing(args: SigningArgs, ctx: &ToolCtx) -> Result<SigningOu
     let budget = Budget::live();
     require_admin(TOOL, ctx)?;
     let host = LocalHost::current()?;
-    let cfg = crate::tools::resolve_config(&args.endpoint).await?;
-    let secret = secret_name(&args.endpoint);
+    // Everything before WriteIni must leave `reserve` for restart, verify and rollback.
+    let pre = Instant::now() + budget.pre_limit();
+    let endpoint = args.endpoint.clone();
+    let runtime = tokio::runtime::Handle::current();
+    let cfg = blocking(left(pre), "resolve the endpoint", move || {
+        runtime.block_on(crate::tools::resolve_config(&endpoint))
+    })
+    .await?;
     let key_path = PathBuf::from(&args.key_path);
+    let public_key = existing_key(&host, &key_path, &secret_name(&args.endpoint), pre).await?;
+    let instance = instance_url(&cfg);
+    let served_url = format!("{}/api/v1/signing-key.pub", instance.trim_end_matches('/'));
     let facts = Facts {
         ini: read_ini(&args.app_ini)?,
         init: host.init,
-        key_on_host: key_path.exists(),
-        key_in_secrets: plugin_toolkit::secrets::get(&secret)?.is_some(),
+        served_key: attempt(pre, fetch_public_key(&cfg, &served_url)).await.ok(),
+        public_key: public_key.clone(),
     };
-    let steps = plan(&args, &facts, &instance_url(&cfg))?;
+    let steps = plan(&args, &facts, &instance)?;
     let execution_plan = to_plan(TOOL, &args, &steps)?;
     if !args.execute {
-        let public_key = if facts.key_on_host {
-            public_of(&host, &key_path).await.ok()
-        } else {
-            None
-        };
         return Ok(SigningOutput {
             dry_run: true,
             plan: execution_plan,
             applied: vec![],
-            public_key,
+            public_key: Some(public_key),
             notes: vec![],
         });
     }
     let live = Live {
         host: &host,
         cfg: &cfg,
-        instance: instance_url(&cfg),
+        instance,
     };
-    let (applied, public_key) = run(&live, &steps, budget).await?;
+    let applied = run(&live, &steps, budget, &public_key).await?;
     Ok(SigningOutput {
         dry_run: false,
         plan: execution_plan,
@@ -742,7 +890,7 @@ pub async fn gitea_signing(args: SigningArgs, ctx: &ToolCtx) -> Result<SigningOu
 fn to_plan(tool: &str, args: &SigningArgs, steps: &[Step]) -> Result<ExecutionPlan> {
     let inputs = plugin_toolkit::serde_json::to_value(args)?;
     let summary = format!(
-        "sign Gitea-authored commits with an SSH key at {}{}",
+        "sign Gitea-authored commits with the SSH key at {}{}",
         args.key_path,
         if steps.iter().any(|s| matches!(s, Step::Restart { .. })) {
             "; RESTARTS Gitea (brief downtime)"
@@ -756,14 +904,6 @@ fn to_plan(tool: &str, args: &SigningArgs, steps: &[Step]) -> Result<ExecutionPl
 
 /// The parts of a run that touch the live service.
 trait Service {
-    async fn apply_key(
-        &self,
-        source: &KeySource,
-        key_path: &Path,
-        owner: &str,
-        secret: &str,
-        comment: &str,
-    ) -> Result<String>;
     async fn restart(&self, argv: &[String]) -> Result<()>;
     async fn verify(&self, url: &str, expected: &str, wait_secs: u64) -> Result<()>;
     /// Gitea answers HTTP at all (any status) within `wait_secs`.
@@ -777,16 +917,6 @@ struct Live<'a> {
 }
 
 impl Service for Live<'_> {
-    async fn apply_key(
-        &self,
-        source: &KeySource,
-        key_path: &Path,
-        owner: &str,
-        secret: &str,
-        comment: &str,
-    ) -> Result<String> {
-        apply_key(self.host, source, key_path, owner, secret, comment).await
-    }
     async fn restart(&self, argv: &[String]) -> Result<()> {
         run_ok(self.host, argv).await
     }
@@ -834,8 +964,8 @@ impl Budget {
         self.restart * 2 + Duration::from_secs(MIN_VERIFY_SECS + ROLLBACK_UP_SECS)
     }
 
-    /// What the key step may take so `reserve` still fits.
-    fn key_limit(&self) -> Duration {
+    /// What resolving the endpoint and checking the key may take.
+    fn pre_limit(&self) -> Duration {
         left(self.deadline).saturating_sub(self.reserve())
     }
 }
@@ -901,44 +1031,23 @@ async fn roll_back(
 /// Run `steps`; a failure names what already ran. If the restart or the
 /// verify fails, the previous app.ini is put back and Gitea restarted. The
 /// verify is shortened so the rollback still finishes by `budget.deadline`.
-async fn run(svc: &impl Service, steps: &[Step], budget: Budget) -> Result<(Vec<String>, String)> {
+async fn run(
+    svc: &impl Service,
+    steps: &[Step],
+    budget: Budget,
+    public: &str,
+) -> Result<Vec<String>> {
     let mut done = Vec::new();
-    let mut public = None;
     let mut previous_ini: Option<(PathBuf, String)> = None;
     let mut restart: Option<Vec<String>> = None;
     for step in steps {
         let result: Result<()> = async {
             match step {
-                Step::Key {
-                    source,
-                    key_path,
-                    owner,
-                    secret,
-                    comment,
-                } => {
-                    let limit = budget.key_limit();
-                    let key = svc.apply_key(source, key_path, owner, secret, comment);
-                    public = Some(
-                        plugin_toolkit::time::timeout(limit, key)
-                            .await
-                            .unwrap_or_else(|| {
-                                Err(anyhow!(
-                                    "key step did not finish within {}s",
-                                    limit.as_secs()
-                                ))
-                            })?,
-                    );
-                }
                 Step::WriteIni { path, contents } => {
                     if left(budget.deadline) < budget.reserve() {
-                        let key_note = if public.is_some() {
-                            "; the key is now in place, so a rerun skips the key step"
-                        } else {
-                            ""
-                        };
                         bail!(
                             "too little time left to write, restart, verify and roll back; \
-                             {} and the service are unchanged (rerun to finish){key_note}",
+                             {} and the service are unchanged (rerun to finish)",
                             path.display()
                         );
                     }
@@ -952,11 +1061,8 @@ async fn run(svc: &impl Service, steps: &[Step], budget: Budget) -> Result<(Vec<
                     }
                 }
                 Step::Verify { url, wait_secs } => {
-                    let expected = public
-                        .as_deref()
-                        .ok_or_else(|| anyhow!("no key to verify"))?;
                     let secs = verify_budget(*wait_secs, left(budget.deadline), budget.restart);
-                    if let Err(e) = svc.verify(url, expected, secs).await {
+                    if let Err(e) = svc.verify(url, public, secs).await {
                         return Err(match &restart {
                             Some(argv) => roll_back(svc, &previous_ini, argv, budget, e).await,
                             None => e,
@@ -978,8 +1084,7 @@ async fn run(svc: &impl Service, steps: &[Step], budget: Budget) -> Result<(Vec<
         }
         done.push(format!("{} {}", change.action, change.target));
     }
-    let public = public.ok_or_else(|| anyhow!("no key step ran"))?;
-    Ok((done, public))
+    Ok(done)
 }
 
 async fn run_ok(host: &LocalHost, argv: &[String]) -> Result<()> {
@@ -993,6 +1098,102 @@ async fn run_ok(host: &LocalHost, argv: &[String]) -> Result<()> {
         );
     }
     Ok(())
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// gitea.signing.key
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[derive(clap::Args, Serialize, Deserialize, JsonSchema)]
+pub struct SigningKeyArgs {
+    /// Registered Gitea endpoint served from this host.
+    #[arg(long)]
+    pub endpoint: String,
+    /// Read for RUN_USER (the key's owner) and [server] DOMAIN; never written.
+    #[arg(long, default_value = DEFAULT_APP_INI)]
+    #[serde(default = "default_app_ini")]
+    pub app_ini: String,
+    /// Private key path; the public key is written beside it as `.pub`.
+    #[arg(long, default_value = DEFAULT_KEY_PATH)]
+    #[serde(default = "default_key_path")]
+    pub key_path: String,
+    /// Key comment; defaults to `gitea@<[server] DOMAIN>`.
+    #[arg(long)]
+    #[serde(default)]
+    pub signing_email: Option<String>,
+    /// Apply. Omitted, returns the plan and changes nothing.
+    #[arg(long)]
+    #[serde(default)]
+    pub execute: bool,
+}
+
+/// Provision the Gitea signing key on this host and in orca secrets. Never
+/// touches app.ini or restarts Gitea; run `gitea.signing` afterwards.
+#[orca_tool(
+    domain = "gitea",
+    verb = "signing.key",
+    role = "admin",
+    execute_gated = false
+)]
+pub async fn gitea_signing_key(args: SigningKeyArgs, ctx: &ToolCtx) -> Result<SigningOutput> {
+    const TOOL: &str = "gitea.signing.key";
+    let deadline = Instant::now() + Duration::from_secs(KEY_SECS);
+    require_admin(TOOL, ctx)?;
+    let host = LocalHost::current()?;
+    let endpoint = args.endpoint.clone();
+    blocking(left(deadline), "look up the endpoint", move || {
+        crate::tools::endpoint_db::require(&endpoint).map(|_| ())
+    })
+    .await?;
+    let secret = secret_name(&args.endpoint);
+    let key_path = PathBuf::from(&args.key_path);
+    let ini = read_ini(&args.app_ini)?;
+    let owner = run_user(&ini);
+    let comment = signing_email(&args.signing_email, &ini)?;
+    let source = KeySource::decide(
+        secret_get(left(deadline), &secret).await?.is_some(),
+        key_path.exists(),
+    );
+    let execution_plan =
+        ExecutionPlan::generic(TOOL, plugin_toolkit::serde_json::to_value(&args)?.into()).detailed(
+            format!(
+                "provision the Gitea signing key at {}; app.ini and the service are untouched",
+                args.key_path
+            ),
+            vec![source.to_change(&key_path, &owner, &secret)],
+        );
+    let notes = vec!["then run `gitea.signing` to configure Gitea to sign with it".to_string()];
+    if !args.execute {
+        let public_key = if key_path.exists() {
+            public_of(&host, &key_path).await.ok()
+        } else {
+            None
+        };
+        return Ok(SigningOutput {
+            dry_run: true,
+            plan: execution_plan,
+            applied: vec![],
+            public_key,
+            notes,
+        });
+    }
+    let public = plugin_toolkit::time::timeout(
+        left(deadline),
+        provision_key(
+            &host, &source, &key_path, &owner, &secret, &comment, deadline,
+        ),
+    )
+    .await
+    .unwrap_or_else(|| Err(anyhow!("did not finish within {KEY_SECS}s")))
+    .with_context(|| format!("{TOOL} failed; app.ini and the service are unchanged"))?;
+    let change = source.to_change(&key_path, &owner, &secret);
+    Ok(SigningOutput {
+        dry_run: false,
+        plan: execution_plan,
+        applied: vec![format!("{} {}", change.action, change.target)],
+        public_key: Some(public),
+        notes,
+    })
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1184,12 +1385,14 @@ mod tests {
 
     const INI: &str = "APP_NAME = Gitea\nRUN_USER = gitea\n\n[server]\nDOMAIN = git.example\n\n[repository.signing]\n; keep me\nSIGNING_KEY = default\n\n[log]\nMODE = console\n";
 
-    fn facts(ini: &str, on_host: bool, in_secrets: bool) -> Facts {
+    const PUBLIC: &str = "ssh-ed25519 AAAA";
+
+    fn facts(ini: &str, served: Option<&str>) -> Facts {
         Facts {
             ini: ini.into(),
             init: Init::Systemd,
-            key_on_host: on_host,
-            key_in_secrets: in_secrets,
+            public_key: PUBLIC.into(),
+            served_key: served.map(str::to_string),
         }
     }
 
@@ -1236,52 +1439,53 @@ mod tests {
     }
 
     #[test]
-    fn plan_generates_a_key_writes_the_ini_restarts_and_verifies() {
-        let steps = plan(
-            &args(false),
-            &facts(INI, false, false),
-            "https://git.example",
-        )
-        .unwrap();
+    fn plan_writes_the_ini_restarts_and_verifies() {
+        let steps = plan(&args(false), &facts(INI, None), "https://git.example").unwrap();
         let actions: Vec<_> = steps.iter().map(|s| s.to_change().action).collect();
-        assert_eq!(actions, ["generate-key", "write", "restart", "verify"]);
-        let Step::Key {
-            owner,
-            comment,
-            secret,
-            ..
-        } = &steps[0]
-        else {
-            panic!()
-        };
-        assert_eq!(
-            (owner.as_str(), comment.as_str()),
-            ("gitea", "gitea@git.example")
-        );
-        assert_eq!(secret, "gitea.home.signing_key");
-        let restart = steps[2].to_change();
+        assert_eq!(actions, ["write", "restart", "verify"]);
+        let restart = steps[1].to_change();
         assert_eq!(restart.target, "systemctl restart gitea");
         assert!(restart.detail.unwrap().contains("DOWN"));
         assert_eq!(
-            steps[3].to_change().target,
+            steps[2].to_change().target,
             "https://git.example/api/v1/signing-key.pub"
         );
     }
 
     #[test]
-    fn configured_server_only_rechecks_the_key_and_verifies() {
+    fn configured_server_restarts_only_when_it_does_not_serve_the_key() {
         let done = ini_set(
             INI,
             SECTION,
             &signing_settings(Path::new(DEFAULT_KEY_PATH), "Gitea", "gitea@git.example"),
         );
-        let steps = plan(&args(false), &facts(&done, true, true), "https://g").unwrap();
-        let actions: Vec<_> = steps.iter().map(|s| s.to_change().action).collect();
-        assert_eq!(actions, ["check-key", "verify"]);
+        let actions = |served| -> Vec<String> {
+            plan(&args(false), &facts(&done, served), "https://g")
+                .unwrap()
+                .iter()
+                .map(|s| s.to_change().action)
+                .collect()
+        };
+        assert_eq!(actions(Some(PUBLIC)), ["verify"]);
+        assert_eq!(actions(Some("ssh-ed25519 OLD")), ["restart", "verify"]);
+        assert_eq!(actions(None), ["restart", "verify"]);
     }
 
     #[test]
     fn key_source_covers_every_case() {
+        let actions: Vec<_> = [
+            KeySource::Generate,
+            KeySource::Adopt,
+            KeySource::Install,
+            KeySource::CheckMatch,
+        ]
+        .iter()
+        .map(|k| k.to_change(Path::new("/k"), "git", "s").action)
+        .collect();
+        assert_eq!(
+            actions,
+            ["generate-key", "adopt-key", "install-key", "check-key"]
+        );
         assert_eq!(KeySource::decide(false, false), KeySource::Generate);
         assert_eq!(KeySource::decide(false, true), KeySource::Adopt);
         assert_eq!(KeySource::decide(true, false), KeySource::Install);
@@ -1290,13 +1494,9 @@ mod tests {
 
     #[test]
     fn plan_needs_an_email_when_app_ini_has_no_domain() {
-        let err = plan(
-            &args(false),
-            &facts("[server]\n", false, false),
-            "https://g",
-        )
-        .unwrap_err()
-        .to_string();
+        let err = plan(&args(false), &facts("[server]\n", None), "https://g")
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("--signing-email"), "{err}");
     }
 
@@ -1311,13 +1511,13 @@ mod tests {
     fn verify_secs_is_clamped_to_the_default() {
         let mut a = args(false);
         a.verify_secs = 600;
-        let steps = plan(&a, &facts(INI, false, false), "https://g").unwrap();
+        let steps = plan(&a, &facts(INI, None), "https://g").unwrap();
         let Some(Step::Verify { wait_secs, .. }) = steps.last() else {
             panic!()
         };
         assert_eq!(*wait_secs, DEFAULT_VERIFY_SECS);
         a.verify_secs = 0;
-        let steps = plan(&a, &facts(INI, false, false), "https://g").unwrap();
+        let steps = plan(&a, &facts(INI, None), "https://g").unwrap();
         let Some(Step::Verify { wait_secs, .. }) = steps.last() else {
             panic!()
         };
@@ -1338,6 +1538,11 @@ mod tests {
         assert!(prepare_key_dir(&key).unwrap(), "created");
         std::fs::write(dir.join("new").join("k.pub"), "x").unwrap();
         assert!(!prepare_key_dir(&key).unwrap(), "key-only dir is reused");
+        std::fs::write(temp_key_path(&key), "x").unwrap();
+        assert!(
+            !prepare_key_dir(&key).unwrap(),
+            "a leftover temp key is allowed"
+        );
         std::fs::write(dir.join("other"), "x").unwrap();
         let err = prepare_key_dir(&dir.join("k")).unwrap_err().to_string();
         assert!(err.contains("not a dedicated key directory"), "{err}");
@@ -1347,7 +1552,6 @@ mod tests {
     struct Fake {
         restarts: std::cell::RefCell<std::collections::VecDeque<bool>>,
         hang_first_restart: std::cell::Cell<bool>,
-        key_delay: std::cell::Cell<Option<Duration>>,
         verify_ok: bool,
         up_ok: bool,
         calls: std::cell::RefCell<Vec<&'static str>>,
@@ -1358,7 +1562,6 @@ mod tests {
             Fake {
                 restarts: std::cell::RefCell::new(restarts.iter().copied().collect()),
                 hang_first_restart: Default::default(),
-                key_delay: Default::default(),
                 verify_ok,
                 up_ok,
                 calls: Default::default(),
@@ -1367,19 +1570,6 @@ mod tests {
     }
 
     impl Service for Fake {
-        async fn apply_key(
-            &self,
-            _: &KeySource,
-            _: &Path,
-            _: &str,
-            _: &str,
-            _: &str,
-        ) -> Result<String> {
-            if let Some(d) = self.key_delay.get() {
-                tokio::time::sleep(d).await;
-            }
-            Ok("ssh-ed25519 AAAA".into())
-        }
         async fn restart(&self, _: &[String]) -> Result<()> {
             self.calls.borrow_mut().push("restart");
             if self.hang_first_restart.replace(false) {
@@ -1437,9 +1627,9 @@ mod tests {
             b.reserve(),
             Duration::from_secs(2 * RESTART_SECS + MIN_VERIFY_SECS + ROLLBACK_UP_SECS)
         );
-        assert!(b.key_limit() <= Duration::from_secs(RUN_SECS) - b.reserve());
-        assert!(b.key_limit() > Duration::from_secs(8));
-        // Worst failure path: key, restart, verify, rollback restart, wait_up.
+        assert!(b.pre_limit() <= Duration::from_secs(RUN_SECS) - b.reserve());
+        assert!(b.pre_limit() > Duration::from_secs(3));
+        // Worst path: pre-run checks, write, restart, verify, rollback restart, wait_up.
         const {
             assert!(
                 (RUN_SECS - (2 * RESTART_SECS + MIN_VERIFY_SECS + ROLLBACK_UP_SECS))
@@ -1454,27 +1644,7 @@ mod tests {
             deadline: Instant::now(),
             restart: b.restart,
         };
-        assert_eq!(spent.key_limit(), Duration::ZERO);
-        const { assert!(2 * RESTART_SECS + MIN_VERIFY_SECS + ROLLBACK_UP_SECS < RUN_SECS) };
-    }
-
-    #[tokio::test]
-    async fn a_slow_key_step_refuses_before_writing_app_ini() {
-        let dir = scratch("slowkey");
-        let ini = dir.join("app.ini");
-        std::fs::write(&ini, INI).unwrap();
-        let fake = Fake::new(&[true, true], true, true);
-        fake.key_delay.set(Some(Duration::from_millis(300)));
-        let mut budget = test_budget();
-        budget.deadline = Instant::now() + budget.reserve() + Duration::from_millis(100);
-        let err = run(&fake, &run_steps(&ini), budget)
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("key step did not finish"), "{err}");
-        assert_eq!(std::fs::read_to_string(&ini).unwrap(), INI);
-        assert!(fake.calls.borrow().is_empty());
-        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(spent.pre_limit(), Duration::ZERO);
     }
 
     #[tokio::test]
@@ -1485,7 +1655,7 @@ mod tests {
         let fake = Fake::new(&[true, true], true, true);
         let mut budget = test_budget();
         budget.deadline = Instant::now() + budget.reserve() - Duration::from_millis(1);
-        let err = run(&fake, &run_steps(&ini)[1..], budget)
+        let err = run(&fake, &run_steps(&ini), budget, PUBLIC)
             .await
             .unwrap_err()
             .to_string();
@@ -1502,7 +1672,7 @@ mod tests {
         std::fs::write(&ini, INI).unwrap();
         let fake = Fake::new(&[true, true], true, true);
         fake.hang_first_restart.set(true);
-        let err = run(&fake, &run_steps(&ini), test_budget())
+        let err = run(&fake, &run_steps(&ini), test_budget(), PUBLIC)
             .await
             .unwrap_err()
             .to_string();
@@ -1515,13 +1685,6 @@ mod tests {
 
     fn run_steps(ini: &Path) -> Vec<Step> {
         vec![
-            Step::Key {
-                source: KeySource::CheckMatch,
-                key_path: "/k".into(),
-                owner: "git".into(),
-                secret: "s".into(),
-                comment: "c".into(),
-            },
             Step::WriteIni {
                 path: ini.to_path_buf(),
                 contents: "NEW\n".into(),
@@ -1542,7 +1705,7 @@ mod tests {
         let ini = dir.join("app.ini");
         std::fs::write(&ini, INI).unwrap();
         let fake = Fake::new(&[false, true], true, true);
-        let err = run(&fake, &run_steps(&ini), test_budget())
+        let err = run(&fake, &run_steps(&ini), test_budget(), PUBLIC)
             .await
             .unwrap_err()
             .to_string();
@@ -1558,7 +1721,7 @@ mod tests {
         let ini = dir.join("app.ini");
         std::fs::write(&ini, INI).unwrap();
         let fake = Fake::new(&[true, true], false, true);
-        let err = run(&fake, &run_steps(&ini), test_budget())
+        let err = run(&fake, &run_steps(&ini), test_budget(), PUBLIC)
             .await
             .unwrap_err()
             .to_string();
@@ -1577,14 +1740,14 @@ mod tests {
         let ini = dir.join("app.ini");
         std::fs::write(&ini, INI).unwrap();
         let fake = Fake::new(&[false, false], true, true);
-        let err = run(&fake, &run_steps(&ini), test_budget())
+        let err = run(&fake, &run_steps(&ini), test_budget(), PUBLIC)
             .await
             .unwrap_err()
             .to_string();
         assert!(err.contains("Gitea may be DOWN"), "{err}");
         assert!(err.contains("PREVIOUS app.ini is in place"), "{err}");
         let fake = Fake::new(&[true, true], false, false);
-        let err = run(&fake, &run_steps(&ini), test_budget())
+        let err = run(&fake, &run_steps(&ini), test_budget(), PUBLIC)
             .await
             .unwrap_err()
             .to_string();
@@ -1594,14 +1757,14 @@ mod tests {
 
     #[test]
     fn launchd_hosts_are_refused() {
-        let mut f = facts(INI, false, false);
+        let mut f = facts(INI, None);
         f.init = Init::Launchd;
         assert!(plan(&args(false), &f, "https://g").is_err());
     }
 
     #[test]
     fn plan_output_never_contains_key_material() {
-        let steps = plan(&args(false), &facts(INI, false, false), "https://g").unwrap();
+        let steps = plan(&args(false), &facts(INI, None), "https://g").unwrap();
         let p = to_plan("gitea.signing", &args(false), &steps).unwrap();
         let text = plugin_toolkit::serde_json::to_string(&p).unwrap();
         assert!(!text.contains("PRIVATE KEY"), "{text}");
@@ -1617,6 +1780,15 @@ mod tests {
         for execute in [false, true] {
             let err = plugin_toolkit::dispatch::dispatch(
                 "gitea.signing",
+                json!({"endpoint": "home", "app_ini": ini, "key_path": dir.join("k"), "execute": execute}),
+                &ctx,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("no caller identity"), "{err}");
+            let err = plugin_toolkit::dispatch::dispatch(
+                "gitea.signing.key",
                 json!({"endpoint": "home", "app_ini": ini, "key_path": dir.join("k"), "execute": execute}),
                 &ctx,
             )
@@ -1670,6 +1842,10 @@ mod tests {
             Some("admin")
         );
         assert_eq!(
+            plugin_toolkit::dispatch::required_role("gitea.signing.key"),
+            Some("admin")
+        );
+        assert_eq!(
             plugin_toolkit::dispatch::required_role("gitea.signing.status"),
             Some("admin")
         );
@@ -1677,6 +1853,54 @@ mod tests {
             plugin_toolkit::dispatch::required_role("gitea.update_style"),
             Some("admin")
         );
+    }
+
+    #[test]
+    fn a_failed_chown_after_install_restores_the_previous_app_ini() {
+        let dir = scratch("chown");
+        let ini = dir.join("app.ini");
+        std::fs::write(&ini, INI).unwrap();
+        let calls = std::cell::Cell::new(0);
+        let finish = |_: &Path| {
+            calls.set(calls.get() + 1);
+            if calls.get() == 1 {
+                bail!("chown refused")
+            }
+            Ok(())
+        };
+        let err = install_ini(&ini, b"NEW\n", INI.as_bytes(), 0o640, finish)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("PREVIOUS"), "{err}");
+        assert_eq!(std::fs::read_to_string(&ini).unwrap(), INI);
+        let err = install_ini(&ini, b"NEW\n", INI.as_bytes(), 0o640, |_| bail!("no"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("owner could not be restored"), "{err}");
+        assert_eq!(std::fs::read_to_string(&ini).unwrap(), INI);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn apply_refuses_until_the_key_is_provisioned() {
+        let dir = scratch("nokey");
+        let host = LocalHost::current().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let err = existing_key(&host, &dir.join("k"), "s", deadline)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(RUN_KEY_FIRST), "{err}");
+        std::fs::write(dir.join("garbage"), "not a key").unwrap();
+        let err = format!(
+            "{:#}",
+            existing_key(&host, &dir.join("garbage"), "s", deadline)
+                .await
+                .unwrap_err()
+        );
+        assert!(err.contains("not a valid private key"), "{err}");
+        assert!(err.contains(RUN_KEY_FIRST), "{err}");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
