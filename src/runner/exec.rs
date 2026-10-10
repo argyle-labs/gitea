@@ -31,7 +31,7 @@ pub struct Executor<'a> {
 /// over `path`, so a reader (launchd, a running runner) never sees a partial
 /// file and a crash never leaves one. `create_new` refuses to reuse a temp
 /// path someone else planted.
-fn write_atomic(path: &Path, contents: &[u8], mode: u32) -> Result<()> {
+pub(crate) fn write_atomic(path: &Path, contents: &[u8], mode: u32) -> Result<()> {
     use std::io::Write;
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     let parent = path
@@ -83,7 +83,7 @@ fn create_dir_mode(path: &Path, mode: u32) -> Result<()> {
         .with_context(|| format!("chmod {}", path.display()))
 }
 
-fn chown(path: &Path, uid: Option<u32>, gid: u32, recursive: bool) -> Result<()> {
+pub(crate) fn chown(path: &Path, uid: Option<u32>, gid: u32, recursive: bool) -> Result<()> {
     std::os::unix::fs::lchown(path, uid, Some(gid))
         .with_context(|| format!("chown {}", path.display()))?;
     if recursive && std::fs::symlink_metadata(path)?.is_dir() {
