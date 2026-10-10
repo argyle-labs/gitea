@@ -571,15 +571,19 @@ async fn existing_key(
     if !key_path.exists() {
         bail!("no signing key at {}; {RUN_KEY_FIRST}", key_path.display());
     }
-    let public = plugin_toolkit::time::timeout(left(deadline), public_of(host, key_path))
-        .await
-        .unwrap_or_else(|| Err(anyhow!("ssh-keygen did not finish in time")))
-        .with_context(|| {
-            format!(
-                "{} is not a valid private key; {RUN_KEY_FIRST}",
+    let public =
+        match plugin_toolkit::time::timeout(left(deadline), public_of(host, key_path)).await {
+            Some(parsed) => parsed.with_context(|| {
+                format!(
+                    "{} is not a valid private key; {RUN_KEY_FIRST}",
+                    key_path.display()
+                )
+            })?,
+            None => bail!(
+                "timed out reading the public half of {} with ssh-keygen",
                 key_path.display()
-            )
-        })?;
+            ),
+        };
     check_matches_secret(key_path, secret, left(deadline))
         .await
         .context(RUN_KEY_FIRST)?;
@@ -1985,6 +1989,22 @@ mod tests {
         );
         assert!(err.contains("not a valid private key"), "{err}");
         assert!(err.contains(RUN_KEY_FIRST), "{err}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn apply_reports_a_key_check_timeout_as_a_timeout() {
+        let dir = scratch("keytimeout");
+        let host = LocalHost::current().unwrap();
+        std::fs::write(dir.join("k"), "not a key").unwrap();
+        let err = format!(
+            "{:#}",
+            existing_key(&host, &dir.join("k"), "s", Instant::now())
+                .await
+                .unwrap_err()
+        );
+        assert!(err.contains("timed out"), "{err}");
+        assert!(!err.contains("not a valid private key"), "{err}");
         std::fs::remove_dir_all(&dir).ok();
     }
 
