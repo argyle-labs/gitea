@@ -99,6 +99,36 @@ pub struct RunnerState {
     /// Revoked on uninstall; a created account takes its grant with it.
     #[serde(default)]
     pub added_docker_group: bool,
+    /// Gitea records an adopt still has to delete. Kept until the deletes
+    /// succeed so a re-run after a failure still removes them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_stale: Vec<StaleRecord>,
+}
+
+/// A Gitea runner record to delete, with the scope it lives under.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StaleRecord {
+    pub id: i64,
+    pub scope: String,
+}
+
+impl std::str::FromStr for StaleRecord {
+    type Err = anyhow::Error;
+    /// `ID` or `ID@SCOPE`; a bare id takes the install's scope at plan time.
+    fn from_str(s: &str) -> Result<Self> {
+        let (id, scope) = s.split_once('@').unwrap_or((s, ""));
+        let id: i64 = id
+            .trim()
+            .parse()
+            .map_err(|_| anyhow!("invalid stale id '{s}' (expected ID or ID@SCOPE)"))?;
+        if !scope.is_empty() {
+            scope.parse::<Scope>()?;
+        }
+        Ok(StaleRecord {
+            id,
+            scope: scope.to_string(),
+        })
+    }
 }
 
 impl RunnerState {
@@ -192,6 +222,41 @@ pub enum Step {
     Remove {
         path: PathBuf,
         recursive: bool,
+    },
+    /// Poll Gitea until the runner holds no job, failing after `timeout_secs`.
+    WaitIdle {
+        runner_id: i64,
+        timeout_secs: u64,
+    },
+    /// Poll Gitea until the runner reports online, failing after `timeout_secs`.
+    VerifyOnline {
+        runner_id: i64,
+        timeout_secs: u64,
+    },
+    /// Poll Gitea until the runner reports offline. Run before starting an
+    /// adopted runner so the online gate after it proves contact from this
+    /// host, not a source that is still running.
+    WaitOffline {
+        runner_id: i64,
+        timeout_secs: u64,
+    },
+    /// Set the runner's `disabled` flag in Gitea.
+    SetDisabled {
+        runner_id: i64,
+        scope: Scope,
+        disabled: bool,
+    },
+    /// Fail unless the service manager shows the runner not running.
+    VerifyStopped {
+        layout: Box<Layout>,
+    },
+    /// Copy a migrated `.runner` into place. Read at execute time, so the
+    /// runner's secret token is never in the plan, and refused unless it still
+    /// carries `runner_id`.
+    InstallRegistration {
+        src: PathBuf,
+        dest: PathBuf,
+        runner_id: i64,
     },
 }
 
@@ -305,6 +370,52 @@ impl Step {
                 path.display().to_string(),
                 if *recursive { "remove-dir" } else { "remove-file" },
             ),
+            Step::WaitIdle {
+                runner_id,
+                timeout_secs,
+            } => PlannedChange::new(format!("gitea runner id {runner_id}"), "wait-idle")
+                .with_detail(format!(
+                    "gate: wait up to {timeout_secs}s for Gitea to show no running job"
+                )),
+            Step::VerifyOnline {
+                runner_id,
+                timeout_secs,
+            } => PlannedChange::new(format!("gitea runner id {runner_id}"), "verify-online")
+                .with_detail(format!(
+                    "gate: wait up to {timeout_secs}s for Gitea to show it online"
+                )),
+            Step::WaitOffline {
+                runner_id,
+                timeout_secs,
+            } => PlannedChange::new(format!("gitea runner id {runner_id}"), "wait-offline")
+                .with_detail(format!(
+                    "gate: wait up to {timeout_secs}s for Gitea to show it offline, so no other host still runs it"
+                )),
+            Step::SetDisabled {
+                runner_id,
+                scope,
+                disabled,
+            } => PlannedChange::new(
+                format!("gitea runner id {runner_id}"),
+                if *disabled { "disable" } else { "enable" },
+            )
+            .with_detail(format!(
+                "PATCH {}/{runner_id} {{\"disabled\": {disabled}}}",
+                scope.runners_path()
+            )),
+            Step::VerifyStopped { layout } => {
+                PlannedChange::new(layout.service.clone(), "verify-stopped")
+                    .with_detail("gate: fail unless the service manager shows it not running")
+            }
+            Step::InstallRegistration {
+                src,
+                dest,
+                runner_id,
+            } => PlannedChange::new(dest.display().to_string(), "install-registration")
+                .with_detail(format!(
+                    "copy {} (mode 600); refused unless it holds runner id {runner_id}",
+                    src.display()
+                )),
         }
     }
 }
@@ -594,6 +705,7 @@ pub fn install_steps(spec: &InstallSpec<'_>) -> Vec<Step> {
         runner_id: None,
         created_account: spec.account.record.created,
         added_docker_group: spec.account.record.added_docker_group,
+        pending_stale: Vec::new(),
     };
     // Recorded before the account is touched (the state file lives outside
     // the install dir), so an install that fails later still leaves uninstall
@@ -750,6 +862,158 @@ pub fn uninstall_steps(
     steps
 }
 
+/// Source side of a host move: stop Gitea assigning the runner jobs, wait out
+/// the running one, then stop the runner and keep it from restarting. Files
+/// and the Gitea record stay for the target, which re-enables it.
+pub fn drain_steps(
+    layout: &Layout,
+    uid: u32,
+    state: ServiceState,
+    runner_id: i64,
+    scope: &Scope,
+    timeout_secs: u64,
+) -> Vec<Step> {
+    let mut steps = vec![
+        Step::SetDisabled {
+            runner_id,
+            scope: scope.clone(),
+            disabled: true,
+        },
+        Step::WaitIdle {
+            runner_id,
+            timeout_secs,
+        },
+    ];
+    steps.extend(service_steps(layout, ServiceOp::Unload, uid, state));
+    steps.push(Step::VerifyStopped {
+        layout: Box::new(layout.clone()),
+    });
+    steps
+}
+
+/// Records to delete after an adopt: the install's own previous id and any
+/// still pending from an earlier adopt, plus the caller's list, never the
+/// migrated id. A bare caller id takes the install's scope.
+pub fn stale_ids(
+    record: &RunnerState,
+    given: &[StaleRecord],
+    migrated: i64,
+) -> Result<Vec<StaleRecord>> {
+    if given.iter().any(|g| g.id == migrated) {
+        bail!("stale id {migrated} is the migrated runner; it is never deleted");
+    }
+    let own = record.runner_id.map(|id| StaleRecord {
+        id,
+        scope: record.scope.clone(),
+    });
+    let mut out: Vec<StaleRecord> = Vec::new();
+    for s in own.into_iter().chain(record.pending_stale.iter().cloned()) {
+        if s.id != migrated && !out.iter().any(|o| o.id == s.id) {
+            out.push(s);
+        }
+    }
+    for g in given {
+        let scope = if g.scope.is_empty() {
+            record.scope.clone()
+        } else {
+            g.scope.clone()
+        };
+        let scope_label = scope.parse::<Scope>()?.label();
+        match out.iter().find(|o| o.id == g.id) {
+            Some(o) if o.scope.parse::<Scope>()?.label() != scope_label => bail!(
+                "stale id {} is recorded under scope '{}', not '{scope_label}'",
+                g.id,
+                o.scope
+            ),
+            Some(_) => {}
+            None => out.push(StaleRecord { id: g.id, scope }),
+        }
+    }
+    Ok(out)
+}
+
+/// Gitea marks a runner offline only after about a minute without contact,
+/// so a shorter offline gate fails even when the source is stopped.
+pub const MIN_OFFLINE_SECS: u64 = 90;
+
+/// Target side of a host move: swap the install's registration for the
+/// migrated one, start it, prove Gitea sees it online, then delete stale
+/// records. Stale deletion waits for the online gate so a failed move leaves
+/// every record in place.
+#[allow(clippy::too_many_arguments)]
+pub fn adopt_steps(
+    layout: &Layout,
+    uid: u32,
+    state: ServiceState,
+    src: &Path,
+    record: RunnerState,
+    migrated_id: i64,
+    stale: &[StaleRecord],
+    scope: &Scope,
+    timeout_secs: u64,
+    offline_timeout_secs: u64,
+) -> Result<Vec<Step>> {
+    let mut steps = service_steps(layout, ServiceOp::Unload, uid, state);
+    steps.push(Step::InstallRegistration {
+        src: src.to_path_buf(),
+        dest: layout.runner_file.clone(),
+        runner_id: migrated_id,
+    });
+    if let Some(user) = &layout.user {
+        steps.push(Step::Chown {
+            path: layout.runner_file.clone(),
+            user: Some(user.clone()),
+            group: user.clone(),
+            recursive: false,
+        });
+    }
+    let adopted = RunnerState {
+        runner_id: Some(migrated_id),
+        pending_stale: stale.to_vec(),
+        ..record
+    };
+    steps.push(Step::RecordState {
+        path: layout.state_file(),
+        state: adopted.clone(),
+        runner_file: None,
+    });
+    steps.push(Step::WaitOffline {
+        runner_id: migrated_id,
+        timeout_secs: offline_timeout_secs.max(MIN_OFFLINE_SECS),
+    });
+    steps.push(Step::SetDisabled {
+        runner_id: migrated_id,
+        scope: scope.clone(),
+        disabled: false,
+    });
+    steps.extend(service_steps(
+        layout,
+        ServiceOp::Load,
+        uid,
+        ServiceState::NotLoaded,
+    ));
+    steps.push(Step::VerifyOnline {
+        runner_id: migrated_id,
+        timeout_secs,
+    });
+    for s in stale {
+        steps.push(Step::Deregister {
+            runner_id: s.id,
+            scope: s.scope.parse()?,
+            scope_known: true,
+        });
+    }
+    steps.push(Step::RecordState {
+        path: layout.state_file(),
+        state: RunnerState {
+            pending_stale: Vec::new(),
+            ..adopted
+        },
+        runner_file: None,
+    });
+    Ok(steps)
+}
+
 /// `recorded` is the managed install's state, rewritten with the new version.
 /// `check_major` guards a hand-placed install against a silent major jump.
 pub fn upgrade_steps(
@@ -894,7 +1158,9 @@ pub fn touched_paths(steps: &[Step]) -> Vec<&Path> {
             | Step::Chown { path, .. }
             | Step::RecordState { path, .. }
             | Step::ReconcileAccount { path, .. } => Some(path.as_path()),
-            Step::InstallBinary { dest, .. } => Some(dest.as_path()),
+            Step::InstallBinary { dest, .. } | Step::InstallRegistration { dest, .. } => {
+                Some(dest.as_path())
+            }
             _ => None,
         })
         .collect()
@@ -1656,6 +1922,7 @@ mod tests {
             runner_id: Some(7),
             created_account: true,
             added_docker_group: false,
+            pending_stale: Vec::new(),
         };
         let a = actions(&upgrade_steps(
             &l,
@@ -1831,5 +2098,142 @@ mod tests {
             ]
         );
         assert!(heal_steps(&l, 0, ServiceState::Running, &[], &Rerender::default()).is_empty());
+    }
+
+    #[test]
+    fn drain_disables_then_waits_then_stops_and_verifies() {
+        let l = layout(Init::Systemd);
+        let steps = drain_steps(&l, 0, ServiceState::Running, 7, &Scope::Instance, 60);
+        assert_eq!(
+            steps[0],
+            Step::SetDisabled {
+                runner_id: 7,
+                scope: Scope::Instance,
+                disabled: true
+            }
+        );
+        assert_eq!(
+            steps[1],
+            Step::WaitIdle {
+                runner_id: 7,
+                timeout_secs: 60
+            }
+        );
+        assert!(matches!(&steps[2], Step::Run { argv, .. } if argv[1] == "disable"));
+        assert!(matches!(steps.last(), Some(Step::VerifyStopped { .. })));
+        assert!(
+            !steps
+                .iter()
+                .any(|s| matches!(s, Step::Deregister { .. } | Step::Remove { .. }))
+        );
+    }
+
+    fn record(runner_id: Option<i64>, pending: Vec<StaleRecord>) -> RunnerState {
+        RunnerState {
+            scope: "instance".into(),
+            version: "4.1.0".into(),
+            runner_id,
+            created_account: true,
+            added_docker_group: false,
+            pending_stale: pending,
+        }
+    }
+
+    fn stale(id: i64, scope: &str) -> StaleRecord {
+        StaleRecord {
+            id,
+            scope: scope.into(),
+        }
+    }
+
+    #[test]
+    fn stale_ids_never_include_the_migrated_runner() {
+        let given = [stale(4, "org:a"), stale(9, "")];
+        assert_eq!(
+            stale_ids(&record(Some(9), vec![]), &given, 7).unwrap(),
+            vec![stale(9, "instance"), stale(4, "org:a")]
+        );
+        assert!(
+            stale_ids(&record(Some(7), vec![]), &[], 7)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(stale_ids(&record(None, vec![]), &[stale(7, "")], 7).is_err());
+        assert!(stale_ids(&record(Some(9), vec![]), &[stale(9, "org:a")], 7).is_err());
+    }
+
+    #[test]
+    fn stale_ids_keep_records_pending_from_a_failed_adopt() {
+        let r = record(Some(7), vec![stale(9, "instance")]);
+        assert_eq!(stale_ids(&r, &[], 7).unwrap(), vec![stale(9, "instance")]);
+    }
+
+    #[test]
+    fn stale_record_parses_id_and_optional_scope() {
+        assert_eq!("12".parse::<StaleRecord>().unwrap(), stale(12, ""));
+        assert_eq!(
+            "12@repo:o/r".parse::<StaleRecord>().unwrap(),
+            stale(12, "repo:o/r")
+        );
+        assert!("x".parse::<StaleRecord>().is_err());
+        assert!("1@bogus".parse::<StaleRecord>().is_err());
+    }
+
+    #[test]
+    fn adopt_deletes_stale_records_only_after_the_online_gate() {
+        let l = layout(Init::Systemd);
+        let steps = adopt_steps(
+            &l,
+            0,
+            ServiceState::Running,
+            Path::new("/tmp/moved.runner"),
+            record(Some(9), vec![]),
+            7,
+            &[stale(9, "instance"), stale(4, "org:a")],
+            &Scope::Instance,
+            120,
+            10,
+        )
+        .unwrap();
+        assert!(steps.contains(&Step::WaitOffline {
+            runner_id: 7,
+            timeout_secs: MIN_OFFLINE_SECS
+        }));
+        let pos = |f: &dyn Fn(&Step) -> bool| steps.iter().position(f).unwrap();
+        let install = pos(&|s| matches!(s, Step::InstallRegistration { runner_id: 7, .. }));
+        let recorded = pos(&|s| {
+            matches!(s, Step::RecordState { state, runner_file: None, .. }
+                if state.runner_id == Some(7) && state.created_account && state.pending_stale.len() == 2)
+        });
+        let offline = pos(&|s| matches!(s, Step::WaitOffline { runner_id: 7, .. }));
+        let enable = pos(&|s| {
+            matches!(
+                s,
+                Step::SetDisabled {
+                    runner_id: 7,
+                    disabled: false,
+                    ..
+                }
+            )
+        });
+        let load = pos(&|s| matches!(s, Step::Run { argv, .. } if argv[1] == "enable"));
+        let online = pos(&|s| matches!(s, Step::VerifyOnline { runner_id: 7, .. }));
+        let dereg = pos(&|s| matches!(s, Step::Deregister { runner_id: 9, .. }));
+        let org = pos(
+            &|s| matches!(s, Step::Deregister { runner_id: 4, scope: Scope::Org(o), .. } if o == "a"),
+        );
+        let cleared = pos(&|s| {
+            matches!(s, Step::RecordState { state, .. }
+                if state.runner_id == Some(7) && state.pending_stale.is_empty())
+        });
+        assert!(install < recorded && recorded < offline && offline < enable);
+        assert!(enable < load && load < online && online < dereg && dereg < org);
+        assert_eq!(cleared, steps.len() - 1);
+        assert!(!steps.iter().any(|s| matches!(s, Step::Register { .. })));
+        assert!(
+            !steps
+                .iter()
+                .any(|s| matches!(s, Step::Deregister { runner_id: 7, .. }))
+        );
     }
 }

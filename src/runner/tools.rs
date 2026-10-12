@@ -22,7 +22,7 @@ use super::health::{
     LaunchdPriority, Observation, WaitingJob, mode_from_labels,
 };
 use super::host::{
-    ETC_GROUP, ETC_PASSWD, LocalHost, LocalInstall, lookup_group, lookup_user, read_local_db,
+    self, ETC_GROUP, ETC_PASSWD, LocalHost, LocalInstall, lookup_group, lookup_user, read_local_db,
     user_in_group,
 };
 use super::layout::{self, Init, Layout, Mode};
@@ -1024,6 +1024,283 @@ pub async fn gitea_runner_heal(args: RunnerHealArgs, ctx: &ToolCtx) -> Result<Ru
     .await
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// gitea.runner.drain / gitea.runner.adopt — moving a runner between hosts
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn default_drain_timeout() -> u64 {
+    3600
+}
+fn default_online_timeout() -> u64 {
+    180
+}
+fn default_offline_timeout() -> u64 {
+    180
+}
+
+#[derive(clap::Args, Serialize, Deserialize, JsonSchema)]
+pub struct RunnerDrainArgs {
+    /// Registered Gitea endpoint (to see whether the runner holds a job).
+    #[arg(long)]
+    pub endpoint: String,
+    #[arg(long)]
+    pub name: String,
+    /// Scope the runner was registered in. Normally read from the install's
+    /// own record; if given, it must agree with that record.
+    #[arg(long)]
+    #[serde(default)]
+    pub scope: Option<String>,
+    /// How long to wait for a running job to finish.
+    #[arg(long, default_value_t = default_drain_timeout())]
+    #[serde(default = "default_drain_timeout")]
+    pub timeout_secs: u64,
+    /// Apply. Omitted, returns the plan and changes nothing.
+    #[arg(long)]
+    #[serde(default)]
+    pub execute: bool,
+}
+
+/// First half of a host move: disable the runner in Gitea so it takes no new
+/// job, wait for the running one, then stop it so it cannot restart. Its
+/// `.runner` and Gitea record are kept for `gitea.runner.adopt` on the
+/// replacement system. If the wait or the stop fails, the runner is
+/// re-enabled before the error is returned.
+#[orca_tool(
+    domain = "gitea",
+    verb = "runner.drain",
+    role = "admin",
+    execute_gated = false
+)]
+pub async fn gitea_runner_drain(args: RunnerDrainArgs, ctx: &ToolCtx) -> Result<RunnerChange> {
+    const TOOL: &str = "gitea.runner.drain";
+    guard(TOOL, args.execute, ctx)?;
+    let host = LocalHost::current()?;
+    let l = host.find(&args.name).ok_or_else(|| {
+        anyhow!(
+            "no runner named '{}' is installed on this system",
+            args.name
+        )
+    })?;
+    // The root-owned record is preferred; a hand-placed install has only `.runner`.
+    let recorded = RunnerState::read(&l.state_file());
+    let runner_id = recorded
+        .as_ref()
+        .and_then(|r| r.runner_id)
+        .or_else(|| host::read_registration(&l.runner_file).map(|r| r.id))
+        .ok_or_else(|| anyhow!("runner '{}' has no Gitea runner id to drain", args.name))?;
+    let (scope, _) = plan::deregister_scope(
+        recorded.as_ref().map(|r| r.scope.as_str()),
+        args.scope.as_deref(),
+    )?;
+    let cfg = gitea_config(&args.endpoint).await?;
+    if !api::runner_in_scope(&cfg, &scope, runner_id).await? {
+        bail!(
+            "Gitea has no runner {runner_id} under scope '{}'",
+            scope.label()
+        );
+    }
+    let (state, _) = host.service_state(&l).await;
+    let steps = plan::drain_steps(&l, host.uid, state, runner_id, &scope, args.timeout_secs);
+    let exec = Executor {
+        host: &host,
+        gitea: Some(&cfg),
+    };
+    plan_or_apply(
+        TOOL,
+        &args,
+        args.execute,
+        ctx.caller().as_ref(),
+        &args.name,
+        format!(
+            "drain runner '{}' (gitea id {runner_id}) and stop it; copy {} to the replacement system, then run gitea.runner.adopt there",
+            args.name,
+            l.runner_file.display()
+        ),
+        steps,
+        exec,
+        Vec::new(),
+        Vec::new(),
+    )
+    .await
+}
+
+/// A `--stale-id`: a bare id (JSON number or string) or `ID@SCOPE`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(untagged)]
+pub enum StaleIdArg {
+    Id(i64),
+    Spec(String),
+}
+
+impl std::str::FromStr for StaleIdArg {
+    type Err = std::convert::Infallible;
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        Ok(StaleIdArg::Spec(s.to_string()))
+    }
+}
+
+impl StaleIdArg {
+    fn to_record(&self) -> Result<plan::StaleRecord> {
+        match self {
+            StaleIdArg::Id(id) => Ok(plan::StaleRecord {
+                id: *id,
+                scope: String::new(),
+            }),
+            StaleIdArg::Spec(s) => s.parse(),
+        }
+    }
+}
+
+#[derive(clap::Args, Serialize, Deserialize, JsonSchema)]
+pub struct RunnerAdoptArgs {
+    /// Registered Gitea endpoint (to verify and delete records).
+    #[arg(long)]
+    pub endpoint: String,
+    /// Managed runner on this system, installed with the source's labels and
+    /// capacity, whose registration is replaced.
+    #[arg(long)]
+    pub name: String,
+    /// The drained source runner's `.runner`, already copied onto this system.
+    #[arg(long)]
+    pub registration: std::path::PathBuf,
+    /// Further stale Gitea runner records to delete once the moved runner is
+    /// online, as `ID` (this install's scope) or `ID@SCOPE`. The id this
+    /// install registered itself is always deleted.
+    #[arg(long = "stale-id")]
+    #[serde(default)]
+    pub stale_ids: Vec<StaleIdArg>,
+    /// How long to wait for Gitea to show the moved runner online.
+    #[arg(long, default_value_t = default_online_timeout())]
+    #[serde(default = "default_online_timeout")]
+    pub timeout_secs: u64,
+    /// How long to wait for Gitea to show the moved runner offline before
+    /// starting it here. Values below 90 are raised to 90.
+    #[arg(long, default_value_t = default_offline_timeout())]
+    #[serde(default = "default_offline_timeout")]
+    pub offline_timeout_secs: u64,
+    /// Apply. Omitted, returns the plan and changes nothing.
+    #[arg(long)]
+    #[serde(default)]
+    pub execute: bool,
+}
+
+/// Second half of a host move: give a runner installed here the drained
+/// source's registration, keeping its Gitea runner id (never re-registering),
+/// start it, verify Gitea shows that id online, then delete stale records.
+#[orca_tool(
+    domain = "gitea",
+    verb = "runner.adopt",
+    role = "admin",
+    execute_gated = false
+)]
+pub async fn gitea_runner_adopt(args: RunnerAdoptArgs, ctx: &ToolCtx) -> Result<RunnerChange> {
+    const TOOL: &str = "gitea.runner.adopt";
+    guard(TOOL, args.execute, ctx)?;
+    let host = LocalHost::current()?;
+    let l = host.find(&args.name).ok_or_else(|| {
+        anyhow!(
+            "no runner named '{}' is installed on this system; install it first",
+            args.name
+        )
+    })?;
+    if !l.managed {
+        bail!(
+            "runner '{}' is a hand-placed install at {}; adopt only into installs this plugin created",
+            args.name,
+            l.dir.display()
+        );
+    }
+    let record = RunnerState::read(&l.state_file())
+        .ok_or_else(|| anyhow!("no state record at {}", l.state_file().display()))?;
+    let migrated = host::read_registration(&args.registration).ok_or_else(|| {
+        anyhow!(
+            "no readable act_runner registration at {}",
+            args.registration.display()
+        )
+    })?;
+    let given = args
+        .stale_ids
+        .iter()
+        .map(StaleIdArg::to_record)
+        .collect::<Result<Vec<plan::StaleRecord>>>()?;
+    let candidates = plan::stale_ids(&record, &given, migrated.id)?;
+    let scope: Scope = record.scope.parse()?;
+    let cfg = gitea_config(&args.endpoint).await?;
+    if !api::runner_in_scope(&cfg, &scope, migrated.id).await? {
+        bail!(
+            "Gitea has no runner {} under scope '{}' — the registration cannot be adopted",
+            migrated.id,
+            scope.label()
+        );
+    }
+    let mut notes = Vec::new();
+    let mut stale = Vec::new();
+    for s in candidates {
+        let s_scope: Scope = s.scope.parse()?;
+        if api::runner_in_scope(&cfg, &s_scope, s.id).await? {
+            stale.push(s);
+        } else if given.iter().any(|g| g.id == s.id) {
+            bail!(
+                "stale id {} is not a runner under scope '{}'",
+                s.id,
+                s_scope.label()
+            );
+        } else {
+            notes.push(format!("stale id {} is already gone from Gitea", s.id));
+        }
+    }
+    let local = host.inspect(&l).await;
+    let mut want: Vec<&str> = migrated.labels.iter().map(String::as_str).collect();
+    let mut have: Vec<&str> = local.labels.iter().map(String::as_str).collect();
+    want.sort_unstable();
+    have.sort_unstable();
+    if want != have {
+        notes.push(format!(
+            "labels differ: moved registration [{}], this install's config [{}]",
+            want.join(", "),
+            have.join(", ")
+        ));
+    }
+    let steps = plan::adopt_steps(
+        &l,
+        host.uid,
+        local.service_state,
+        &args.registration,
+        record,
+        migrated.id,
+        &stale,
+        &scope,
+        args.timeout_secs,
+        args.offline_timeout_secs,
+    )?;
+    let exec = Executor {
+        host: &host,
+        gitea: Some(&cfg),
+    };
+    plan_or_apply(
+        TOOL,
+        &args,
+        args.execute,
+        ctx.caller().as_ref(),
+        &args.name,
+        format!(
+            "adopt gitea runner id {} as '{}', then delete stale ids [{}]",
+            migrated.id,
+            args.name,
+            stale
+                .iter()
+                .map(|s| format!("{}@{}", s.id, s.scope))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        steps,
+        exec,
+        Vec::new(),
+        notes,
+    )
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1039,7 +1316,28 @@ mod tests {
             runner_id: Some(5),
             created_account: created,
             added_docker_group: added,
+            pending_stale: Vec::new(),
         }
+    }
+
+    #[test]
+    fn stale_ids_accept_json_numbers_and_strings() {
+        let args: RunnerAdoptArgs = plugin_toolkit::serde_json::from_str(
+            r#"{"endpoint":"e","name":"n","registration":"/r","stale_ids":[4,"5","6@org:a"]}"#,
+        )
+        .unwrap();
+        let got: Vec<plan::StaleRecord> = args
+            .stale_ids
+            .iter()
+            .map(|s| s.to_record().unwrap())
+            .collect();
+        assert_eq!(
+            got.iter()
+                .map(|s| (s.id, s.scope.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(4, ""), (5, ""), (6, "org:a")]
+        );
+        assert_eq!(args.offline_timeout_secs, 180);
     }
 
     #[test]
