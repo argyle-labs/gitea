@@ -1058,8 +1058,10 @@ pub struct RunnerDrainArgs {
 }
 
 /// First half of a host move: disable the runner in Gitea so it takes no new
-/// job, wait for the running one, then stop it so it cannot restart. Its `.runner` and Gitea record are kept for
-/// `gitea.runner.adopt` on the replacement system.
+/// job, wait for the running one, then stop it so it cannot restart. Its
+/// `.runner` and Gitea record are kept for `gitea.runner.adopt` on the
+/// replacement system. If the wait or the stop fails, the runner is
+/// re-enabled before the error is returned.
 #[orca_tool(
     domain = "gitea",
     verb = "runner.drain",
@@ -1119,6 +1121,33 @@ pub async fn gitea_runner_drain(args: RunnerDrainArgs, ctx: &ToolCtx) -> Result<
     .await
 }
 
+/// A `--stale-id`: a bare id (JSON number or string) or `ID@SCOPE`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(untagged)]
+pub enum StaleIdArg {
+    Id(i64),
+    Spec(String),
+}
+
+impl std::str::FromStr for StaleIdArg {
+    type Err = std::convert::Infallible;
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        Ok(StaleIdArg::Spec(s.to_string()))
+    }
+}
+
+impl StaleIdArg {
+    fn to_record(&self) -> Result<plan::StaleRecord> {
+        match self {
+            StaleIdArg::Id(id) => Ok(plan::StaleRecord {
+                id: *id,
+                scope: String::new(),
+            }),
+            StaleIdArg::Spec(s) => s.parse(),
+        }
+    }
+}
+
 #[derive(clap::Args, Serialize, Deserialize, JsonSchema)]
 pub struct RunnerAdoptArgs {
     /// Registered Gitea endpoint (to verify and delete records).
@@ -1136,11 +1165,16 @@ pub struct RunnerAdoptArgs {
     /// install registered itself is always deleted.
     #[arg(long = "stale-id")]
     #[serde(default)]
-    pub stale_ids: Vec<String>,
+    pub stale_ids: Vec<StaleIdArg>,
     /// How long to wait for Gitea to show the moved runner online.
     #[arg(long, default_value_t = default_online_timeout())]
     #[serde(default = "default_online_timeout")]
     pub timeout_secs: u64,
+    /// How long to wait for Gitea to show the moved runner offline before
+    /// starting it here. Values below 90 are raised to 90.
+    #[arg(long, default_value_t = default_online_timeout())]
+    #[serde(default = "default_online_timeout")]
+    pub offline_timeout_secs: u64,
     /// Apply. Omitted, returns the plan and changes nothing.
     #[arg(long)]
     #[serde(default)]
@@ -1184,7 +1218,7 @@ pub async fn gitea_runner_adopt(args: RunnerAdoptArgs, ctx: &ToolCtx) -> Result<
     let given = args
         .stale_ids
         .iter()
-        .map(|s| s.parse())
+        .map(StaleIdArg::to_record)
         .collect::<Result<Vec<plan::StaleRecord>>>()?;
     let candidates = plan::stale_ids(&record, &given, migrated.id)?;
     let scope: Scope = record.scope.parse()?;
@@ -1234,6 +1268,7 @@ pub async fn gitea_runner_adopt(args: RunnerAdoptArgs, ctx: &ToolCtx) -> Result<
         &stale,
         &scope,
         args.timeout_secs,
+        args.offline_timeout_secs,
     )?;
     let exec = Executor {
         host: &host,
@@ -1280,6 +1315,26 @@ mod tests {
             added_docker_group: added,
             pending_stale: Vec::new(),
         }
+    }
+
+    #[test]
+    fn stale_ids_accept_json_numbers_and_strings() {
+        let args: RunnerAdoptArgs = plugin_toolkit::serde_json::from_str(
+            r#"{"endpoint":"e","name":"n","registration":"/r","stale_ids":[4,"5","6@org:a"]}"#,
+        )
+        .unwrap();
+        let got: Vec<plan::StaleRecord> = args
+            .stale_ids
+            .iter()
+            .map(|s| s.to_record().unwrap())
+            .collect();
+        assert_eq!(
+            got.iter()
+                .map(|s| (s.id, s.scope.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(4, ""), (5, ""), (6, "org:a")]
+        );
+        assert_eq!(args.offline_timeout_secs, 180);
     }
 
     #[test]

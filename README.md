@@ -175,6 +175,13 @@ identified admin caller (a call with no caller identity is refused).
 | `gitea.runner.adopt` | host move, target side: give a runner installed here the drained source's copied `.runner` (same Gitea id, no re-registration), wait for Gitea to show that id offline, re-enable it, start it, wait for Gitea to show it online, then delete stale records (this install's own id plus `--stale-id ID[@SCOPE]`s, never the moved one; kept in the state record until deleted) |
 | `gitea.runner.uninstall` | stop and remove the service, deregister from Gitea (under the scope recorded at install), delete files |
 
+Runner drain needs Gitea 1.26 or newer (the edit-runner API). A disabled
+runner still heartbeats and shows online. If drain's wait or stop fails, it
+re-enables the runner before returning the error; the error says whether that
+worked. A re-run of adopt after a partial adopt waits for Gitea to show the
+runner offline, which takes about 60s or more after the last contact
+(`--offline-timeout-secs`, default 180, minimum 90).
+
 Service units: launchd agents set `ProcessType=Interactive` (otherwise macOS
 schedules the runner at background priority), `KeepAlive` and `RunAtLoad`.
 On Linux each runner runs as its own unprivileged account,

@@ -285,13 +285,15 @@ pub struct Registration {
     pub labels: Vec<String>,
 }
 
+pub const MAX_REGISTRATION_BYTES: u64 = 1 << 20;
+
 /// Read `path` once without following a final symlink, refusing anything but
-/// a regular file. `.runner` lives in runner-writable directories, so a
+/// a regular file of at most [`MAX_REGISTRATION_BYTES`]. `.runner` lives in runner-writable directories, so a
 /// planted symlink or FIFO must not redirect or stall a root read.
 pub fn read_regular_nofollow(path: &Path) -> Result<Vec<u8>> {
     use std::io::Read;
     use std::os::unix::fs::OpenOptionsExt;
-    let mut f = std::fs::OpenOptions::new()
+    let f = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)
@@ -303,8 +305,15 @@ pub fn read_regular_nofollow(path: &Path) -> Result<Vec<u8>> {
         bail!("{} is not a regular file", path.display());
     }
     let mut bytes = Vec::new();
-    f.read_to_end(&mut bytes)
+    f.take(MAX_REGISTRATION_BYTES + 1)
+        .read_to_end(&mut bytes)
         .with_context(|| format!("read {}", path.display()))?;
+    if bytes.len() as u64 > MAX_REGISTRATION_BYTES {
+        bail!(
+            "{} is larger than {MAX_REGISTRATION_BYTES} bytes",
+            path.display()
+        );
+    }
     Ok(bytes)
 }
 
@@ -531,8 +540,8 @@ pub fn parse_launchctl_print(out: &str) -> (ServiceState, Option<String>) {
 
 pub fn parse_systemctl_active(out: &str) -> ServiceState {
     match out.lines().next().unwrap_or("").trim() {
-        "active" | "reloading" | "activating" => ServiceState::Running,
-        "inactive" | "deactivating" => ServiceState::Stopped,
+        "active" | "reloading" | "activating" | "deactivating" => ServiceState::Running,
+        "inactive" => ServiceState::Stopped,
         "failed" => ServiceState::Crashed,
         _ => ServiceState::Unknown,
     }
@@ -612,6 +621,10 @@ mod tests {
         assert_eq!(parse_systemctl_active("failed"), ServiceState::Crashed);
         assert_eq!(parse_systemctl_active("inactive"), ServiceState::Stopped);
         assert_eq!(
+            parse_systemctl_active("deactivating"),
+            ServiceState::Running
+        );
+        assert_eq!(
             parse_openrc_status(" * status: crashed"),
             ServiceState::Crashed
         );
@@ -664,6 +677,19 @@ mod tests {
         assert_eq!(reg.id, 3);
         assert_eq!(reg.name, "mint");
         assert!(!format!("{reg:?}").contains("SECRET"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn registration_read_is_capped() {
+        let dir = std::env::temp_dir().join(format!("gitea-reg-cap-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join(".runner");
+        std::fs::write(&p, vec![b' '; MAX_REGISTRATION_BYTES as usize]).unwrap();
+        assert!(read_regular_nofollow(&p).is_ok());
+        std::fs::write(&p, vec![b' '; MAX_REGISTRATION_BYTES as usize + 1]).unwrap();
+        let err = read_regular_nofollow(&p).unwrap_err().to_string();
+        assert!(err.contains("larger than"), "{err}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

@@ -932,6 +932,10 @@ pub fn stale_ids(
     Ok(out)
 }
 
+/// Gitea marks a runner offline only after about a minute without contact,
+/// so a shorter offline gate fails even when the source is stopped.
+pub const MIN_OFFLINE_SECS: u64 = 90;
+
 /// Target side of a host move: swap the install's registration for the
 /// migrated one, start it, prove Gitea sees it online, then delete stale
 /// records. Stale deletion waits for the online gate so a failed move leaves
@@ -947,6 +951,7 @@ pub fn adopt_steps(
     stale: &[StaleRecord],
     scope: &Scope,
     timeout_secs: u64,
+    offline_timeout_secs: u64,
 ) -> Result<Vec<Step>> {
     let mut steps = service_steps(layout, ServiceOp::Unload, uid, state);
     steps.push(Step::InstallRegistration {
@@ -974,7 +979,7 @@ pub fn adopt_steps(
     });
     steps.push(Step::WaitOffline {
         runner_id: migrated_id,
-        timeout_secs,
+        timeout_secs: offline_timeout_secs.max(MIN_OFFLINE_SECS),
     });
     steps.push(Step::SetDisabled {
         runner_id: migrated_id,
@@ -2187,8 +2192,13 @@ mod tests {
             &[stale(9, "instance"), stale(4, "org:a")],
             &Scope::Instance,
             120,
+            10,
         )
         .unwrap();
+        assert!(steps.contains(&Step::WaitOffline {
+            runner_id: 7,
+            timeout_secs: MIN_OFFLINE_SECS
+        }));
         let pos = |f: &dyn Fn(&Step) -> bool| steps.iter().position(f).unwrap();
         let install = pos(&|s| matches!(s, Step::InstallRegistration { runner_id: 7, .. }));
         let recorded = pos(&|s| {

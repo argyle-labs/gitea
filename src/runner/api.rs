@@ -152,27 +152,34 @@ pub async fn registration_token(cfg: &Config, scope: &Scope) -> Result<String> {
     Ok(parsed.token)
 }
 
+fn generated_error(what: &str, e: crate::generated::Error<()>) -> anyhow::Error {
+    match e.status() {
+        Some(s) => classify(what, Some(s.as_u16()), ""),
+        None => classify(what, None, &e.to_string()),
+    }
+}
+
 /// Whether `runner_id` exists in `scope`'s runner collection.
 pub async fn runner_in_scope(cfg: &Config, scope: &Scope, runner_id: i64) -> Result<bool> {
     let what = format!("look up runner {runner_id} under {}", scope.label());
-    let url = api_url(cfg, &format!("{}/{runner_id}", scope.runners_path()));
-    let resp = verified_client(cfg)?
-        .get(url)
-        .send()
-        .await
-        .map_err(|e| anyhow!("{what}: {e}"))?;
-    match resp.status().as_u16() {
-        200..=299 => Ok(true),
-        404 => Ok(false),
-        status => {
-            let body = resp.text().await.unwrap_or_default();
-            Err(status_error(&what, status, &body))
-        }
+    let client = verified_generated_client(cfg)?;
+    let id = runner_id.to_string();
+    let result = match scope {
+        Scope::Instance => client.get_admin_runner(&id).await.map(|_| ()),
+        Scope::Org(o) => client.get_org_runner(o, &id).await.map(|_| ()),
+        Scope::Repo(o, r) => client.get_repo_runner(o, r, &id).await.map(|_| ()),
+    };
+    match result {
+        Ok(()) => Ok(true),
+        Err(e) if e.status().map(|s| s.as_u16()) == Some(404) => Ok(false),
+        Err(e) => Err(generated_error(&what, e)),
     }
 }
 
 /// Set a runner's `disabled` flag. Gitea assigns no new job to a disabled
-/// runner; one already running finishes.
+/// runner; one already running finishes. Called only after
+/// [`runner_in_scope`] found the runner, so a 404/405 here means the server
+/// predates the edit-runner endpoint.
 pub async fn set_disabled(
     cfg: &Config,
     scope: &Scope,
@@ -180,19 +187,24 @@ pub async fn set_disabled(
     disabled: bool,
 ) -> Result<()> {
     let what = format!("set runner {runner_id} disabled={disabled}");
-    let url = api_url(cfg, &format!("{}/{runner_id}", scope.runners_path()));
-    let resp = verified_client(cfg)?
-        .patch(url)
-        .json(&plugin_toolkit::serde_json::json!({ "disabled": disabled }))
-        .send()
-        .await
-        .map_err(|e| anyhow!("{what}: {e}"))?;
-    let status = resp.status().as_u16();
-    if (200..300).contains(&status) {
-        return Ok(());
+    let client = verified_generated_client(cfg)?;
+    let id = runner_id.to_string();
+    let body = crate::generated::types::EditActionRunnerOption { disabled };
+    let result = match scope {
+        Scope::Instance => client.update_admin_runner(&id, &body).await.map(|_| ()),
+        Scope::Org(o) => client.update_org_runner(o, &id, &body).await.map(|_| ()),
+        Scope::Repo(o, r) => client
+            .update_repo_runner(o, r, &id, &body)
+            .await
+            .map(|_| ()),
+    };
+    match result {
+        Ok(()) => Ok(()),
+        Err(e) if matches!(e.status().map(|s| s.as_u16()), Some(404 | 405)) => Err(anyhow!(
+            "{what}: Gitea too old for runner drain (needs >=1.26)"
+        )),
+        Err(e) => Err(generated_error(&what, e)),
     }
-    let body = resp.text().await.unwrap_or_default();
-    Err(status_error(&what, status, &body))
 }
 
 /// Delete a runner in Gitea. Already-gone is success: the goal state holds.

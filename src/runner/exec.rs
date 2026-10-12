@@ -8,7 +8,7 @@ use super::api;
 use super::health::ServiceState;
 use super::host::{self, LocalHost};
 use super::layout::managed_root;
-use super::plan::{AccountRecord, RunnerState, Step};
+use super::plan::{AccountRecord, RunnerState, Scope, Step};
 use super::release;
 use crate::Config;
 
@@ -145,6 +145,11 @@ fn deregister_outcome(
     }
 }
 
+const SET_DISABLED_SECS: u64 = if cfg!(test) { 1 } else { 60 };
+const STOP_GRACE: std::time::Duration =
+    std::time::Duration::from_secs(if cfg!(test) { 0 } else { 30 });
+const STOP_POLL: std::time::Duration = std::time::Duration::from_secs(1);
+
 const POLL: std::time::Duration = if cfg!(test) {
     std::time::Duration::from_millis(10)
 } else {
@@ -176,6 +181,21 @@ impl Executor<'_> {
                 bail!("runner {runner_id} not {what} after {timeout_secs}s ({last})");
             }
             tokio::time::sleep(POLL).await;
+        }
+    }
+
+    /// Set the `disabled` flag, retrying transient API errors for up to
+    /// [`SET_DISABLED_SECS`].
+    async fn set_disabled(&self, scope: &Scope, runner_id: i64, disabled: bool) -> Result<()> {
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(SET_DISABLED_SECS);
+        loop {
+            match api::set_disabled(self.gitea()?, scope, runner_id, disabled).await {
+                Err(e) if api::is_transient(&e) && std::time::Instant::now() < deadline => {
+                    tokio::time::sleep(POLL).await;
+                }
+                r => return r,
+            }
         }
     }
 
@@ -375,15 +395,24 @@ impl Executor<'_> {
                 scope,
                 disabled,
             } => {
-                api::set_disabled(self.gitea()?, scope, *runner_id, *disabled).await?;
+                self.set_disabled(scope, *runner_id, *disabled).await?;
                 Ok(None)
             }
-            Step::VerifyStopped { layout } => match self.host.service_state(layout).await.0 {
-                state @ (ServiceState::Running | ServiceState::Unknown) => {
-                    bail!("{} is still {state:?} after stopping it", layout.service)
+            Step::VerifyStopped { layout } => {
+                // systemd reports `deactivating` while the stop is in flight.
+                let deadline = std::time::Instant::now() + STOP_GRACE;
+                loop {
+                    match self.host.service_state(layout).await.0 {
+                        state @ (ServiceState::Running | ServiceState::Unknown) => {
+                            if std::time::Instant::now() >= deadline {
+                                bail!("{} is still {state:?} after stopping it", layout.service)
+                            }
+                            tokio::time::sleep(STOP_POLL).await;
+                        }
+                        state => return Ok(Some(format!("{state:?}"))),
+                    }
                 }
-                state => Ok(Some(format!("{state:?}"))),
-            },
+            }
             Step::InstallRegistration {
                 src,
                 dest,
@@ -431,18 +460,39 @@ impl Executor<'_> {
 
     /// Run `steps` in order, stopping at the first failure. Returns every
     /// outcome so far plus the error, if one stopped the run.
+    /// A failure while this run holds the runner disabled re-enables it, so a
+    /// failed drain never strands a runner that takes no jobs.
     pub async fn run(&self, steps: &[Step]) -> (Vec<StepOutcome>, Option<anyhow::Error>) {
         let mut outcomes = Vec::new();
+        let mut held: Option<(i64, &Scope)> = None;
         for step in steps {
             let change = step.to_change();
             match self.step(step).await {
-                Ok(detail) => outcomes.push(StepOutcome {
-                    target: change.target,
-                    action: change.action,
-                    ok: true,
-                    detail,
-                }),
-                Err(e) => {
+                Ok(detail) => {
+                    if let Step::SetDisabled {
+                        runner_id,
+                        scope,
+                        disabled,
+                    } = step
+                    {
+                        held = disabled.then_some((*runner_id, scope));
+                    }
+                    outcomes.push(StepOutcome {
+                        target: change.target,
+                        action: change.action,
+                        ok: true,
+                        detail,
+                    })
+                }
+                Err(mut e) => {
+                    if let Some((runner_id, scope)) = held {
+                        e = match self.set_disabled(scope, runner_id, false).await {
+                            Ok(()) => e.context(format!("runner {runner_id} re-enabled in Gitea")),
+                            Err(re) => e.context(format!(
+                                "runner {runner_id} is still DISABLED in Gitea; re-enabling failed: {re:#}"
+                            )),
+                        };
+                    }
                     outcomes.push(StepOutcome {
                         target: change.target,
                         action: change.action,
@@ -859,6 +909,67 @@ mod tests {
         );
         let err = err.expect("a stale online status must not pass the gate");
         assert!(err.contains("not offline"), "{err}");
+    }
+
+    fn disable(disabled: bool) -> Step {
+        Step::SetDisabled {
+            runner_id: 7,
+            scope: Scope::Instance,
+            disabled,
+        }
+    }
+
+    fn patched() -> (u16, String) {
+        (200, r#"{"id":7,"name":"r1"}"#.to_string())
+    }
+
+    #[test]
+    fn a_failed_drain_re_enables_the_runner() {
+        let (err, n) = run_against(
+            vec![patched(), runners("active", true), patched()],
+            vec![
+                disable(true),
+                Step::WaitIdle {
+                    runner_id: 7,
+                    timeout_secs: 0,
+                },
+            ],
+        );
+        let err = err.expect("a busy runner must time out");
+        assert!(err.contains("re-enabled in Gitea"), "{err}");
+        assert_eq!(n, 3);
+    }
+
+    #[test]
+    fn a_failed_re_enable_says_the_runner_is_still_disabled() {
+        let (err, _) = run_against(
+            vec![patched(), runners("active", true), (403, String::new())],
+            vec![
+                disable(true),
+                Step::WaitIdle {
+                    runner_id: 7,
+                    timeout_secs: 0,
+                },
+            ],
+        );
+        assert!(err.unwrap().contains("still DISABLED"));
+    }
+
+    #[test]
+    fn set_disabled_retries_transient_errors() {
+        let (err, n) = run_against(
+            vec![(503, String::new()), (502, String::new()), patched()],
+            vec![disable(true)],
+        );
+        assert!(err.is_none(), "{err:?}");
+        assert_eq!(n, 3);
+    }
+
+    #[test]
+    fn set_disabled_on_an_old_gitea_names_the_version() {
+        let (err, n) = run_against(vec![(405, String::new())], vec![disable(true)]);
+        assert!(err.unwrap().contains("needs >=1.26"));
+        assert_eq!(n, 1);
     }
 
     async fn install_registration(src: &Path, dest: &Path, runner_id: i64) -> Option<String> {
