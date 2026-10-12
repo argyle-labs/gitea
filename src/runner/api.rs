@@ -49,6 +49,11 @@ pub async fn list_runners(cfg: &Config) -> Result<Vec<GiteaRunnerView>> {
         .collect())
 }
 
+/// One runner by id, `None` when Gitea has no such runner.
+pub async fn runner_by_id(cfg: &Config, id: i64) -> Result<Option<GiteaRunnerView>> {
+    Ok(list_runners(cfg).await?.into_iter().find(|r| r.id == id))
+}
+
 /// Jobs Gitea is holding for a runner, newest first, with how long each has
 /// waited. The API's `queued` filter is the runner queue; its `waiting` filter
 /// is jobs blocked on `needs`, which no runner can take yet.

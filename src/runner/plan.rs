@@ -193,6 +193,24 @@ pub enum Step {
         path: PathBuf,
         recursive: bool,
     },
+    /// Poll Gitea until the runner holds no job, failing after `timeout_secs`.
+    WaitIdle {
+        runner_id: i64,
+        timeout_secs: u64,
+    },
+    /// Poll Gitea until the runner reports online, failing after `timeout_secs`.
+    VerifyOnline {
+        runner_id: i64,
+        timeout_secs: u64,
+    },
+    /// Copy a migrated `.runner` into place. Read at execute time, so the
+    /// runner's secret token is never in the plan, and refused unless it still
+    /// carries `runner_id`.
+    InstallRegistration {
+        src: PathBuf,
+        dest: PathBuf,
+        runner_id: i64,
+    },
 }
 
 fn run(argv: &[&str], tolerate_failure: bool) -> Step {
@@ -305,6 +323,29 @@ impl Step {
                 path.display().to_string(),
                 if *recursive { "remove-dir" } else { "remove-file" },
             ),
+            Step::WaitIdle {
+                runner_id,
+                timeout_secs,
+            } => PlannedChange::new(format!("gitea runner id {runner_id}"), "wait-idle")
+                .with_detail(format!(
+                    "gate: wait up to {timeout_secs}s for Gitea to show no running job"
+                )),
+            Step::VerifyOnline {
+                runner_id,
+                timeout_secs,
+            } => PlannedChange::new(format!("gitea runner id {runner_id}"), "verify-online")
+                .with_detail(format!(
+                    "gate: wait up to {timeout_secs}s for Gitea to show it online"
+                )),
+            Step::InstallRegistration {
+                src,
+                dest,
+                runner_id,
+            } => PlannedChange::new(dest.display().to_string(), "install-registration")
+                .with_detail(format!(
+                    "copy {} (mode 600); refused unless it holds runner id {runner_id}",
+                    src.display()
+                )),
         }
     }
 }
@@ -750,6 +791,94 @@ pub fn uninstall_steps(
     steps
 }
 
+/// Source side of a host move: wait out the running job, then stop the runner
+/// and keep it from restarting. Files and the Gitea record stay for the target.
+pub fn drain_steps(
+    layout: &Layout,
+    uid: u32,
+    state: ServiceState,
+    runner_id: i64,
+    timeout_secs: u64,
+) -> Vec<Step> {
+    let mut steps = vec![Step::WaitIdle {
+        runner_id,
+        timeout_secs,
+    }];
+    steps.extend(service_steps(layout, ServiceOp::Unload, uid, state));
+    steps
+}
+
+/// Records to delete after an adopt: the caller's list plus the id the target
+/// install registered, never the migrated id.
+pub fn stale_ids(previous: Option<i64>, given: &[i64], migrated: i64) -> Result<Vec<i64>> {
+    if given.contains(&migrated) {
+        bail!("stale id {migrated} is the migrated runner; it is never deleted");
+    }
+    let mut ids: Vec<i64> = previous.into_iter().filter(|&p| p != migrated).collect();
+    for &id in given {
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    Ok(ids)
+}
+
+/// Target side of a host move: swap the install's registration for the
+/// migrated one, start it, prove Gitea sees it online, then delete stale
+/// records. Stale deletion waits for the online gate so a failed move leaves
+/// every record in place.
+#[allow(clippy::too_many_arguments)]
+pub fn adopt_steps(
+    layout: &Layout,
+    uid: u32,
+    state: ServiceState,
+    src: &Path,
+    record: RunnerState,
+    migrated_id: i64,
+    stale: &[i64],
+    scope: &Scope,
+    timeout_secs: u64,
+) -> Vec<Step> {
+    let mut steps = service_steps(layout, ServiceOp::Unload, uid, state);
+    steps.push(Step::InstallRegistration {
+        src: src.to_path_buf(),
+        dest: layout.runner_file.clone(),
+        runner_id: migrated_id,
+    });
+    if let Some(user) = &layout.user {
+        steps.push(Step::Chown {
+            path: layout.runner_file.clone(),
+            user: Some(user.clone()),
+            group: user.clone(),
+            recursive: false,
+        });
+    }
+    steps.push(Step::RecordState {
+        path: layout.state_file(),
+        state: RunnerState {
+            runner_id: Some(migrated_id),
+            ..record
+        },
+        runner_file: None,
+    });
+    steps.extend(service_steps(
+        layout,
+        ServiceOp::Load,
+        uid,
+        ServiceState::NotLoaded,
+    ));
+    steps.push(Step::VerifyOnline {
+        runner_id: migrated_id,
+        timeout_secs,
+    });
+    steps.extend(stale.iter().map(|&id| Step::Deregister {
+        runner_id: id,
+        scope: scope.clone(),
+        scope_known: true,
+    }));
+    steps
+}
+
 /// `recorded` is the managed install's state, rewritten with the new version.
 /// `check_major` guards a hand-placed install against a silent major jump.
 pub fn upgrade_steps(
@@ -894,7 +1023,9 @@ pub fn touched_paths(steps: &[Step]) -> Vec<&Path> {
             | Step::Chown { path, .. }
             | Step::RecordState { path, .. }
             | Step::ReconcileAccount { path, .. } => Some(path.as_path()),
-            Step::InstallBinary { dest, .. } => Some(dest.as_path()),
+            Step::InstallBinary { dest, .. } | Step::InstallRegistration { dest, .. } => {
+                Some(dest.as_path())
+            }
             _ => None,
         })
         .collect()
@@ -1831,5 +1962,69 @@ mod tests {
             ]
         );
         assert!(heal_steps(&l, 0, ServiceState::Running, &[], &Rerender::default()).is_empty());
+    }
+
+    #[test]
+    fn drain_waits_for_the_job_before_stopping() {
+        let l = layout(Init::Systemd);
+        let steps = drain_steps(&l, 0, ServiceState::Running, 7, 60);
+        assert_eq!(
+            steps[0],
+            Step::WaitIdle {
+                runner_id: 7,
+                timeout_secs: 60
+            }
+        );
+        assert!(matches!(&steps[1], Step::Run { argv, .. } if argv[1] == "disable"));
+        assert!(
+            !steps
+                .iter()
+                .any(|s| matches!(s, Step::Deregister { .. } | Step::Remove { .. }))
+        );
+    }
+
+    #[test]
+    fn stale_ids_never_include_the_migrated_runner() {
+        assert_eq!(stale_ids(Some(9), &[4, 9], 7).unwrap(), vec![9, 4]);
+        assert_eq!(stale_ids(Some(7), &[], 7).unwrap(), Vec::<i64>::new());
+        assert!(stale_ids(None, &[7], 7).is_err());
+    }
+
+    #[test]
+    fn adopt_deletes_stale_records_only_after_the_online_gate() {
+        let l = layout(Init::Systemd);
+        let record = RunnerState {
+            scope: "instance".into(),
+            version: "4.1.0".into(),
+            runner_id: Some(9),
+            created_account: true,
+            added_docker_group: false,
+        };
+        let steps = adopt_steps(
+            &l,
+            0,
+            ServiceState::Running,
+            Path::new("/tmp/moved.runner"),
+            record,
+            7,
+            &[9],
+            &Scope::Instance,
+            120,
+        );
+        let pos = |f: &dyn Fn(&Step) -> bool| steps.iter().position(f).unwrap();
+        let install = pos(&|s| matches!(s, Step::InstallRegistration { runner_id: 7, .. }));
+        let recorded = pos(&|s| {
+            matches!(s, Step::RecordState { state, runner_file: None, .. }
+                if state.runner_id == Some(7) && state.created_account)
+        });
+        let online = pos(&|s| matches!(s, Step::VerifyOnline { runner_id: 7, .. }));
+        let dereg = pos(&|s| matches!(s, Step::Deregister { runner_id: 9, .. }));
+        assert!(install < recorded && recorded < online && online < dereg);
+        assert!(!steps.iter().any(|s| matches!(s, Step::Register { .. })));
+        assert!(
+            !steps
+                .iter()
+                .any(|s| matches!(s, Step::Deregister { runner_id: 7, .. }))
+        );
     }
 }

@@ -144,7 +144,36 @@ fn deregister_outcome(
     }
 }
 
+const POLL_SECS: u64 = 10;
+
 impl Executor<'_> {
+    /// Poll Gitea's view of `runner_id` until `done` holds or `timeout_secs`
+    /// passes.
+    async fn poll_runner(
+        &self,
+        runner_id: i64,
+        timeout_secs: u64,
+        what: &str,
+        done: impl Fn(&super::health::GiteaRunnerView) -> bool,
+    ) -> Result<Option<String>> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+        loop {
+            let view = api::runner_by_id(self.gitea()?, runner_id)
+                .await?
+                .ok_or_else(|| anyhow!("Gitea has no runner with id {runner_id}"))?;
+            if done(&view) {
+                return Ok(Some(format!("runner {runner_id} {what} ({})", view.status)));
+            }
+            if std::time::Instant::now() >= deadline {
+                bail!(
+                    "runner {runner_id} not {what} after {timeout_secs}s (status {})",
+                    view.status
+                );
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(POLL_SECS)).await;
+        }
+    }
+
     fn gitea(&self) -> Result<&Config> {
         self.gitea
             .ok_or_else(|| anyhow!("this step needs a Gitea endpoint (pass `endpoint`)"))
@@ -314,6 +343,39 @@ impl Executor<'_> {
             } => {
                 let existed = api::deregister(self.gitea()?, scope, *runner_id).await?;
                 deregister_outcome(existed, *scope_known, scope, *runner_id)
+            }
+            Step::WaitIdle {
+                runner_id,
+                timeout_secs,
+            } => {
+                self.poll_runner(*runner_id, *timeout_secs, "idle", |v| !v.busy)
+                    .await
+            }
+            Step::VerifyOnline {
+                runner_id,
+                timeout_secs,
+            } => {
+                self.poll_runner(*runner_id, *timeout_secs, "online", |v| v.online)
+                    .await
+            }
+            Step::InstallRegistration {
+                src,
+                dest,
+                runner_id,
+            } => {
+                let found = host::read_registration(src)
+                    .ok_or_else(|| anyhow!("no readable registration at {}", src.display()))?;
+                if found.id != *runner_id {
+                    bail!(
+                        "{} now holds runner id {}, planned {runner_id}",
+                        src.display(),
+                        found.id
+                    );
+                }
+                let bytes =
+                    std::fs::read(src).with_context(|| format!("read {}", src.display()))?;
+                write_atomic(dest, &bytes, 0o600)?;
+                Ok(Some(format!("gitea runner id {runner_id}")))
             }
             Step::Remove { path, recursive } => {
                 let result = if *recursive {
