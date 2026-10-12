@@ -285,9 +285,35 @@ pub struct Registration {
     pub labels: Vec<String>,
 }
 
+/// Read `path` once without following a final symlink, refusing anything but
+/// a regular file. `.runner` lives in runner-writable directories, so a
+/// planted symlink or FIFO must not redirect or stall a root read.
+pub fn read_regular_nofollow(path: &Path) -> Result<Vec<u8>> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .with_context(|| format!("open {} (symlinks refused)", path.display()))?;
+    let meta = f
+        .metadata()
+        .with_context(|| format!("stat {}", path.display()))?;
+    if !meta.file_type().is_file() {
+        bail!("{} is not a regular file", path.display());
+    }
+    let mut bytes = Vec::new();
+    f.read_to_end(&mut bytes)
+        .with_context(|| format!("read {}", path.display()))?;
+    Ok(bytes)
+}
+
+pub fn parse_registration(bytes: &[u8]) -> Option<Registration> {
+    plugin_toolkit::serde_json::from_slice(bytes).ok()
+}
+
 pub fn read_registration(path: &Path) -> Option<Registration> {
-    let text = std::fs::read_to_string(path).ok()?;
-    plugin_toolkit::serde_json::from_str(&text).ok()
+    parse_registration(&read_regular_nofollow(path).ok()?)
 }
 
 #[cfg(target_os = "linux")]

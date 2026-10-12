@@ -5,6 +5,7 @@ use std::path::Path;
 use plugin_toolkit::prelude::*;
 
 use super::api;
+use super::health::ServiceState;
 use super::host::{self, LocalHost};
 use super::layout::managed_root;
 use super::plan::{AccountRecord, RunnerState, Step};
@@ -144,11 +145,15 @@ fn deregister_outcome(
     }
 }
 
-const POLL_SECS: u64 = 10;
+const POLL: std::time::Duration = if cfg!(test) {
+    std::time::Duration::from_millis(10)
+} else {
+    std::time::Duration::from_secs(10)
+};
 
 impl Executor<'_> {
     /// Poll Gitea's view of `runner_id` until `done` holds or `timeout_secs`
-    /// passes.
+    /// passes. Transient API errors are retried until the deadline.
     async fn poll_runner(
         &self,
         runner_id: i64,
@@ -158,19 +163,19 @@ impl Executor<'_> {
     ) -> Result<Option<String>> {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
         loop {
-            let view = api::runner_by_id(self.gitea()?, runner_id)
-                .await?
-                .ok_or_else(|| anyhow!("Gitea has no runner with id {runner_id}"))?;
-            if done(&view) {
-                return Ok(Some(format!("runner {runner_id} {what} ({})", view.status)));
-            }
+            let last = match api::runner_by_id(self.gitea()?, runner_id).await {
+                Ok(Some(view)) if done(&view) => {
+                    return Ok(Some(format!("runner {runner_id} {what} ({})", view.status)));
+                }
+                Ok(Some(view)) => format!("status {}", view.status),
+                Ok(None) => bail!("Gitea has no runner with id {runner_id}"),
+                Err(e) if api::is_transient(&e) => format!("last error: {e:#}"),
+                Err(e) => return Err(e),
+            };
             if std::time::Instant::now() >= deadline {
-                bail!(
-                    "runner {runner_id} not {what} after {timeout_secs}s (status {})",
-                    view.status
-                );
+                bail!("runner {runner_id} not {what} after {timeout_secs}s ({last})");
             }
-            tokio::time::sleep(std::time::Duration::from_secs(POLL_SECS)).await;
+            tokio::time::sleep(POLL).await;
         }
     }
 
@@ -358,12 +363,34 @@ impl Executor<'_> {
                 self.poll_runner(*runner_id, *timeout_secs, "online", |v| v.online)
                     .await
             }
+            Step::WaitOffline {
+                runner_id,
+                timeout_secs,
+            } => {
+                self.poll_runner(*runner_id, *timeout_secs, "offline", |v| !v.online)
+                    .await
+            }
+            Step::SetDisabled {
+                runner_id,
+                scope,
+                disabled,
+            } => {
+                api::set_disabled(self.gitea()?, scope, *runner_id, *disabled).await?;
+                Ok(None)
+            }
+            Step::VerifyStopped { layout } => match self.host.service_state(layout).await.0 {
+                state @ (ServiceState::Running | ServiceState::Unknown) => {
+                    bail!("{} is still {state:?} after stopping it", layout.service)
+                }
+                state => Ok(Some(format!("{state:?}"))),
+            },
             Step::InstallRegistration {
                 src,
                 dest,
                 runner_id,
             } => {
-                let found = host::read_registration(src)
+                let bytes = host::read_regular_nofollow(src)?;
+                let found = host::parse_registration(&bytes)
                     .ok_or_else(|| anyhow!("no readable registration at {}", src.display()))?;
                 if found.id != *runner_id {
                     bail!(
@@ -372,8 +399,6 @@ impl Executor<'_> {
                         found.id
                     );
                 }
-                let bytes =
-                    std::fs::read(src).with_context(|| format!("read {}", src.display()))?;
                 write_atomic(dest, &bytes, 0o600)?;
                 Ok(Some(format!("gitea runner id {runner_id}")))
             }
@@ -539,6 +564,7 @@ mod tests {
             runner_id: Some(9),
             created_account: true,
             added_docker_group: true,
+            pending_stale: Vec::new(),
         };
         write_atomic(&path, state.to_json().as_bytes(), 0o600).unwrap();
         let (_, err) = exec
@@ -575,6 +601,7 @@ mod tests {
             runner_id: None,
             created_account: true,
             added_docker_group: true,
+            pending_stale: Vec::new(),
         };
         let (_, err) = exec
             .run(&[
@@ -625,6 +652,7 @@ mod tests {
                     runner_id: None,
                     created_account: true,
                     added_docker_group: true,
+                    pending_stale: Vec::new(),
                 },
                 runner_file: Some(runner_file),
             }])
@@ -714,5 +742,194 @@ mod tests {
         assert!(!out[1].ok);
         assert!(err.is_some());
         std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    fn test_host(home: &Path) -> LocalHost {
+        LocalHost {
+            init: Init::Launchd,
+            home: home.to_path_buf(),
+            uid: 501,
+        }
+    }
+
+    /// Run `steps` against canned Gitea replies, served in order (the last
+    /// repeats). Returns the run's error and how many requests were made.
+    fn run_against(replies: Vec<(u16, String)>, steps: Vec<Step>) -> (Option<String>, usize) {
+        let served = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+        let count = served.clone();
+        let mut err = None;
+        plugin_toolkit::capsink::with_cap_sink(
+            Box::new(move |_c: &str, _json: &str| {
+                let mut n = count.lock().unwrap();
+                let (status, body) = &replies[(*n).min(replies.len() - 1)];
+                *n += 1;
+                Ok(plugin_toolkit::serde_json::json!({
+                    "status": status,
+                    "headers": [],
+                    "body": body.as_bytes().to_vec(),
+                })
+                .to_string())
+            }),
+            || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                rt.block_on(async {
+                    let host = test_host(&std::env::temp_dir());
+                    let cfg = Config::new("https://gitea.test/api/v1", "k");
+                    let exec = Executor {
+                        host: &host,
+                        gitea: Some(&cfg),
+                    };
+                    err = exec.run(&steps).await.1.map(|e| format!("{e:#}"));
+                });
+            },
+        );
+        let n = *served.lock().unwrap();
+        (err, n)
+    }
+
+    fn runners(status: &str, busy: bool) -> (u16, String) {
+        (
+            200,
+            format!(
+                r#"{{"runners":[{{"id":7,"name":"r1","status":"{status}","busy":{busy}}}],"total_count":1}}"#
+            ),
+        )
+    }
+
+    #[test]
+    fn poll_fails_at_the_deadline() {
+        let (err, _) = run_against(
+            vec![runners("active", true)],
+            vec![Step::WaitIdle {
+                runner_id: 7,
+                timeout_secs: 0,
+            }],
+        );
+        let err = err.expect("a busy runner must time out");
+        assert!(err.contains("not idle after 0s"), "{err}");
+    }
+
+    #[test]
+    fn poll_retries_transient_errors_until_the_deadline() {
+        let (err, n) = run_against(
+            vec![
+                (503, String::new()),
+                (502, String::new()),
+                runners("online", false),
+            ],
+            vec![Step::VerifyOnline {
+                runner_id: 7,
+                timeout_secs: 30,
+            }],
+        );
+        assert!(err.is_none(), "{err:?}");
+        assert_eq!(n, 3);
+    }
+
+    #[test]
+    fn poll_stops_on_a_permanent_error() {
+        let (err, n) = run_against(
+            vec![(403, String::new())],
+            vec![Step::VerifyOnline {
+                runner_id: 7,
+                timeout_secs: 30,
+            }],
+        );
+        assert!(err.expect("403 is not retried").contains("admin scope"));
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn a_source_still_online_is_not_taken_as_the_adopted_runner() {
+        let (err, _) = run_against(
+            vec![runners("online", false)],
+            vec![
+                Step::WaitOffline {
+                    runner_id: 7,
+                    timeout_secs: 0,
+                },
+                Step::VerifyOnline {
+                    runner_id: 7,
+                    timeout_secs: 0,
+                },
+            ],
+        );
+        let err = err.expect("a stale online status must not pass the gate");
+        assert!(err.contains("not offline"), "{err}");
+    }
+
+    async fn install_registration(src: &Path, dest: &Path, runner_id: i64) -> Option<String> {
+        let home = src.parent().unwrap().to_path_buf();
+        let host = test_host(&home);
+        let exec = Executor {
+            host: &host,
+            gitea: None,
+        };
+        exec.run(&[Step::InstallRegistration {
+            src: src.to_path_buf(),
+            dest: dest.to_path_buf(),
+            runner_id,
+        }])
+        .await
+        .1
+        .map(|e| format!("{e:#}"))
+    }
+
+    #[tokio::test]
+    async fn install_registration_copies_the_checked_bytes_privately() {
+        use std::os::unix::fs::MetadataExt;
+        let d = scratch("reg-ok");
+        let src = d.join("moved.runner");
+        let dest = d.join("r1/.runner");
+        let body = br#"{"id":7,"name":"r1","token":"SECRET","labels":[]}"#;
+        std::fs::write(&src, body).unwrap();
+        let err = install_registration(&src, &dest, 7).await;
+        let meta = std::fs::metadata(&dest).unwrap();
+        let copied = std::fs::read(&dest).unwrap();
+        std::fs::remove_dir_all(&d).ok();
+        assert!(err.is_none(), "{err:?}");
+        assert_eq!(copied, body);
+        assert_eq!(meta.mode() & 0o777, 0o600);
+        assert_eq!(meta.uid(), unsafe { libc::geteuid() });
+    }
+
+    #[tokio::test]
+    async fn install_registration_refuses_another_runner_id() {
+        let d = scratch("reg-id");
+        let src = d.join("moved.runner");
+        let dest = d.join("r1/.runner");
+        std::fs::write(&src, r#"{"id":8,"name":"r1"}"#).unwrap();
+        let err = install_registration(&src, &dest, 7).await;
+        let written = dest.exists();
+        std::fs::remove_dir_all(&d).ok();
+        assert!(err.unwrap().contains("holds runner id 8, planned 7"));
+        assert!(!written);
+    }
+
+    #[tokio::test]
+    async fn install_registration_refuses_a_symlink_or_non_regular_source() {
+        let d = scratch("reg-link");
+        let real = d.join("real.runner");
+        std::fs::write(&real, r#"{"id":7,"name":"r1"}"#).unwrap();
+        let link = d.join("link.runner");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let dir = d.join("dir.runner");
+        std::fs::create_dir(&dir).unwrap();
+        let fifo = d.join("fifo.runner");
+        let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let dest = d.join("r1/.runner");
+        let via_link = install_registration(&link, &dest, 7).await;
+        let via_dir = install_registration(&dir, &dest, 7).await;
+        let via_fifo = install_registration(&fifo, &dest, 7).await;
+        let written = dest.exists();
+        std::fs::remove_dir_all(&d).ok();
+        assert!(via_link.unwrap().contains("symlinks refused"));
+        assert!(via_dir.unwrap().contains("not a regular file"));
+        assert!(via_fifo.unwrap().contains("not a regular file"));
+        assert!(!written);
     }
 }

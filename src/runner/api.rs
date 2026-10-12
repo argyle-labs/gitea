@@ -20,6 +20,32 @@ pub(crate) fn status_error(what: &str, status: u16, body: &str) -> anyhow::Error
     anyhow!("{what}: HTTP {status}{hint}: {body}")
 }
 
+/// Marks an API failure worth retrying: no response, 429, or 5xx.
+#[derive(Debug)]
+pub(crate) struct Transient(pub String);
+
+impl std::fmt::Display for Transient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Transient {}
+
+pub(crate) fn is_transient(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<Transient>().is_some()
+}
+
+fn classify(what: &str, status: Option<u16>, detail: &str) -> anyhow::Error {
+    match status {
+        Some(s @ (429 | 500..=599)) => {
+            anyhow::Error::new(Transient(status_error(what, s, detail).to_string()))
+        }
+        Some(s) => status_error(what, s, detail),
+        None => anyhow::Error::new(Transient(format!("{what}: {detail}"))),
+    }
+}
+
 /// Every instance-level runner.
 pub async fn list_runners(cfg: &Config) -> Result<Vec<GiteaRunnerView>> {
     let client = verified_generated_client(cfg)?;
@@ -27,8 +53,8 @@ pub async fn list_runners(cfg: &Config) -> Result<Vec<GiteaRunnerView>> {
         .get_admin_runners(None)
         .await
         .map_err(|e| match e.status() {
-            Some(s) => status_error("list runners", s.as_u16(), ""),
-            None => anyhow!("list runners: {e}"),
+            Some(s) => classify("list runners", Some(s.as_u16()), ""),
+            None => classify("list runners", None, &e.to_string()),
         })?;
     Ok(resp
         .into_inner()
@@ -124,6 +150,49 @@ pub async fn registration_token(cfg: &Config, scope: &Scope) -> Result<String> {
     let parsed: TokenBody = plugin_toolkit::serde_json::from_str(&body)
         .map_err(|_| anyhow!("registration-token response had no `token` field"))?;
     Ok(parsed.token)
+}
+
+/// Whether `runner_id` exists in `scope`'s runner collection.
+pub async fn runner_in_scope(cfg: &Config, scope: &Scope, runner_id: i64) -> Result<bool> {
+    let what = format!("look up runner {runner_id} under {}", scope.label());
+    let url = api_url(cfg, &format!("{}/{runner_id}", scope.runners_path()));
+    let resp = verified_client(cfg)?
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| anyhow!("{what}: {e}"))?;
+    match resp.status().as_u16() {
+        200..=299 => Ok(true),
+        404 => Ok(false),
+        status => {
+            let body = resp.text().await.unwrap_or_default();
+            Err(status_error(&what, status, &body))
+        }
+    }
+}
+
+/// Set a runner's `disabled` flag. Gitea assigns no new job to a disabled
+/// runner; one already running finishes.
+pub async fn set_disabled(
+    cfg: &Config,
+    scope: &Scope,
+    runner_id: i64,
+    disabled: bool,
+) -> Result<()> {
+    let what = format!("set runner {runner_id} disabled={disabled}");
+    let url = api_url(cfg, &format!("{}/{runner_id}", scope.runners_path()));
+    let resp = verified_client(cfg)?
+        .patch(url)
+        .json(&plugin_toolkit::serde_json::json!({ "disabled": disabled }))
+        .send()
+        .await
+        .map_err(|e| anyhow!("{what}: {e}"))?;
+    let status = resp.status().as_u16();
+    if (200..300).contains(&status) {
+        return Ok(());
+    }
+    let body = resp.text().await.unwrap_or_default();
+    Err(status_error(&what, status, &body))
 }
 
 /// Delete a runner in Gitea. Already-gone is success: the goal state holds.

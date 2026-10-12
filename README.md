@@ -171,8 +171,8 @@ identified admin caller (a call with no caller identity is refused).
 | `gitea.runner.install` | download a pinned, sha256-verified runner release, render `config.yaml`, register, install the supervised service |
 | `gitea.runner.heal` | applies the health findings' remedies (restart, reload, rewrite unit/config) and reports why |
 | `gitea.runner.upgrade` | swap in a pinned, verified release binary and restart |
-| `gitea.runner.drain` | host move, source side: wait (Gitea API) for the running job to finish, then stop and disable the runner; files and Gitea record are kept |
-| `gitea.runner.adopt` | host move, target side: give a runner installed here the drained source's copied `.runner` (same Gitea id, no re-registration), start it, wait for Gitea to show that id online, then delete stale records (this install's own id plus `--stale-id`s, never the moved one) |
+| `gitea.runner.drain` | host move, source side: disable the runner in Gitea so it takes no new job, wait for the running one to finish, then stop the service and verify it is down; files and Gitea record are kept |
+| `gitea.runner.adopt` | host move, target side: give a runner installed here the drained source's copied `.runner` (same Gitea id, no re-registration), wait for Gitea to show that id offline, re-enable it, start it, wait for Gitea to show it online, then delete stale records (this install's own id plus `--stale-id ID[@SCOPE]`s, never the moved one; kept in the state record until deleted) |
 | `gitea.runner.uninstall` | stop and remove the service, deregister from Gitea (under the scope recorded at install), delete files |
 
 Service units: launchd agents set `ProcessType=Interactive` (otherwise macOS
