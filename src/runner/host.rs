@@ -288,8 +288,9 @@ pub struct Registration {
 pub const MAX_REGISTRATION_BYTES: u64 = 1 << 20;
 
 /// Read `path` once without following a final symlink, refusing anything but
-/// a regular file of at most [`MAX_REGISTRATION_BYTES`]. `.runner` lives in runner-writable directories, so a
-/// planted symlink or FIFO must not redirect or stall a root read.
+/// a regular file of at most [`MAX_REGISTRATION_BYTES`]. `.runner` lives in
+/// runner-writable directories, so a planted symlink or FIFO must not redirect
+/// or stall a root read.
 pub fn read_regular_nofollow(path: &Path) -> Result<Vec<u8>> {
     use std::io::Read;
     use std::os::unix::fs::OpenOptionsExt;

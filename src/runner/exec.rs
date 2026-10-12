@@ -399,7 +399,8 @@ impl Executor<'_> {
                 Ok(None)
             }
             Step::VerifyStopped { layout } => {
-                // systemd reports `deactivating` while the stop is in flight.
+                // systemd reports `deactivating` while the stop is in flight; an
+                // Unknown state gets the same grace before failing.
                 let deadline = std::time::Instant::now() + STOP_GRACE;
                 loop {
                     match self.host.service_state(layout).await.0 {
@@ -485,6 +486,18 @@ impl Executor<'_> {
                     })
                 }
                 Err(mut e) => {
+                    // A disable that ran out of transient retries may still have
+                    // landed in Gitea (lost reply).
+                    if let Step::SetDisabled {
+                        runner_id,
+                        scope,
+                        disabled: true,
+                    } = step
+                        && e.chain()
+                            .any(|c| c.downcast_ref::<crate::runner::api::Transient>().is_some())
+                    {
+                        held = Some((*runner_id, scope));
+                    }
                     if let Some((runner_id, scope)) = held {
                         e = match self.set_disabled(scope, runner_id, false).await {
                             Ok(()) => e.context(format!("runner {runner_id} re-enabled in Gitea")),

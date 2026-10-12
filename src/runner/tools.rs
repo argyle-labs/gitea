@@ -1034,6 +1034,9 @@ fn default_drain_timeout() -> u64 {
 fn default_online_timeout() -> u64 {
     180
 }
+fn default_offline_timeout() -> u64 {
+    180
+}
 
 #[derive(clap::Args, Serialize, Deserialize, JsonSchema)]
 pub struct RunnerDrainArgs {
@@ -1172,8 +1175,8 @@ pub struct RunnerAdoptArgs {
     pub timeout_secs: u64,
     /// How long to wait for Gitea to show the moved runner offline before
     /// starting it here. Values below 90 are raised to 90.
-    #[arg(long, default_value_t = default_online_timeout())]
-    #[serde(default = "default_online_timeout")]
+    #[arg(long, default_value_t = default_offline_timeout())]
+    #[serde(default = "default_offline_timeout")]
     pub offline_timeout_secs: u64,
     /// Apply. Omitted, returns the plan and changes nothing.
     #[arg(long)]
