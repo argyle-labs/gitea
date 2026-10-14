@@ -79,6 +79,10 @@ impl DumpTarget {
             if !p.starts_with('/') {
                 bail!("{what} `{p}` is not an absolute path");
             }
+            // The prefix check below is lexical; `..` would escape it.
+            if p.split('/').any(|c| c == "..") {
+                bail!("{what} `{p}` contains a `..` component");
+            }
         }
         let dir = self.dir.trim_end_matches('/');
         if self.tempdir.trim_end_matches('/') != dir
@@ -166,6 +170,19 @@ mod tests {
         assert!(t.validate().is_err());
         t.tempdir = "relative".into();
         assert!(t.validate().unwrap_err().to_string().contains("absolute"));
+    }
+
+    #[test]
+    fn dotdot_components_are_rejected() {
+        let mut t = target(DumpFormat::TarZst);
+        t.tempdir = "/mnt/backup/gitea/../../tmp".into();
+        assert!(t.validate().unwrap_err().to_string().contains(".."));
+        let mut t = target(DumpFormat::TarZst);
+        t.dir = "/mnt/../backup/gitea".into();
+        assert!(t.validate().is_err());
+        t = target(DumpFormat::TarZst);
+        t.tempdir = "/mnt/backup/gitea/tmp..x".into();
+        t.validate().unwrap();
     }
 
     #[test]
