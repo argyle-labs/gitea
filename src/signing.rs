@@ -658,7 +658,7 @@ fn setup_expired(e: anyhow::Error, setup: Instant, step: &str) -> anyhow::Error 
     ))
 }
 
-fn left(deadline: Instant) -> Duration {
+pub(crate) fn left(deadline: Instant) -> Duration {
     deadline.saturating_duration_since(Instant::now())
 }
 
