@@ -7,12 +7,14 @@
 
 use plugin_toolkit::contract::plan::{ExecutionPlan, PlannedChange};
 use plugin_toolkit::prelude::*;
-use plugin_toolkit::time::{Deadline, Timestamp};
+use plugin_toolkit::time::{Timestamp, timeout};
+use std::time::{Duration, Instant};
 
 use crate::Config;
 use crate::generated::types::ActionArtifact;
 use crate::runner::api::{status_error, verified_client, verified_generated_client};
 use crate::runner::tools::authorize_execute;
+use crate::signing::left;
 
 /// Total budget of one call, under orca's 35s plugin-call timeout.
 const PRUNE_SECS: u64 = 25;
@@ -100,8 +102,36 @@ pub struct ArtifactPruneOutput {
     pub cleanup_error: Option<String>,
 }
 
-/// `owner/name` of every repo. An admin token's search sees every repo.
-async fn all_repos(cfg: &Config, deadline: &Deadline) -> Result<Vec<String>> {
+/// `owner/name` of every repo, paging via `fetch`. The flag is false when the
+/// deadline cut paging off and the list is partial.
+async fn all_repos<F, Fut>(fetch: F, deadline: Instant) -> Result<(Vec<String>, bool)>
+where
+    F: Fn(usize) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<String>>>,
+{
+    let mut out = Vec::new();
+    for page in 1.. {
+        if left(deadline).is_zero() {
+            return Ok((out, false));
+        }
+        let Some(batch) = timeout(left(deadline), fetch(page)).await else {
+            return Ok((out, false));
+        };
+        let batch = batch?;
+        if batch.is_empty() {
+            break;
+        }
+        out.extend(batch);
+    }
+    Ok((out, true))
+}
+
+/// One page of repo names. An admin token's search sees every repo.
+async fn repo_page(
+    client: &plugin_toolkit::reqwest::Client,
+    cfg: &Config,
+    page: usize,
+) -> Result<Vec<String>> {
     #[derive(Deserialize)]
     struct Page {
         data: Vec<Repo>,
@@ -110,37 +140,23 @@ async fn all_repos(cfg: &Config, deadline: &Deadline) -> Result<Vec<String>> {
     struct Repo {
         full_name: String,
     }
-    let client = verified_client(cfg)?;
-    let mut out = Vec::new();
-    for page in 1.. {
-        if deadline.reached() {
-            bail!(
-                "listing repos did not finish within {PRUNE_SECS}s ({} found so far)",
-                out.len()
-            );
-        }
-        let url = format!(
-            "{}/repos/search?limit=50&page={page}",
-            cfg.base_url.trim_end_matches('/')
-        );
-        let resp = client
-            .get(url)
-            .send()
-            .await
-            .map_err(|e| anyhow!("search repos: {e}"))?;
-        let status = resp.status().as_u16();
-        let body = resp.text().await.unwrap_or_default();
-        if !(200..300).contains(&status) {
-            return Err(status_error("search repos", status, &body));
-        }
-        let page: Page = plugin_toolkit::serde_json::from_str(&body)
-            .map_err(|e| anyhow!("search repos: {e}"))?;
-        if page.data.is_empty() {
-            break;
-        }
-        out.extend(page.data.into_iter().map(|r| r.full_name));
+    let url = format!(
+        "{}/repos/search?limit=50&page={page}",
+        cfg.base_url.trim_end_matches('/')
+    );
+    let resp = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| anyhow!("search repos: {e}"))?;
+    let status = resp.status().as_u16();
+    let body = resp.text().await.unwrap_or_default();
+    if !(200..300).contains(&status) {
+        return Err(status_error("search repos", status, &body));
     }
-    Ok(out)
+    let page: Page =
+        plugin_toolkit::serde_json::from_str(&body).map_err(|e| anyhow!("search repos: {e}"))?;
+    Ok(page.data.into_iter().map(|r| r.full_name).collect())
 }
 
 struct Listing {
@@ -153,17 +169,20 @@ const ARTIFACT_PAGE: usize = 50;
 
 /// Every artifact of a repo, paging until `total_count` is reached. `fetch`
 /// returns one page and the total. `Ok(None)` when the deadline cut paging off.
-async fn all_artifacts<F, Fut>(fetch: F, deadline: &Deadline) -> Result<Option<Vec<ActionArtifact>>>
+async fn all_artifacts<F, Fut>(fetch: F, deadline: Instant) -> Result<Option<Vec<ActionArtifact>>>
 where
     F: Fn(usize) -> Fut,
     Fut: std::future::Future<Output = Result<(i64, Vec<ActionArtifact>)>>,
 {
     let mut out = Vec::new();
     for page in 1.. {
-        if deadline.reached() {
+        if left(deadline).is_zero() {
             return Ok(None);
         }
-        let (total, batch) = fetch(page).await?;
+        let Some(res) = timeout(left(deadline), fetch(page)).await else {
+            return Ok(None);
+        };
+        let (total, batch) = res?;
         let empty = batch.is_empty();
         out.extend(batch);
         if empty || out.len() as i64 >= total {
@@ -209,7 +228,7 @@ async fn list_stale(
     cfg: &Config,
     repos: &[String],
     keep_days: u32,
-    deadline: &Deadline,
+    deadline: Instant,
 ) -> Result<Listing> {
     let client = verified_client(cfg)?;
     let now = Timestamp::now().unix_seconds();
@@ -220,7 +239,7 @@ async fn list_stale(
         unreached: Vec::new(),
     };
     for (i, full) in repos.iter().enumerate() {
-        if deadline.reached() {
+        if left(deadline).is_zero() {
             listing.unreached.extend_from_slice(&repos[i..]);
             break;
         }
@@ -258,14 +277,21 @@ pub async fn gitea_actions_artifacts_prune(
     const TOOL: &str = "gitea.actions.artifacts.prune";
     // The plan lists every repo and artifact, so a dry run needs admin too.
     authorize_execute(TOOL, ctx.caller().as_ref())?;
-    let deadline = Deadline::after(std::time::Duration::from_secs(PRUNE_SECS));
+    let deadline = Instant::now() + Duration::from_secs(PRUNE_SECS);
     let cfg = crate::tools::resolve_config(&args.endpoint).await?;
-    let repos = all_repos(&cfg, &deadline).await?;
+    let http = verified_client(&cfg)?;
+    let (repos, complete) = all_repos(|page| repo_page(&http, &cfg, page), deadline).await?;
     let Listing {
         stale,
         unlisted,
         mut unreached,
-    } = list_stale(&cfg, &repos, args.keep_days, &deadline).await?;
+    } = list_stale(&cfg, &repos, args.keep_days, deadline).await?;
+    if !complete {
+        unreached.push(format!(
+            "repos after the first {} (listing ran out of time)",
+            repos.len()
+        ));
+    }
     let bytes = stale.iter().map(|a| a.bytes).sum();
     let changes = stale
         .iter()
@@ -306,28 +332,41 @@ pub async fn gitea_actions_artifacts_prune(
     }
     let client = verified_generated_client(&cfg)?;
     for (i, a) in stale.iter().enumerate() {
-        if deadline.reached() {
+        if left(deadline).is_zero() {
             let mut rest: Vec<String> = stale[i..].iter().map(|a| a.repo.clone()).collect();
             rest.dedup();
             unreached.splice(0..0, rest);
             break;
         }
         let (owner, repo) = a.repo.split_once('/').unwrap_or((&a.repo, ""));
-        match client.delete_artifact(owner, repo, &a.id.to_string()).await {
-            Ok(_) => out.deleted.push(a.clone()),
-            Err(e) => out.failed.push(match e.status() {
+        match timeout(
+            left(deadline),
+            client.delete_artifact(owner, repo, &a.id.to_string()),
+        )
+        .await
+        {
+            None => out.failed.push(format!(
+                "{}#{} (no answer within the time budget)",
+                a.repo, a.id
+            )),
+            Some(Ok(_)) => out.deleted.push(a.clone()),
+            Some(Err(e)) => out.failed.push(match e.status() {
                 Some(s) => format!("{}#{} (HTTP {})", a.repo, a.id, s.as_u16()),
                 None => format!("{}#{} ({e})", a.repo, a.id),
             }),
         }
     }
     out.unreached = unreached;
-    let cleanup = client.admin_cron_run(CLEANUP_TASK).await;
-    out.cleanup_started = Some(cleanup.is_ok());
-    out.cleanup_error = cleanup.err().map(|e| match e.status() {
-        Some(s) => format!("{CLEANUP_TASK}: HTTP {}", s.as_u16()),
-        None => format!("{CLEANUP_TASK}: {e}"),
-    });
+    let cleanup = timeout(left(deadline), client.admin_cron_run(CLEANUP_TASK)).await;
+    out.cleanup_started = Some(matches!(cleanup, Some(Ok(_))));
+    out.cleanup_error = match cleanup {
+        None => Some(format!("{CLEANUP_TASK}: no answer within the time budget")),
+        Some(Ok(_)) => None,
+        Some(Err(e)) => Some(match e.status() {
+            Some(s) => format!("{CLEANUP_TASK}: HTTP {}", s.as_u16()),
+            None => format!("{CLEANUP_TASK}: {e}"),
+        }),
+    };
     Ok(out)
 }
 
@@ -386,7 +425,7 @@ mod tests {
 
     #[tokio::test]
     async fn pages_until_total_count() {
-        let deadline = Deadline::after(std::time::Duration::from_secs(5));
+        let deadline = Instant::now() + Duration::from_secs(5);
         let calls = std::sync::atomic::AtomicUsize::new(0);
         let got = all_artifacts(
             |page| {
@@ -400,7 +439,7 @@ mod tests {
                     Ok((51, batch))
                 }
             },
-            &deadline,
+            deadline,
         )
         .await
         .unwrap()
@@ -411,11 +450,65 @@ mod tests {
 
     #[tokio::test]
     async fn paging_stops_at_the_deadline() {
-        let deadline = Deadline::after(std::time::Duration::ZERO);
-        let got = all_artifacts(|_| async { Ok((1, vec![])) }, &deadline)
+        let deadline = Instant::now();
+        let got = all_artifacts(|_| async { Ok((1, vec![])) }, deadline)
             .await
             .unwrap();
         assert!(got.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_hung_artifact_page_is_cut_off_at_the_deadline() {
+        let deadline = Instant::now() + Duration::from_millis(50);
+        let got = all_artifacts(
+            |_| async {
+                plugin_toolkit::time::sleep(Duration::from_secs(60)).await;
+                Ok((1, vec![]))
+            },
+            deadline,
+        )
+        .await
+        .unwrap();
+        assert!(got.is_none());
+    }
+
+    #[tokio::test]
+    async fn repo_listing_out_of_time_returns_what_it_found() {
+        let deadline = Instant::now() + Duration::from_millis(200);
+        let (repos, complete) = all_repos(
+            |page| async move {
+                if page == 1 {
+                    Ok(vec!["o/a".to_string(), "o/b".to_string()])
+                } else {
+                    plugin_toolkit::time::sleep(Duration::from_secs(60)).await;
+                    Ok(vec![])
+                }
+            },
+            deadline,
+        )
+        .await
+        .unwrap();
+        assert_eq!(repos, ["o/a", "o/b"]);
+        assert!(!complete);
+    }
+
+    #[tokio::test]
+    async fn repo_listing_stops_at_an_empty_page() {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let (repos, complete) = all_repos(
+            |page| async move {
+                Ok(if page == 1 {
+                    vec!["o/a".to_string()]
+                } else {
+                    vec![]
+                })
+            },
+            deadline,
+        )
+        .await
+        .unwrap();
+        assert_eq!(repos, ["o/a"]);
+        assert!(complete);
     }
 
     #[tokio::test]
