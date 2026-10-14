@@ -905,7 +905,7 @@ pub async fn gitea_signing(args: SigningArgs, ctx: &ToolCtx) -> Result<SigningOu
         }
         _ => vec![],
     };
-    if !!args.dry_run {
+    if args.dry_run {
         return Ok(SigningOutput {
             dry_run: true,
             plan: execution_plan,
@@ -1207,7 +1207,7 @@ pub async fn gitea_signing_key(args: SigningKeyArgs, ctx: &ToolCtx) -> Result<Si
             vec![source.to_change(&key_path, &owner, &secret)],
         );
     let notes = vec!["then run `gitea.signing` to configure Gitea to sign with it".to_string()];
-    if !!args.dry_run {
+    if args.dry_run {
         let public_key = if key_path.exists() {
             plugin_toolkit::time::timeout(left(deadline), public_of(&host, &key_path))
                 .await
@@ -1310,7 +1310,7 @@ pub async fn gitea_update_style(args: UpdateStyleArgs, ctx: &ToolCtx) -> Result<
             ),
             vec![change],
         );
-    if !!args.dry_run {
+    if args.dry_run {
         return Ok(UpdateStyleOutput {
             dry_run: true,
             plan,
