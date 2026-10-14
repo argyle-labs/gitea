@@ -114,6 +114,75 @@ fn cores() -> u32 {
         .unwrap_or(1)
 }
 
+/// `MemTotal` of a `/proc/meminfo`, in bytes.
+pub fn parse_meminfo_total(meminfo: &str) -> Option<u64> {
+    let kib = meminfo
+        .lines()
+        .find_map(|l| l.strip_prefix("MemTotal:"))?
+        .trim()
+        .strip_suffix("kB")?
+        .trim()
+        .parse::<u64>()
+        .ok()?;
+    Some(kib * 1024)
+}
+
+/// Physical memory of this system, `None` when it cannot be read. Inside an
+/// LXC, lxcfs makes `/proc/meminfo` report the container's limit.
+#[cfg(target_os = "linux")]
+fn host_memory_bytes() -> Option<u64> {
+    parse_meminfo_total(&std::fs::read_to_string("/proc/meminfo").ok()?)
+}
+
+#[cfg(target_os = "macos")]
+fn host_memory_bytes() -> Option<u64> {
+    let mut bytes: u64 = 0;
+    let mut len = std::mem::size_of::<u64>();
+    // SAFETY: `hw.memsize` is a u64; `bytes`/`len` describe a buffer of that size.
+    let rc = unsafe {
+        libc::sysctlbyname(
+            c"hw.memsize".as_ptr(),
+            (&mut bytes as *mut u64).cast(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    (rc == 0).then_some(bytes)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn host_memory_bytes() -> Option<u64> {
+    None
+}
+
+/// Refuse a capacity whose concurrent jobs would need more memory than the
+/// system has. Unknown memory is a note, not a refusal.
+pub fn check_job_memory(
+    capacity: u32,
+    job_memory_mib: Option<u64>,
+    total_bytes: Option<u64>,
+) -> Result<Option<String>> {
+    let Some(job) = job_memory_mib else {
+        return Ok(None);
+    };
+    // Saturating: an overflowing request exceeds any real total and is refused.
+    let need = u64::from(capacity)
+        .saturating_mul(job)
+        .saturating_mul(1024 * 1024);
+    match total_bytes {
+        None => Ok(Some(format!(
+            "system memory could not be read; capacity {capacity} x {job} MiB per job is unchecked"
+        ))),
+        Some(total) if need > total => bail!(
+            "capacity {capacity} x {job} MiB per job needs {} MiB; this system has {} MiB; lower --capacity",
+            need / (1024 * 1024),
+            total / (1024 * 1024)
+        ),
+        Some(_) => Ok(None),
+    }
+}
+
 /// `scheme://host[:port]`, lowercased, of an http(s) URL without userinfo.
 pub fn origin(url: &str) -> Option<String> {
     let (scheme, rest) = url.trim().split_once("://")?;
@@ -474,6 +543,11 @@ pub struct RunnerInstallArgs {
     #[arg(long)]
     #[serde(default)]
     pub capacity: Option<u32>,
+    /// Peak memory one job needs, in MiB. Given, install refuses a capacity
+    /// whose concurrent jobs would exceed this system's memory.
+    #[arg(long)]
+    #[serde(default)]
+    pub job_memory_mib: Option<u64>,
     /// Runner release version; must be one this plugin pins a checksum for.
     #[arg(long, default_value = DEFAULT_VERSION)]
     #[serde(default = "default_install_version")]
@@ -612,6 +686,7 @@ pub async fn gitea_runner_install(args: RunnerInstallArgs, ctx: &ToolCtx) -> Res
     )?;
 
     let capacity = render::effective_capacity(mode, args.capacity, cores());
+    let memory_note = check_job_memory(capacity.value, args.job_memory_mib, host_memory_bytes())?;
     let path_env = args
         .path_env
         .clone()
@@ -668,7 +743,7 @@ pub async fn gitea_runner_install(args: RunnerInstallArgs, ctx: &ToolCtx) -> Res
         host: &host,
         gitea: Some(&cfg),
     };
-    let mut notes: Vec<String> = capacity.note.into_iter().collect();
+    let mut notes: Vec<String> = capacity.note.into_iter().chain(memory_note).collect();
     notes.push(
         "Gitea reuses one registration token per scope and offers no API to rotate it; \
          reset it in Gitea after installs if it may have been exposed"
@@ -1316,6 +1391,32 @@ mod tests {
             added_docker_group: added,
             pending_stale: Vec::new(),
         }
+    }
+
+    #[test]
+    fn meminfo_total_is_read_in_bytes() {
+        let m = "MemFree:  100 kB\nMemTotal:       12288000 kB\n";
+        assert_eq!(parse_meminfo_total(m), Some(12_288_000 * 1024));
+        assert_eq!(parse_meminfo_total("MemFree: 1 kB\n"), None);
+    }
+
+    #[test]
+    fn job_memory_check_refuses_overcommit_only() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        assert_eq!(check_job_memory(4, None, Some(GIB)).unwrap(), None);
+        assert_eq!(
+            check_job_memory(4, Some(2048), Some(8 * GIB)).unwrap(),
+            None
+        );
+        let err = check_job_memory(5, Some(2048), Some(8 * GIB)).unwrap_err();
+        assert!(err.to_string().contains("needs 10240 MiB"), "{err}");
+        assert!(
+            check_job_memory(4, Some(2048), None)
+                .unwrap()
+                .unwrap()
+                .contains("unchecked")
+        );
+        assert!(check_job_memory(u32::MAX, Some(u64::MAX), Some(8 * GIB)).is_err());
     }
 
     #[test]
