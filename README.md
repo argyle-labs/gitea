@@ -240,6 +240,20 @@ gitea.ci.status --endpoint home
 gitea.pr.list   --endpoint home --owner argyle-labs
 ```
 
+### Actions artifact retention — `gitea.actions.artifacts.prune`
+
+Deletes Actions artifacts older than `--keep-days` (default 1) on every repo,
+then runs Gitea's `cleanup_actions` cron task so their storage is freed now.
+Gitea's `[actions] ARTIFACT_RETENTION_DAYS` is an app.ini setting with no API,
+so retention is enforced through the artifact API instead. Role `admin`, for
+the dry run too (the plan lists every repo's artifacts). `--dry-run` returns
+the plan and changes nothing. Repos not reached within the call's time budget
+are listed in `unreached`; re-run to finish.
+
+```sh
+gitea.actions.artifacts.prune --endpoint home --keep-days 1
+```
+
 ---
 
 ## Layout
@@ -256,6 +270,8 @@ gitea.pr.list   --endpoint home --owner argyle-labs
     health classification, step plans, the local executor, and the verbs.
   - `ci.rs` — `gitea.ci.status` / `gitea.pr.list`: CI jobs, runs, stuck-job
     causes and open PRs with their CI state.
+  - `artifacts.rs` — `gitea.actions.artifacts.prune`: Actions artifact
+    retention through the API.
   - `lib.rs`, `main.rs` — plugin wiring and the `serve_tool_plugin!` entrypoint.
 - `specs/` — the vendored Gitea API spec (`gitea.swagger2.json` and the
   converted `gitea.openapi.json` the REST surface is generated from).
