@@ -12,6 +12,7 @@ pub mod artifacts;
 pub mod backup;
 pub mod ci;
 pub mod deploy;
+pub mod dump;
 pub mod runner;
 pub mod signing;
 pub mod tools;

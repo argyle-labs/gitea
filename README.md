@@ -264,6 +264,8 @@ gitea.actions.artifacts.prune --endpoint home --keep-days 1
   - `deploy.rs` — the `Substrate` abstraction and the `gitea.deploy` verb (not
     implemented).
   - `backup.rs` — the `gitea.backup` / `gitea.restore` verbs (not implemented).
+  - `dump.rs` — the `gitea dump` argv, per-format archive verification and
+    the truncation size check the backup verb will use.
   - `runner/` — `gitea.runner.*`: layout, renderers, release verification,
     health classification, step plans, the local executor, and the verbs.
   - `ci.rs` — `gitea.ci.status` / `gitea.pr.list`: CI jobs, runs, stuck-job
