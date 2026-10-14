@@ -262,14 +262,14 @@ mod tests {
             ("lxc", "gitea.deploy lxc"),
             ("docker", "gitea.deploy docker"),
         ] {
-            for execute in [false, true] {
+            for dry_run in [false, true] {
                 let err = dispatch_err(plugin_toolkit::serde_json::json!({
                     "substrate": substrate,
                     "host": "pve",
                     "name": "gitea",
                     "root_url": "https://gitea.example/",
                     "version": "latest",
-                    "execute": execute,
+                    "dry_run": dry_run,
                 }))
                 .await;
                 assert!(err.contains(want), "{err}");

@@ -96,7 +96,7 @@ mod tests {
     async fn backup_fails_honestly_and_names_no_archive() {
         for args in [
             json!({"endpoint": "home"}),
-            json!({"endpoint": "home", "execute": true}),
+            json!({"endpoint": "home", "dry_run": true}),
         ] {
             let err = dispatch_err("gitea.backup", args).await;
             assert!(err.contains("gitea.backup home: not implemented"), "{err}");
@@ -108,7 +108,7 @@ mod tests {
     async fn restore_fails_honestly() {
         for args in [
             json!({"endpoint": "home", "archive": "/backups/gitea-dump.zip"}),
-            json!({"endpoint": "home", "archive": "/backups/gitea-dump.zip", "execute": true}),
+            json!({"endpoint": "home", "archive": "/backups/gitea-dump.zip", "dry_run": true}),
         ] {
             let err = dispatch_err("gitea.restore", args).await;
             assert!(err.contains("gitea.restore home: not implemented"), "{err}");

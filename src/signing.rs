@@ -823,10 +823,10 @@ pub struct SigningArgs {
     #[arg(long, default_value_t = DEFAULT_VERIFY_SECS)]
     #[serde(default = "default_verify_secs")]
     pub verify_secs: u64,
-    /// Apply. Omitted, returns the plan and changes nothing.
+    /// Return the plan and change nothing. Omitted, applies.
     #[arg(long)]
     #[serde(default)]
-    pub execute: bool,
+    pub dry_run: bool,
     /// Restart Gitea even when app.ini and the served key look current.
     #[arg(long)]
     #[serde(default)]
@@ -905,7 +905,7 @@ pub async fn gitea_signing(args: SigningArgs, ctx: &ToolCtx) -> Result<SigningOu
         }
         _ => vec![],
     };
-    if !args.execute {
+    if !!args.dry_run {
         return Ok(SigningOutput {
             dry_run: true,
             plan: execution_plan,
@@ -1165,10 +1165,10 @@ pub struct SigningKeyArgs {
     #[arg(long)]
     #[serde(default)]
     pub signing_email: Option<String>,
-    /// Apply. Omitted, returns the plan and changes nothing.
+    /// Return the plan and change nothing. Omitted, applies.
     #[arg(long)]
     #[serde(default)]
-    pub execute: bool,
+    pub dry_run: bool,
 }
 
 /// Provision the Gitea signing key on this host and in orca secrets. Never
@@ -1207,7 +1207,7 @@ pub async fn gitea_signing_key(args: SigningKeyArgs, ctx: &ToolCtx) -> Result<Si
             vec![source.to_change(&key_path, &owner, &secret)],
         );
     let notes = vec!["then run `gitea.signing` to configure Gitea to sign with it".to_string()];
-    if !args.execute {
+    if !!args.dry_run {
         let public_key = if key_path.exists() {
             plugin_toolkit::time::timeout(left(deadline), public_of(&host, &key_path))
                 .await
@@ -1255,10 +1255,10 @@ pub struct UpdateStyleArgs {
     /// or `merge`.
     #[arg(long)]
     pub style: String,
-    /// Apply. Omitted, returns the plan and changes nothing.
+    /// Return the plan and change nothing. Omitted, applies.
     #[arg(long)]
     #[serde(default)]
-    pub execute: bool,
+    pub dry_run: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -1310,7 +1310,7 @@ pub async fn gitea_update_style(args: UpdateStyleArgs, ctx: &ToolCtx) -> Result<
             ),
             vec![change],
         );
-    if !args.execute {
+    if !!args.dry_run {
         return Ok(UpdateStyleOutput {
             dry_run: true,
             plan,
@@ -1416,7 +1416,7 @@ pub async fn gitea_signing_status(args: SigningStatusArgs, ctx: &ToolCtx) -> Res
 mod tests {
     use super::*;
 
-    fn args(execute: bool) -> SigningArgs {
+    fn args(dry_run: bool) -> SigningArgs {
         SigningArgs {
             endpoint: "home".into(),
             app_ini: "/tmp/none.ini".into(),
@@ -1425,7 +1425,7 @@ mod tests {
             signing_name: "Gitea".into(),
             signing_email: None,
             verify_secs: DEFAULT_VERIFY_SECS,
-            execute,
+            dry_run,
             force_restart: false,
         }
     }
@@ -1866,10 +1866,10 @@ mod tests {
         let ini = dir.join("app.ini");
         std::fs::write(&ini, INI).unwrap();
         let ctx = plugin_toolkit::tool_manifest::minimal_ctx();
-        for execute in [false, true] {
+        for dry_run in [false, true] {
             let err = plugin_toolkit::dispatch::dispatch(
                 "gitea.signing",
-                json!({"endpoint": "home", "app_ini": ini, "key_path": dir.join("k"), "execute": execute}),
+                json!({"endpoint": "home", "app_ini": ini, "key_path": dir.join("k"), "dry_run": dry_run}),
                 &ctx,
             )
             .await
@@ -1878,7 +1878,7 @@ mod tests {
             assert!(err.contains("no caller identity"), "{err}");
             let err = plugin_toolkit::dispatch::dispatch(
                 "gitea.signing.key",
-                json!({"endpoint": "home", "app_ini": ini, "key_path": dir.join("k"), "execute": execute}),
+                json!({"endpoint": "home", "app_ini": ini, "key_path": dir.join("k"), "dry_run": dry_run}),
                 &ctx,
             )
             .await
@@ -1887,7 +1887,7 @@ mod tests {
             assert!(err.contains("no caller identity"), "{err}");
             let err = plugin_toolkit::dispatch::dispatch(
                 "gitea.update_style",
-                json!({"endpoint": "home", "style": "rebase", "execute": execute}),
+                json!({"endpoint": "home", "style": "rebase", "dry_run": dry_run}),
                 &ctx,
             )
             .await

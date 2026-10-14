@@ -159,10 +159,10 @@ backup target with a sha256 checksum verified before restore (gitea#7, gitea#9).
 
 Installs, registers, supervises, health-checks, heals, upgrades and removes
 Gitea Actions runners on **the orca system the call runs on**; a runner on
-another system is managed by the gitea plugin there. Mutating verbs are
-dry-run by default: they return an `ExecutionPlan` listing every file,
-command, download and API call, and apply only with `--execute` from an
-identified admin caller (a call with no caller identity is refused).
+another system is managed by the gitea plugin there. Mutating verbs apply by
+default; `--dry-run` returns an `ExecutionPlan` listing every file, command,
+download and API call and changes nothing. Both need an identified admin
+caller (a call with no caller identity is refused).
 
 | verb | does |
 |---|---|
@@ -216,10 +216,10 @@ rotate it; reset it in Gitea if it may have been exposed. Instance scope needs
 an admin-scoped Gitea token.
 
 ```sh
-gitea.runner.install --endpoint home --name mint-macos                # plan
-gitea.runner.install --endpoint home --name mint-macos --execute
+gitea.runner.install --endpoint home --name mint-macos --dry-run      # plan
+gitea.runner.install --endpoint home --name mint-macos
 gitea.runner.health  --endpoint home
-gitea.runner.heal    --endpoint home --name mint-macos --execute
+gitea.runner.heal    --endpoint home --name mint-macos
 ```
 
 ### CI and PR state — `gitea.ci.status` / `gitea.pr.list`

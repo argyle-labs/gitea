@@ -3,13 +3,13 @@
 //! Every verb acts on the orca system it runs on; a runner on another system
 //! is managed by the gitea plugin on that system.
 //!
-//! Mutating verbs set `execute_gated = false` and own their `execute` opt-in,
+//! Mutating verbs set `execute_gated = false` and own their `dry_run` opt-in,
 //! because the central gate can only return a generic plan while these verbs
 //! can say exactly which files, commands and API calls they would run.
 //! Opting out of the central gate also opts out of the role check orca runs
-//! inside it, so [`authorize_execute`] replaces it: execute is refused unless
-//! the call carries an admin caller identity. Without `execute: true` a verb
-//! returns its `ExecutionPlan` and touches nothing.
+//! inside it, so [`authorize_execute`] replaces it: the call, dry run
+//! included, is refused unless it carries an admin caller identity. With
+//! `dry_run: true` a verb returns its `ExecutionPlan` and touches nothing.
 
 use plugin_toolkit::contract::CallerIdentity;
 use plugin_toolkit::contract::plan::ExecutionPlan;
@@ -72,21 +72,19 @@ pub fn authorize_execute(tool: &str, caller: Option<&CallerIdentity>) -> Result<
     match caller {
         Some(c) if c.role == "admin" => Ok(()),
         Some(c) => bail!(
-            "{tool}: execute requires role 'admin'; caller '{}' has '{}'",
+            "{tool}: requires role 'admin'; caller '{}' has '{}'",
             c.username,
             c.role
         ),
         None => bail!(
-            "{tool}: execute refused: the call carries no caller identity, so admin cannot be verified"
+            "{tool}: refused: the call carries no caller identity, so admin cannot be verified"
         ),
     }
 }
 
-fn guard(tool: &str, execute: bool, ctx: &ToolCtx) -> Result<()> {
-    if execute {
-        authorize_execute(tool, ctx.caller().as_ref())?;
-    }
-    Ok(())
+/// A dry run needs admin too: the plan reveals paths, accounts and tokens' scopes.
+fn guard(tool: &str, ctx: &ToolCtx) -> Result<()> {
+    authorize_execute(tool, ctx.caller().as_ref())
 }
 
 async fn gitea_config(endpoint: &str) -> Result<Config> {
@@ -498,10 +496,10 @@ pub struct RunnerInstallArgs {
     #[arg(long)]
     #[serde(default)]
     pub force_host_as_root: bool,
-    /// Apply. Omitted, returns the plan and changes nothing.
+    /// Return the plan and change nothing. Omitted, applies.
     #[arg(long)]
     #[serde(default)]
-    pub execute: bool,
+    pub dry_run: bool,
 }
 
 /// Host-executor jobs run as the service's account. Refuse that being root
@@ -557,7 +555,7 @@ fn account_still_applied_here(
 )]
 pub async fn gitea_runner_install(args: RunnerInstallArgs, ctx: &ToolCtx) -> Result<RunnerChange> {
     const TOOL: &str = "gitea.runner.install";
-    guard(TOOL, args.execute, ctx)?;
+    guard(TOOL, ctx)?;
     layout::validate_name(&args.name)?;
     let host = LocalHost::current()?;
     if let Some(existing) = host.find(&args.name) {
@@ -679,7 +677,7 @@ pub async fn gitea_runner_install(args: RunnerInstallArgs, ctx: &ToolCtx) -> Res
     plan_or_apply(
         TOOL,
         &args,
-        args.execute,
+        !args.dry_run,
         ctx.caller().as_ref(),
         &args.name,
         summary,
@@ -711,10 +709,10 @@ pub struct RunnerUninstallArgs {
     #[arg(long)]
     #[serde(default)]
     pub keep_files: bool,
-    /// Apply. Omitted, returns the plan and changes nothing.
+    /// Return the plan and change nothing. Omitted, applies.
     #[arg(long)]
     #[serde(default)]
-    pub execute: bool,
+    pub dry_run: bool,
 }
 
 /// Stop and remove a runner's service, deregister it from Gitea, and delete
@@ -730,7 +728,7 @@ pub async fn gitea_runner_uninstall(
     ctx: &ToolCtx,
 ) -> Result<RunnerChange> {
     const TOOL: &str = "gitea.runner.uninstall";
-    guard(TOOL, args.execute, ctx)?;
+    guard(TOOL, ctx)?;
     let host = LocalHost::current()?;
     let l = host.find(&args.name).ok_or_else(|| {
         anyhow!(
@@ -779,7 +777,7 @@ pub async fn gitea_runner_uninstall(
     plan_or_apply(
         TOOL,
         &args,
-        args.execute,
+        !args.dry_run,
         ctx.caller().as_ref(),
         &args.name,
         format!("uninstall runner '{}'", args.name),
@@ -813,10 +811,10 @@ pub struct RunnerUpgradeArgs {
     #[arg(long)]
     #[serde(default)]
     pub allow_major_upgrade: bool,
-    /// Apply. Omitted, returns the plan and changes nothing.
+    /// Return the plan and change nothing. Omitted, applies.
     #[arg(long)]
     #[serde(default)]
-    pub execute: bool,
+    pub dry_run: bool,
 }
 
 /// Version and major-version guard for an upgrade.
@@ -852,7 +850,7 @@ pub fn upgrade_target(
 )]
 pub async fn gitea_runner_upgrade(args: RunnerUpgradeArgs, ctx: &ToolCtx) -> Result<RunnerChange> {
     const TOOL: &str = "gitea.runner.upgrade";
-    guard(TOOL, args.execute, ctx)?;
+    guard(TOOL, ctx)?;
     let host = LocalHost::current()?;
     let l = host.find(&args.name).ok_or_else(|| {
         anyhow!(
@@ -894,7 +892,7 @@ pub async fn gitea_runner_upgrade(args: RunnerUpgradeArgs, ctx: &ToolCtx) -> Res
     plan_or_apply(
         TOOL,
         &args,
-        args.execute,
+        !args.dry_run,
         ctx.caller().as_ref(),
         &args.name,
         summary,
@@ -925,10 +923,10 @@ pub struct RunnerHealArgs {
     #[arg(long)]
     #[serde(default)]
     pub path_env: Option<String>,
-    /// Apply. Omitted, returns the plan and changes nothing.
+    /// Return the plan and change nothing. Omitted, applies.
     #[arg(long)]
     #[serde(default)]
-    pub execute: bool,
+    pub dry_run: bool,
 }
 
 /// Diagnose a runner and fix what can be fixed: restart a crashed or
@@ -942,7 +940,7 @@ pub struct RunnerHealArgs {
 )]
 pub async fn gitea_runner_heal(args: RunnerHealArgs, ctx: &ToolCtx) -> Result<RunnerChange> {
     const TOOL: &str = "gitea.runner.heal";
-    guard(TOOL, args.execute, ctx)?;
+    guard(TOOL, ctx)?;
     let host = LocalHost::current()?;
     let l = host.find(&args.name).ok_or_else(|| {
         anyhow!(
@@ -1012,7 +1010,7 @@ pub async fn gitea_runner_heal(args: RunnerHealArgs, ctx: &ToolCtx) -> Result<Ru
     plan_or_apply(
         TOOL,
         &args,
-        args.execute,
+        !args.dry_run,
         ctx.caller().as_ref(),
         &args.name,
         summary,
@@ -1054,10 +1052,10 @@ pub struct RunnerDrainArgs {
     #[arg(long, default_value_t = default_drain_timeout())]
     #[serde(default = "default_drain_timeout")]
     pub timeout_secs: u64,
-    /// Apply. Omitted, returns the plan and changes nothing.
+    /// Return the plan and change nothing. Omitted, applies.
     #[arg(long)]
     #[serde(default)]
-    pub execute: bool,
+    pub dry_run: bool,
 }
 
 /// First half of a host move: disable the runner in Gitea so it takes no new
@@ -1073,7 +1071,7 @@ pub struct RunnerDrainArgs {
 )]
 pub async fn gitea_runner_drain(args: RunnerDrainArgs, ctx: &ToolCtx) -> Result<RunnerChange> {
     const TOOL: &str = "gitea.runner.drain";
-    guard(TOOL, args.execute, ctx)?;
+    guard(TOOL, ctx)?;
     let host = LocalHost::current()?;
     let l = host.find(&args.name).ok_or_else(|| {
         anyhow!(
@@ -1108,7 +1106,7 @@ pub async fn gitea_runner_drain(args: RunnerDrainArgs, ctx: &ToolCtx) -> Result<
     plan_or_apply(
         TOOL,
         &args,
-        args.execute,
+        !args.dry_run,
         ctx.caller().as_ref(),
         &args.name,
         format!(
@@ -1178,10 +1176,10 @@ pub struct RunnerAdoptArgs {
     #[arg(long, default_value_t = default_offline_timeout())]
     #[serde(default = "default_offline_timeout")]
     pub offline_timeout_secs: u64,
-    /// Apply. Omitted, returns the plan and changes nothing.
+    /// Return the plan and change nothing. Omitted, applies.
     #[arg(long)]
     #[serde(default)]
-    pub execute: bool,
+    pub dry_run: bool,
 }
 
 /// Second half of a host move: give a runner installed here the drained
@@ -1195,7 +1193,7 @@ pub struct RunnerAdoptArgs {
 )]
 pub async fn gitea_runner_adopt(args: RunnerAdoptArgs, ctx: &ToolCtx) -> Result<RunnerChange> {
     const TOOL: &str = "gitea.runner.adopt";
-    guard(TOOL, args.execute, ctx)?;
+    guard(TOOL, ctx)?;
     let host = LocalHost::current()?;
     let l = host.find(&args.name).ok_or_else(|| {
         anyhow!(
@@ -1280,7 +1278,7 @@ pub async fn gitea_runner_adopt(args: RunnerAdoptArgs, ctx: &ToolCtx) -> Result<
     plan_or_apply(
         TOOL,
         &args,
-        args.execute,
+        !args.dry_run,
         ctx.caller().as_ref(),
         &args.name,
         format!(
@@ -1474,13 +1472,13 @@ mod tests {
         }
     }
 
-    fn upgrade_args(execute: bool) -> RunnerUpgradeArgs {
+    fn upgrade_args(dry_run: bool) -> RunnerUpgradeArgs {
         RunnerUpgradeArgs {
             name: "r1".into(),
             version: Some("4.1.0".into()),
             allow_unmanaged: false,
             allow_major_upgrade: false,
-            execute,
+            dry_run,
         }
     }
 
@@ -1508,24 +1506,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dispatched_execute_without_a_caller_is_refused_before_anything_runs() {
+    async fn dispatched_dry_run_without_a_caller_is_refused_before_anything_runs() {
         let ctx = plugin_toolkit::tool_manifest::minimal_ctx();
         for (tool, args) in [
             (
                 "gitea.runner.upgrade",
-                json!({"name": "r1", "execute": true}),
+                json!({"name": "r1", "dry_run": true}),
             ),
             (
                 "gitea.runner.heal",
-                json!({"endpoint": "e", "name": "r1", "execute": true}),
+                json!({"endpoint": "e", "name": "r1", "dry_run": true}),
             ),
             (
                 "gitea.runner.uninstall",
-                json!({"endpoint": "e", "name": "r1", "execute": true}),
+                json!({"endpoint": "e", "name": "r1", "dry_run": true}),
             ),
             (
                 "gitea.runner.install",
-                json!({"endpoint": "e", "name": "r1", "execute": true}),
+                json!({"endpoint": "e", "name": "r1", "dry_run": true}),
             ),
         ] {
             let err = plugin_toolkit::dispatch::dispatch(tool, args, &ctx)
@@ -1642,7 +1640,7 @@ mod tests {
         };
         let out = plan_or_apply(
             "gitea.runner.upgrade",
-            &upgrade_args(false),
+            &upgrade_args(true),
             false,
             None,
             "r1",
@@ -1690,7 +1688,7 @@ mod tests {
         };
         let err = plan_or_apply(
             "t",
-            &upgrade_args(true),
+            &upgrade_args(false),
             true,
             None,
             "r1",
@@ -1724,7 +1722,7 @@ mod tests {
         };
         let RunnerChange::Plan(plan) = plan_or_apply(
             "t",
-            &upgrade_args(false),
+            &upgrade_args(true),
             false,
             None,
             "r1",
@@ -1741,7 +1739,7 @@ mod tests {
         assert!(plan.summary.contains("need root"), "{}", plan.summary);
         let err = plan_or_apply(
             "t",
-            &upgrade_args(true),
+            &upgrade_args(false),
             true,
             Some(&admin()),
             "r1",
