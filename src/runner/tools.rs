@@ -166,7 +166,10 @@ pub fn check_job_memory(
     let Some(job) = job_memory_mib else {
         return Ok(None);
     };
-    let need = u64::from(capacity) * job * 1024 * 1024;
+    // Saturating: an overflowing request exceeds any real total and is refused.
+    let need = u64::from(capacity)
+        .saturating_mul(job)
+        .saturating_mul(1024 * 1024);
     match total_bytes {
         None => Ok(Some(format!(
             "system memory could not be read; capacity {capacity} x {job} MiB per job is unchecked"
@@ -1413,6 +1416,7 @@ mod tests {
                 .unwrap()
                 .contains("unchecked")
         );
+        assert!(check_job_memory(u32::MAX, Some(u64::MAX), Some(8 * GIB)).is_err());
     }
 
     #[test]
