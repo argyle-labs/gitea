@@ -104,6 +104,90 @@ pub fn generate_token_args(username: &str, token_name: &str, scopes: &[String]) 
     ]
 }
 
+pub fn change_password_args(username: &str, password: &str) -> Vec<String> {
+    vec![
+        "admin".into(),
+        "user".into(),
+        "change-password".into(),
+        "--username".into(),
+        username.into(),
+        "--password".into(),
+        password.into(),
+        "--must-change-password=false".into(),
+    ]
+}
+
+pub fn token_name_taken(err: &anyhow::Error) -> bool {
+    format!("{err:#}").contains("has been used already")
+}
+
+pub fn delete_token_url(base_url: &str, username: &str, token_name: &str) -> String {
+    format!(
+        "{}/users/{}/tokens/{}",
+        base_url.trim_end_matches('/'),
+        plugin_toolkit::url::encode(username),
+        plugin_toolkit::url::encode(token_name)
+    )
+}
+
+pub fn basic_auth(username: &str, password: &str) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let bytes = format!("{username}:{password}").into_bytes();
+    let mut out = String::from("Basic ");
+    for chunk in bytes.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(ALPHABET[(n >> (18 - 6 * i) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
+fn random_password() -> Result<String> {
+    use std::io::Read;
+    let mut buf = [0u8; 24];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut buf))
+        .context("read /dev/urandom")?;
+    Ok(buf.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+async fn delete_token(
+    cli: &GiteaCli,
+    host: &LocalHost,
+    cfg: &Config,
+    username: &str,
+    token_name: &str,
+) -> Result<()> {
+    let password = random_password()?;
+    cli.run(host, &change_password_args(username, &password))
+        .await
+        .map_err(|e| anyhow!("{}", format!("{e:#}").replace(&password, "<redacted>")))?;
+    let client = plugin_toolkit::api_client::ApiClientBuilder::new()
+        .header("authorization", basic_auth(username, &password))
+        .and_then(|b| b.build())?;
+    let resp = client
+        .delete(delete_token_url(&cfg.base_url, username, token_name))
+        .send()
+        .await
+        .map_err(|e| anyhow!("delete token: {e}"))?;
+    let status = resp.status().as_u16();
+    if !(200..300).contains(&status) && status != 404 {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(status_error("delete token", status, &body));
+    }
+    Ok(())
+}
+
 pub fn listed_usernames(out: &str) -> Vec<String> {
     out.lines()
         .skip_while(|l| !l.trim_start().starts_with("ID"))
@@ -207,10 +291,7 @@ async fn find_team(cfg: &Config, org: &str, team: &str) -> Result<Option<i64>> {
     struct Search {
         data: Vec<Team>,
     }
-    let url = format!(
-        "{}/orgs/{org}/teams/search?q={team}&limit=50",
-        cfg.base_url.trim_end_matches('/')
-    );
+    let url = team_search_url(&cfg.base_url, org, team);
     let resp = verified_client(cfg)?
         .get(url)
         .send()
@@ -227,6 +308,15 @@ async fn find_team(cfg: &Config, org: &str, team: &str) -> Result<Option<i64>> {
         .into_iter()
         .find(|t| t.name.eq_ignore_ascii_case(team))
         .map(|t| t.id))
+}
+
+pub fn team_search_url(base_url: &str, org: &str, team: &str) -> String {
+    format!(
+        "{}/orgs/{}/teams/search?q={}&limit=50",
+        base_url.trim_end_matches('/'),
+        plugin_toolkit::url::encode(org),
+        plugin_toolkit::url::encode(team)
+    )
 }
 
 pub fn team_body(
@@ -364,6 +454,8 @@ pub async fn gitea_bot_create(args: BotCreateArgs, ctx: &ToolCtx) -> Result<BotC
 #[derive(clap::Args, Serialize, Deserialize, JsonSchema)]
 pub struct TokenCreateArgs {
     #[arg(long)]
+    pub endpoint: String,
+    #[arg(long)]
     pub username: String,
     #[arg(long)]
     pub token_name: String,
@@ -371,6 +463,9 @@ pub struct TokenCreateArgs {
     pub scopes: Vec<String>,
     #[arg(long)]
     pub secret_name: String,
+    #[arg(long)]
+    #[serde(default)]
+    pub rotate: bool,
     #[arg(long, default_value = DEFAULT_APP_INI)]
     #[serde(default = "default_app_ini")]
     pub app_ini: String,
@@ -408,16 +503,16 @@ pub async fn gitea_token_create(args: TokenCreateArgs, ctx: &ToolCtx) -> Result<
     let existing = tokio::task::spawn_blocking(move || plugin_toolkit::secrets::get(&secret_name))
         .await??
         .is_some();
-    let change = if existing {
+    let change = if existing && !args.rotate {
         PlannedChange::new(format!("secret {}", args.secret_name), "keep")
             .with_detail("orca secret already holds a token; nothing is created")
     } else {
         PlannedChange::new(
             format!("token {}/{}", args.username, args.token_name),
-            "create",
+            if args.rotate { "rotate" } else { "create" },
         )
         .with_detail(format!(
-            "scopes {}; value stored only in orca secret '{}'",
+            "scopes {}; a same-named token is deleted (password reset to a discarded random value, then basic-auth DELETE) and recreated; value stored only in orca secret '{}'",
             args.scopes.join(","),
             args.secret_name
         ))
@@ -427,7 +522,7 @@ pub async fn gitea_token_create(args: TokenCreateArgs, ctx: &ToolCtx) -> Result<
             format!("access token for Gitea user {}", args.username),
             vec![change],
         );
-    if args.dry_run || existing {
+    if args.dry_run || (existing && !args.rotate) {
         return Ok(TokenCreateOutput {
             dry_run: args.dry_run,
             plan,
@@ -435,12 +530,15 @@ pub async fn gitea_token_create(args: TokenCreateArgs, ctx: &ToolCtx) -> Result<
             created: false,
         });
     }
-    let out = cli
-        .run(
-            &host,
-            &generate_token_args(&args.username, &args.token_name, &args.scopes),
-        )
-        .await?;
+    let generate = generate_token_args(&args.username, &args.token_name, &args.scopes);
+    let out = match cli.run(&host, &generate).await {
+        Err(e) if token_name_taken(&e) => {
+            let cfg = crate::tools::resolve_config(&args.endpoint).await?;
+            delete_token(&cli, &host, &cfg, &args.username, &args.token_name).await?;
+            cli.run(&host, &generate).await?
+        }
+        other => other?,
+    };
     let token = parse_raw_token(&out)?;
     let (name, desc) = (
         args.secret_name.clone(),
@@ -533,6 +631,47 @@ mod tests {
     }
 
     #[test]
+    fn rotate_helpers() {
+        assert_eq!(
+            change_password_args("b", "pw").join(" "),
+            "admin user change-password --username b --password pw --must-change-password=false"
+        );
+        assert!(token_name_taken(&anyhow!(
+            "`gitea admin user` failed (exit Some(1)): access token name has been used already"
+        )));
+        assert!(!token_name_taken(&anyhow!("invalid access token scope")));
+        assert_eq!(
+            delete_token_url("https://g.test/api/v1/", "pkg-bot", "ci token"),
+            "https://g.test/api/v1/users/pkg-bot/tokens/ci%20token"
+        );
+        assert_eq!(
+            basic_auth("Aladdin", "open sesame"),
+            "Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ=="
+        );
+        assert_eq!(basic_auth("a", "b"), "Basic YTpi");
+        let pw = random_password().unwrap();
+        assert_eq!(pw.len(), 48);
+        assert_ne!(pw, random_password().unwrap());
+    }
+
+    #[test]
+    fn team_search_query_is_encoded() {
+        assert_eq!(
+            team_search_url("https://g.test/api/v1", "argyle", "pkg readers&x=1"),
+            "https://g.test/api/v1/orgs/argyle/teams/search?q=pkg%20readers%26x%3D1&limit=50"
+        );
+    }
+
+    #[test]
+    fn team_package_access_needs_no_repos() {
+        let body = team_body(
+            "readers",
+            &parse_units(&["repo.packages=read".into()]).unwrap(),
+        );
+        assert_eq!(body["includes_all_repositories"], false);
+    }
+
+    #[test]
     fn rejects_bad_scopes() {
         assert!(validate_scopes(&[]).is_err());
         assert!(validate_scopes(&["read:package,write:user".into()]).is_err());
@@ -549,7 +688,7 @@ mod tests {
             ),
             (
                 "gitea.token.create",
-                json!({"username": "b", "token_name": "t", "scopes": ["read:package"], "secret_name": "s", "dry_run": true}),
+                json!({"endpoint": "e", "username": "b", "token_name": "t", "scopes": ["read:package"], "secret_name": "s", "dry_run": true}),
             ),
         ] {
             let err = plugin_toolkit::dispatch::dispatch(tool, args, &ctx)
