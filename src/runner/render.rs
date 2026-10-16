@@ -118,14 +118,28 @@ const CONTAINER_RESOURCE_FLAGS: &[&str] = &[
     "--shm-size",
 ];
 
-fn resource_value_ok(v: &str) -> bool {
-    let digits = v.strip_prefix('-').unwrap_or(v);
-    !digits.is_empty()
-        && digits.len() <= 32
-        && digits.starts_with(|c: char| c.is_ascii_digit())
-        && digits
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '.')
+fn all_digits(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 20 && s.chars().all(|c| c.is_ascii_digit())
+}
+
+fn resource_value_ok(flag: &str, v: &str) -> bool {
+    match flag {
+        "--cpus" => {
+            let (whole, frac) = v.split_once('.').unwrap_or((v, "0"));
+            all_digits(whole)
+                && all_digits(frac)
+                && v.chars().any(|c| c.is_ascii_digit() && c != '0')
+        }
+        "--pids-limit" => all_digits(v) && v.parse::<u64>().is_ok_and(|n| n >= 1),
+        "--memory-swap" if v == "-1" => true,
+        "--memory" | "--memory-swap" | "--shm-size" => {
+            let n = v
+                .strip_suffix(|c: char| matches!(c, 'b' | 'k' | 'm' | 'g' | 'B' | 'K' | 'M' | 'G'))
+                .unwrap_or(v);
+            all_digits(n)
+        }
+        _ => false,
+    }
 }
 
 pub fn validate_container_options(options: &str) -> anyhow::Result<String> {
@@ -148,7 +162,7 @@ pub fn validate_container_options(options: &str) -> anyhow::Result<String> {
                 CONTAINER_RESOURCE_FLAGS.join(", ")
             );
         }
-        if !resource_value_ok(&value) {
+        if !resource_value_ok(flag, &value) {
             anyhow::bail!("container option {flag} has an invalid value '{value}'");
         }
         out.push(format!("{flag}={value}"));
@@ -561,6 +575,11 @@ mod tests {
             "--cpus=8 --memory=8g --memory-swap=-1 --pids-limit=512 --shm-size=2g"
         );
         assert_eq!(validate_container_options("").unwrap(), "");
+        assert_eq!(
+            validate_container_options("--cpus=0.5 --cpus 1.25 --memory=512M --memory-swap=1073741824 --pids-limit=1 --shm-size=64k")
+                .unwrap(),
+            "--cpus=0.5 --cpus=1.25 --memory=512M --memory-swap=1073741824 --pids-limit=1 --shm-size=64k"
+        );
         for bad in [
             "--privileged",
             "--cap-add=SYS_ADMIN",
@@ -575,6 +594,25 @@ mod tests {
             "--memory=8g;rm",
             "--memory=$(id)",
             "--cpus=8 --mount type=bind,src=/,dst=/h",
+            "--cpus=0",
+            "--cpus=0.0",
+            "--cpus=-1",
+            "--cpus=1.",
+            "--cpus=.5",
+            "--cpus=1e3",
+            "--pids-limit=0",
+            "--pids-limit=-1",
+            "--pids-limit=1.5",
+            "--pids-limit=10k",
+            "--memory=-1",
+            "--memory=8gb",
+            "--memory=8t",
+            "--memory=1.5g",
+            "--memory=g",
+            "--memory-swap=-2",
+            "--memory-swap=-1g",
+            "--shm-size=-1",
+            "--shm-size=0x10",
         ] {
             assert!(validate_container_options(bad).is_err(), "accepted {bad:?}");
         }

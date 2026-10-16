@@ -1033,9 +1033,21 @@ pub struct TakeoverSpec<'a> {
     pub state: RunnerState,
     pub account: AccountPlan,
     pub timeout_secs: u64,
+    pub resume: bool,
 }
 
-pub fn takeover_steps(spec: &TakeoverSpec<'_>) -> Result<Vec<Step>> {
+#[derive(Debug, Clone)]
+pub struct Rollback {
+    pub armed: std::ops::RangeInclusive<usize>,
+    pub steps: Vec<Step>,
+}
+
+pub struct Takeover {
+    pub steps: Vec<Step>,
+    pub rollback: Rollback,
+}
+
+pub fn takeover_steps(spec: &TakeoverSpec<'_>) -> Result<Takeover> {
     let l = spec.layout;
     let legacy = spec.legacy;
     let runner_id = spec
@@ -1075,6 +1087,18 @@ pub fn takeover_steps(spec: &TakeoverSpec<'_>) -> Result<Vec<Step>> {
             what: "act_runner config.yaml".to_string(),
         },
     ]);
+    if spec.resume {
+        steps.extend(service_steps(
+            l,
+            ServiceOp::Unload,
+            spec.uid,
+            ServiceState::Unknown,
+        ));
+        steps.push(Step::VerifyStopped {
+            layout: Box::new(l.clone()),
+        });
+    }
+    let armed_from = steps.len();
     steps.extend(service_steps(
         legacy,
         ServiceOp::Unload,
@@ -1119,6 +1143,7 @@ pub fn takeover_steps(spec: &TakeoverSpec<'_>) -> Result<Vec<Step>> {
         runner_id,
         timeout_secs: spec.timeout_secs,
     });
+    let armed = armed_from..=steps.len() - 1;
     steps.push(Step::Remove {
         path: legacy.unit_path.clone(),
         recursive: false,
@@ -1130,7 +1155,49 @@ pub fn takeover_steps(spec: &TakeoverSpec<'_>) -> Result<Vec<Step>> {
         path: legacy.runner_file.clone(),
         recursive: false,
     });
-    Ok(steps)
+    Ok(Takeover {
+        steps,
+        rollback: Rollback {
+            armed,
+            steps: takeover_rollback(spec),
+        },
+    })
+}
+
+fn takeover_rollback(spec: &TakeoverSpec<'_>) -> Vec<Step> {
+    let l = spec.layout;
+    let mut steps = service_steps(l, ServiceOp::Unload, spec.uid, ServiceState::Unknown);
+    steps.push(Step::VerifyStopped {
+        layout: Box::new(l.clone()),
+    });
+    steps.extend([
+        Step::Remove {
+            path: l.unit_path.clone(),
+            recursive: false,
+        },
+        Step::Remove {
+            path: l.runner_file.clone(),
+            recursive: false,
+        },
+        Step::Remove {
+            path: l.dir.clone(),
+            recursive: true,
+        },
+        Step::Remove {
+            path: l.state_file(),
+            recursive: false,
+        },
+    ]);
+    if l.init == Init::Systemd {
+        steps.push(run(&["systemctl", "daemon-reload"], true));
+    }
+    steps.extend(service_steps(
+        spec.legacy,
+        ServiceOp::Load,
+        spec.uid,
+        ServiceState::NotLoaded,
+    ));
+    steps
 }
 
 /// `recorded` is the managed install's state, rewritten with the new version.
@@ -2392,8 +2459,9 @@ mod tests {
             state,
             account: AccountPlan::default(),
             timeout_secs: 60,
+            resume: false,
         };
-        let steps = takeover_steps(&mk(state.clone())).unwrap();
+        let Takeover { steps, rollback } = takeover_steps(&mk(state.clone())).unwrap();
         let pos = |f: &dyn Fn(&Step) -> bool| steps.iter().position(f).unwrap();
         let recorded = pos(&|s| {
             matches!(s, Step::RecordState { state, .. }
@@ -2417,6 +2485,45 @@ mod tests {
         assert_eq!(recorded, 0);
         assert!(stop < stopped && stopped < reg && reg < start && start < online);
         assert!(online < retire && retire < old_reg);
+        assert_eq!(rollback.armed, stop..=online);
+        let rb = &rollback.steps;
+        let rpos = |f: &dyn Fn(&Step) -> bool| rb.iter().position(f).unwrap();
+        let new_stop = rpos(
+            &|s| matches!(s, Step::Run { argv, .. } if argv[1] == "gitea-runner-r1" && argv[2] == "stop"),
+        );
+        let new_stopped =
+            rpos(&|s| matches!(s, Step::VerifyStopped { layout } if layout.name == "r1"));
+        let copied = rpos(&|s| matches!(s, Step::Remove { path, .. } if path == &l.runner_file));
+        let record = rpos(&|s| matches!(s, Step::Remove { path, .. } if path == &l.state_file()));
+        let old_start = rpos(
+            &|s| matches!(s, Step::Run { argv, .. } if argv[1] == "act_runner" && argv[2] == "start"),
+        );
+        assert!(new_stop < new_stopped && new_stopped < copied && copied < record);
+        assert_eq!(old_start, rb.len() - 1);
+        assert!(
+            !rb.iter()
+                .any(|s| matches!(s, Step::Remove { path, .. } if path == &legacy.runner_file))
+        );
+        assert!(
+            !steps
+                .iter()
+                .any(|s| matches!(s, Step::VerifyStopped { layout } if layout.name == "r1"))
+        );
+        let resumed = takeover_steps(&TakeoverSpec {
+            resume: true,
+            ..mk(state.clone())
+        })
+        .unwrap();
+        let rs = &resumed.steps;
+        let new_down = rs
+            .iter()
+            .position(|s| matches!(s, Step::VerifyStopped { layout } if layout.name == "r1"))
+            .unwrap();
+        let old_down = rs
+            .iter()
+            .position(|s| matches!(s, Step::Run { argv, .. } if argv[1] == "act_runner" && argv[2] == "stop"))
+            .unwrap();
+        assert!(new_down < old_down && *resumed.rollback.armed.start() == old_down);
         assert!(
             !steps
                 .iter()
