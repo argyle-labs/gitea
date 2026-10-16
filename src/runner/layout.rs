@@ -224,7 +224,23 @@ impl Layout {
                     user: None,
                 }]
             }
-            Init::Systemd => Vec::new(),
+            Init::Systemd => {
+                let dir = PathBuf::from("/etc/act_runner");
+                vec![Layout {
+                    name: String::new(),
+                    init,
+                    binary: PathBuf::from("/usr/local/bin/act_runner"),
+                    config: dir.join("config.yaml"),
+                    runner_file: dir.join(".runner"),
+                    log: PathBuf::from("/var/log/act_runner.log"),
+                    data: dir.clone(),
+                    dir,
+                    service: "act_runner.service".to_string(),
+                    unit_path: PathBuf::from("/etc/systemd/system/act_runner.service"),
+                    managed: false,
+                    user: None,
+                }]
+            }
         }
     }
 
@@ -326,6 +342,10 @@ mod tests {
         assert!(!mac.managed);
         let rc = &Layout::legacy_candidates(Init::Openrc, home)[0];
         assert_eq!(rc.unit_path, PathBuf::from("/etc/init.d/act_runner"));
-        assert!(Layout::legacy_candidates(Init::Systemd, home).is_empty());
+        let sd = &Layout::legacy_candidates(Init::Systemd, home)[0];
+        assert_eq!(sd.binary, PathBuf::from("/usr/local/bin/act_runner"));
+        assert_eq!(sd.runner_file, PathBuf::from("/etc/act_runner/.runner"));
+        assert_eq!(sd.service, "act_runner.service");
+        assert!(!sd.managed);
     }
 }

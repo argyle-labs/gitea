@@ -31,10 +31,6 @@ use super::release::{self, DEFAULT_VERSION, Source};
 use super::render;
 use crate::Config;
 
-/// Operator allowlist of `scheme://host[:port]` origins a runner may register
-/// against over plain http (comma-separated, set on the orca daemon).
-pub const PLAINTEXT_ORIGINS_ENV: &str = "ORCA_GITEA_RUNNER_PLAINTEXT_ORIGINS";
-
 /// A dry-run plan, or the record of what was applied.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(untagged)]
@@ -197,14 +193,29 @@ pub fn origin(url: &str) -> Option<String> {
     Some(format!("{scheme}://{}", authority.to_ascii_lowercase()))
 }
 
+pub fn is_private_host(authority: &str) -> bool {
+    let host = match authority.strip_prefix('[') {
+        Some(rest) => rest.split(']').next().unwrap_or(""),
+        None => authority.rsplit_once(':').map_or(authority, |(h, _)| h),
+    };
+    match host.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(ip)) => {
+            let [a, b, ..] = ip.octets();
+            ip.is_loopback() || ip.is_private() || (a == 100 && (64..128).contains(&b))
+        }
+        Ok(std::net::IpAddr::V6(ip)) => ip.is_loopback(),
+        Err(_) => false,
+    }
+}
+
 /// Check the URL a runner will dial. It must be one of the endpoint's own
 /// origins (so a caller cannot point the runner, and the registration token,
-/// at an arbitrary server), and https unless the operator allowlisted that
-/// plain-http origin.
+/// at an arbitrary server), and https unless plain http was allowed for this
+/// install and the origin is a private or loopback address.
 pub fn check_instance_url(
     url: &str,
     endpoint_origins: &[String],
-    plaintext_ok: &[String],
+    allow_plaintext_origin: bool,
 ) -> Result<String> {
     let o = origin(url).ok_or_else(|| anyhow!("instance_url '{url}' is not an http(s) URL"))?;
     if !endpoint_origins.contains(&o) {
@@ -213,20 +224,18 @@ pub fn check_instance_url(
             endpoint_origins.join(", ")
         );
     }
-    if o.starts_with("http://") && !plaintext_ok.contains(&o) {
-        bail!(
-            "instance_url {o} is plain http; allow it explicitly in {PLAINTEXT_ORIGINS_ENV} on the orca daemon"
-        );
+    if let Some(authority) = o.strip_prefix("http://") {
+        if !allow_plaintext_origin {
+            bail!("instance_url {o} is plain http; pass allow_plaintext_origin to permit it");
+        }
+        if !is_private_host(authority) {
+            bail!(
+                "instance_url {o} is plain http on a non-private address; allow_plaintext_origin \
+                 covers only RFC1918, 100.64.0.0/10 and loopback IPs"
+            );
+        }
     }
     Ok(url.trim().trim_end_matches('/').to_string())
-}
-
-fn plaintext_allowlist() -> Vec<String> {
-    std::env::var(PLAINTEXT_ORIGINS_ENV)
-        .unwrap_or_default()
-        .split(',')
-        .filter_map(origin)
-        .collect()
 }
 
 /// Return the plan, or run it and report. A failed step is an error that
@@ -309,8 +318,42 @@ pub struct RunnerListArgs {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
+pub struct RunnerCapacity {
+    pub managed: Option<bool>,
+    pub capacity: Option<u32>,
+    pub labels: Vec<String>,
+    pub container_options: Option<String>,
+    pub gitea_id: Option<i64>,
+    pub gitea_name: Option<String>,
+}
+
+pub fn capacity_of(
+    local: Option<&LocalInstall>,
+    gitea: Option<&GiteaRunnerView>,
+) -> RunnerCapacity {
+    let local_labels = local
+        .map(|l| render::label_names(&l.labels))
+        .unwrap_or_default();
+    RunnerCapacity {
+        managed: local.map(|l| l.managed),
+        capacity: local.and_then(|l| l.capacity),
+        labels: if local_labels.is_empty() {
+            gitea.map(|g| g.labels.clone()).unwrap_or_default()
+        } else {
+            local_labels
+        },
+        container_options: local.and_then(|l| l.container_options.clone()),
+        gitea_id: gitea.map(|g| g.id).or(local.and_then(|l| l.registered_id)),
+        gitea_name: gitea.map(|g| g.name.clone()),
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct RunnerView {
     pub name: String,
+    #[serde(flatten)]
+    pub summary: RunnerCapacity,
     /// Gitea's view (online, busy, labels). `None` when Gitea does not know it
     /// or was not asked.
     pub gitea: Option<GiteaRunnerView>,
@@ -339,9 +382,11 @@ fn join(locals: Vec<LocalInstall>, gitea: &[GiteaRunnerView]) -> Vec<RunnerView>
             if let Some(i) = idx {
                 claimed[i] = true;
             }
+            let g = idx.map(|i| gitea[i].clone());
             RunnerView {
                 name: l.name.clone(),
-                gitea: idx.map(|i| gitea[i].clone()),
+                summary: capacity_of(Some(&l), g.as_ref()),
+                gitea: g,
                 local: Some(l),
             }
         })
@@ -353,6 +398,7 @@ fn join(locals: Vec<LocalInstall>, gitea: &[GiteaRunnerView]) -> Vec<RunnerView>
             .filter(|(_, c)| !c)
             .map(|(g, _)| RunnerView {
                 name: g.name.clone(),
+                summary: capacity_of(None, Some(g)),
                 gitea: Some(g.clone()),
                 local: None,
             }),
@@ -411,6 +457,8 @@ pub struct RunnerHealthArgs {
 #[serde(rename_all = "camelCase")]
 pub struct RunnerHealth {
     pub name: String,
+    #[serde(flatten)]
+    pub summary: RunnerCapacity,
     pub status: HealthStatus,
     pub findings: Vec<Finding>,
     pub local: LocalInstall,
@@ -500,6 +548,7 @@ pub async fn gitea_runner_health(
         let (status, findings) = health::classify(&obs, stall);
         runners.push(RunnerHealth {
             name: l.name,
+            summary: capacity_of(Some(&local), gitea.as_ref()),
             status,
             findings,
             local,
@@ -570,10 +619,42 @@ pub struct RunnerInstallArgs {
     #[arg(long)]
     #[serde(default)]
     pub force_host_as_root: bool,
+    /// Resource limits for job containers, e.g. "--cpus=8 --memory=8g". Only
+    /// --cpus, --memory, --memory-swap, --pids-limit and --shm-size.
+    #[arg(long)]
+    #[serde(default)]
+    pub container_options: Option<String>,
+    /// Pull job images on every job.
+    #[arg(long)]
+    #[serde(default)]
+    pub force_pull: bool,
+    /// Permit a plain-http instance_url. Only private (RFC1918, 100.64.0.0/10)
+    /// or loopback IP addresses qualify.
+    #[arg(long)]
+    #[serde(default)]
+    pub allow_plaintext_origin: bool,
     /// Return the plan and change nothing. Omitted, applies.
     #[arg(long)]
     #[serde(default)]
     pub dry_run: bool,
+}
+
+fn container_options(given: Option<&str>) -> Result<Option<String>> {
+    Ok(given
+        .map(render::validate_container_options)
+        .transpose()?
+        .filter(|o| !o.is_empty()))
+}
+
+fn account_facts(l: &Layout, docker: bool) -> Result<plan::AccountFacts> {
+    Ok(match &l.user {
+        Some(u) => plan::AccountFacts {
+            user_exists: lookup_user(u)?.is_some(),
+            group_exists: lookup_group(u)?.is_some(),
+            in_docker_group: docker && user_in_group(u, "docker")?,
+        },
+        None => plan::AccountFacts::default(),
+    })
 }
 
 /// Host-executor jobs run as the service's account. Refuse that being root
@@ -631,6 +712,7 @@ pub async fn gitea_runner_install(args: RunnerInstallArgs, ctx: &ToolCtx) -> Res
     const TOOL: &str = "gitea.runner.install";
     guard(TOOL, ctx)?;
     layout::validate_name(&args.name)?;
+    let options = container_options(args.container_options.as_deref())?;
     let host = LocalHost::current()?;
     if let Some(existing) = host.find(&args.name) {
         if existing.managed && !existing.config.exists() && !existing.runner_file.exists() {
@@ -682,7 +764,7 @@ pub async fn gitea_runner_install(args: RunnerInstallArgs, ctx: &ToolCtx) -> Res
             .clone()
             .unwrap_or_else(|| api::instance_url(&cfg)),
         &endpoint_origins,
-        &plaintext_allowlist(),
+        args.allow_plaintext_origin,
     )?;
 
     let capacity = render::effective_capacity(mode, args.capacity, cores());
@@ -696,19 +778,14 @@ pub async fn gitea_runner_install(args: RunnerInstallArgs, ctx: &ToolCtx) -> Res
         mode,
         capacity: capacity.value,
         labels: &labels,
+        container_options: options.as_deref(),
+        force_pull: args.force_pull,
     });
     let unit = render::render_service(&l, mode, &host.home, &path_env);
     let docker = mode == Mode::Docker;
     // A failed lookup (directory outage) aborts here rather than reading as
     // "no such account" and creating a local shadow of a directory account.
-    let facts = match &l.user {
-        Some(u) => plan::AccountFacts {
-            user_exists: lookup_user(u)?.is_some(),
-            group_exists: lookup_group(u)?.is_some(),
-            in_docker_group: docker && user_in_group(u, "docker")?,
-        },
-        None => plan::AccountFacts::default(),
-    };
+    let facts = account_facts(&l, docker)?;
     let account = plan::account_plan(host.init, l.user.as_deref(), &l.data, docker, facts);
     let mut summary = format!(
         "install runner '{}' {} ({} executor, capacity {}, {}) from {} registering with {instance_url} as {}",
@@ -738,6 +815,8 @@ pub async fn gitea_runner_install(args: RunnerInstallArgs, ctx: &ToolCtx) -> Res
         instance_url,
         scope,
         account,
+        container_options: options,
+        force_pull: args.force_pull,
     });
     let exec = Executor {
         host: &host,
@@ -1039,6 +1118,12 @@ pub async fn gitea_runner_heal(args: RunnerHealArgs, ctx: &ToolCtx) -> Result<Ru
             .clone()
             .unwrap_or_else(|| render::default_launchd_path(&host.home));
         let labels = local.labels.clone();
+        let recorded = RunnerState::read(&l.state_file());
+        let options = container_options(
+            recorded
+                .as_ref()
+                .and_then(|r| r.container_options.as_deref()),
+        )?;
         Rerender {
             unit: Some(render::render_service(&l, mode, &host.home, &path_env)),
             config: Some(render::render_config(&render::RunnerConfig {
@@ -1046,6 +1131,8 @@ pub async fn gitea_runner_heal(args: RunnerHealArgs, ctx: &ToolCtx) -> Result<Ru
                 mode,
                 capacity: render::effective_capacity(mode, local.capacity, cores()).value,
                 labels: &labels,
+                container_options: options.as_deref(),
+                force_pull: recorded.as_ref().is_some_and(|r| r.force_pull),
             })),
         }
     } else {
@@ -1229,13 +1316,51 @@ pub struct RunnerAdoptArgs {
     /// Registered Gitea endpoint (to verify and delete records).
     #[arg(long)]
     pub endpoint: String,
-    /// Managed runner on this system, installed with the source's labels and
-    /// capacity, whose registration is replaced.
+    /// With `registration`: the managed runner on this system whose
+    /// registration is replaced. Without it: the hand-placed install on this
+    /// system to take over in place.
     #[arg(long)]
     pub name: String,
     /// The drained source runner's `.runner`, already copied onto this system.
+    /// Omit to take over the hand-placed install `name` instead.
     #[arg(long)]
-    pub registration: std::path::PathBuf,
+    #[serde(default)]
+    pub registration: Option<std::path::PathBuf>,
+    /// Takeover: name of the managed install. Default: `name`.
+    #[arg(long)]
+    #[serde(default)]
+    pub as_name: Option<String>,
+    /// Takeover: scope the runner is registered under.
+    #[arg(long, default_value = "instance")]
+    #[serde(default = "default_scope")]
+    pub scope: String,
+    /// Takeover: pinned runner release to install. Default: the newest pinned.
+    #[arg(long)]
+    #[serde(default)]
+    pub version: Option<String>,
+    /// Takeover: concurrent jobs. Default: the hand-placed config's capacity.
+    #[arg(long)]
+    #[serde(default)]
+    pub capacity: Option<u32>,
+    /// Takeover: resource limits for job containers, e.g. "--cpus=8
+    /// --memory=8g". Only --cpus, --memory, --memory-swap, --pids-limit and
+    /// --shm-size. Default: the hand-placed config's options.
+    #[arg(long)]
+    #[serde(default)]
+    pub container_options: Option<String>,
+    /// Takeover: pull job images on every job. Default: the hand-placed
+    /// config's setting.
+    #[arg(long)]
+    #[serde(default)]
+    pub force_pull: Option<bool>,
+    /// Takeover, launchd only: PATH for host-executor jobs.
+    #[arg(long)]
+    #[serde(default)]
+    pub path_env: Option<String>,
+    /// Takeover: allow host-executor labels on a runner that would run as root.
+    #[arg(long)]
+    #[serde(default)]
+    pub force_host_as_root: bool,
     /// Further stale Gitea runner records to delete once the moved runner is
     /// online, as `ID` (this install's scope) or `ID@SCOPE`. The id this
     /// install registered itself is always deleted.
@@ -1257,9 +1382,27 @@ pub struct RunnerAdoptArgs {
     pub dry_run: bool,
 }
 
-/// Second half of a host move: give a runner installed here the drained
-/// source's registration, keeping its Gitea runner id (never re-registering),
-/// start it, verify Gitea shows that id online, then delete stale records.
+pub fn takeover_only_args(args: &RunnerAdoptArgs) -> Vec<&'static str> {
+    [
+        ("as_name", args.as_name.is_some()),
+        ("version", args.version.is_some()),
+        ("capacity", args.capacity.is_some()),
+        ("container_options", args.container_options.is_some()),
+        ("force_pull", args.force_pull.is_some()),
+        ("path_env", args.path_env.is_some()),
+        ("force_host_as_root", args.force_host_as_root),
+    ]
+    .into_iter()
+    .filter_map(|(n, set)| set.then_some(n))
+    .collect()
+}
+
+/// Adopt a runner without re-registering it. With `registration`, the second
+/// half of a host move: give a runner installed here the drained source's
+/// registration, start it, verify Gitea shows that id online, then delete
+/// stale records. Without it, take over a hand-placed install on this system:
+/// install a pinned binary and managed config and service, move its `.runner`
+/// in, retire the hand-placed service, and verify the same Gitea id online.
 #[orca_tool(
     domain = "gitea",
     verb = "runner.adopt",
@@ -1269,6 +1412,173 @@ pub struct RunnerAdoptArgs {
 pub async fn gitea_runner_adopt(args: RunnerAdoptArgs, ctx: &ToolCtx) -> Result<RunnerChange> {
     const TOOL: &str = "gitea.runner.adopt";
     guard(TOOL, ctx)?;
+    match args.registration.clone() {
+        Some(registration) => {
+            let extra = takeover_only_args(&args);
+            if !extra.is_empty() {
+                bail!(
+                    "{TOOL}: [{}] apply only when taking over a hand-placed install (no registration)",
+                    extra.join(", ")
+                );
+            }
+            adopt_moved(TOOL, &args, &registration, ctx).await
+        }
+        None => adopt_in_place(TOOL, &args, ctx).await,
+    }
+}
+
+async fn adopt_in_place(tool: &str, args: &RunnerAdoptArgs, ctx: &ToolCtx) -> Result<RunnerChange> {
+    let host = LocalHost::current()?;
+    let legacy = host.find(&args.name).ok_or_else(|| {
+        anyhow!(
+            "no runner named '{}' is installed on this system",
+            args.name
+        )
+    })?;
+    if legacy.managed {
+        bail!("runner '{}' is already managed by this plugin", args.name);
+    }
+    let target_name = args.as_name.clone().unwrap_or_else(|| args.name.clone());
+    layout::validate_name(&target_name)?;
+    if host.init != Init::Launchd {
+        layout::account_for(&target_name)?;
+    }
+    if let Some(existing) = host.find(&target_name).filter(|l| l.managed) {
+        bail!(
+            "a managed runner '{target_name}' already exists at {}; pass a different as_name",
+            existing.dir.display()
+        );
+    }
+    let reg = host::read_registration(&legacy.runner_file).ok_or_else(|| {
+        anyhow!(
+            "no readable act_runner registration at {}",
+            legacy.runner_file.display()
+        )
+    })?;
+    let scope: Scope = args.scope.parse()?;
+    let cfg = gitea_config(&args.endpoint).await?;
+    if !api::runner_in_scope(&cfg, &scope, reg.id).await? {
+        bail!(
+            "Gitea has no runner {} under scope '{}' — the install cannot be taken over",
+            reg.id,
+            scope.label()
+        );
+    }
+    let target = release_target()?;
+    let version = args.version.as_deref().unwrap_or(DEFAULT_VERSION);
+    let artifact = release::artifact(&Source::configured()?, version, target)?;
+    let labels = reg.labels.clone();
+    render::validate_labels(&labels)?;
+    let mode = mode_from_labels(&labels).unwrap_or_else(|| default_mode(host.init));
+    if mode == Mode::Docker && host.init == Init::Launchd {
+        bail!("docker labels are not supported for launchd (macOS) runners");
+    }
+    let l = Layout::managed(host.init, &target_name, &host.home);
+    check_host_as_root(
+        mode,
+        l.user.is_none() && host.is_root(),
+        args.force_host_as_root,
+    )?;
+    let legacy_cfg = std::fs::read_to_string(&legacy.config).unwrap_or_default();
+    let capacity = render::effective_capacity(
+        mode,
+        args.capacity
+            .or_else(|| render::config_capacity(&legacy_cfg)),
+        cores(),
+    );
+    let options = container_options(
+        args.container_options
+            .clone()
+            .or_else(|| render::config_container_options(&legacy_cfg))
+            .as_deref(),
+    )?;
+    let force_pull = args
+        .force_pull
+        .or_else(|| render::config_force_pull(&legacy_cfg))
+        .unwrap_or(false);
+    let path_env = args
+        .path_env
+        .clone()
+        .unwrap_or_else(|| render::default_launchd_path(&host.home));
+    let config_yaml = render::render_config(&render::RunnerConfig {
+        layout: &l,
+        mode,
+        capacity: capacity.value,
+        labels: &labels,
+        container_options: options.as_deref(),
+        force_pull,
+    });
+    let unit = render::render_service(&l, mode, &host.home, &path_env);
+    let account = plan::account_plan(
+        host.init,
+        l.user.as_deref(),
+        &l.data,
+        mode == Mode::Docker,
+        account_facts(&l, mode == Mode::Docker)?,
+    );
+    let state = RunnerState {
+        scope: scope.label(),
+        version: artifact.version.clone(),
+        runner_id: Some(reg.id),
+        created_account: account.record.created,
+        added_docker_group: account.record.added_docker_group,
+        pending_stale: Vec::new(),
+        container_options: options.clone(),
+        force_pull,
+    };
+    let (legacy_state, _) = host.service_state(&legacy).await;
+    let summary = format!(
+        "take over hand-placed runner '{}' (gitea id {}) at {} as managed '{target_name}' {} \
+         ({} executor, capacity {}{}); retire {}",
+        args.name,
+        reg.id,
+        legacy.dir.display(),
+        artifact.version,
+        format!("{mode:?}").to_lowercase(),
+        capacity.value,
+        options
+            .as_deref()
+            .map(|o| format!(", container options {o}"))
+            .unwrap_or_default(),
+        legacy.service
+    );
+    let steps = plan::takeover_steps(&plan::TakeoverSpec {
+        layout: &l,
+        legacy: &legacy,
+        legacy_state,
+        uid: host.uid,
+        artifact,
+        config_yaml,
+        unit,
+        state,
+        account,
+        timeout_secs: args.timeout_secs,
+    })?;
+    let exec = Executor {
+        host: &host,
+        gitea: Some(&cfg),
+    };
+    plan_or_apply(
+        tool,
+        args,
+        !args.dry_run,
+        ctx.caller().as_ref(),
+        &target_name,
+        summary,
+        steps,
+        exec,
+        Vec::new(),
+        capacity.note.into_iter().collect(),
+    )
+    .await
+}
+
+async fn adopt_moved(
+    tool: &str,
+    args: &RunnerAdoptArgs,
+    registration: &std::path::Path,
+    ctx: &ToolCtx,
+) -> Result<RunnerChange> {
     let host = LocalHost::current()?;
     let l = host.find(&args.name).ok_or_else(|| {
         anyhow!(
@@ -1285,10 +1595,10 @@ pub async fn gitea_runner_adopt(args: RunnerAdoptArgs, ctx: &ToolCtx) -> Result<
     }
     let record = RunnerState::read(&l.state_file())
         .ok_or_else(|| anyhow!("no state record at {}", l.state_file().display()))?;
-    let migrated = host::read_registration(&args.registration).ok_or_else(|| {
+    let migrated = host::read_registration(registration).ok_or_else(|| {
         anyhow!(
             "no readable act_runner registration at {}",
-            args.registration.display()
+            registration.display()
         )
     })?;
     let given = args
@@ -1338,7 +1648,7 @@ pub async fn gitea_runner_adopt(args: RunnerAdoptArgs, ctx: &ToolCtx) -> Result<
         &l,
         host.uid,
         local.service_state,
-        &args.registration,
+        registration,
         record,
         migrated.id,
         &stale,
@@ -1351,8 +1661,8 @@ pub async fn gitea_runner_adopt(args: RunnerAdoptArgs, ctx: &ToolCtx) -> Result<
         gitea: Some(&cfg),
     };
     plan_or_apply(
-        TOOL,
-        &args,
+        tool,
+        args,
         !args.dry_run,
         ctx.caller().as_ref(),
         &args.name,
@@ -1390,6 +1700,8 @@ mod tests {
             created_account: created,
             added_docker_group: added,
             pending_stale: Vec::new(),
+            container_options: None,
+            force_pull: false,
         }
     }
 
@@ -1485,6 +1797,8 @@ mod tests {
             version: None,
             mode: Some(Mode::Host),
             capacity: Some(1),
+            container_options: None,
+            force_pull: None,
             registered_id: id,
             address: None,
             labels: vec![],
@@ -1626,6 +1940,18 @@ mod tests {
                 "gitea.runner.install",
                 json!({"endpoint": "e", "name": "r1", "dry_run": true}),
             ),
+            (
+                "gitea.runner.drain",
+                json!({"endpoint": "e", "name": "r1", "dry_run": true}),
+            ),
+            (
+                "gitea.runner.adopt",
+                json!({"endpoint": "e", "name": "r1", "dry_run": true}),
+            ),
+            (
+                "gitea.runner.adopt",
+                json!({"endpoint": "e", "name": "r1", "registration": "/r", "dry_run": true}),
+            ),
         ] {
             let err = plugin_toolkit::dispatch::dispatch(tool, args, &ctx)
                 .await
@@ -1640,7 +1966,7 @@ mod tests {
     // check is what refuses them (`execute_needs_an_admin_caller`).
     #[test]
     fn mutating_verbs_require_admin() {
-        for verb in ["install", "uninstall", "upgrade", "heal"] {
+        for verb in ["install", "uninstall", "upgrade", "heal", "drain", "adopt"] {
             let name = format!("gitea.runner.{verb}");
             assert_eq!(
                 plugin_toolkit::dispatch::required_role(&name),
@@ -1677,26 +2003,134 @@ mod tests {
             "http://10.0.0.20:3000".to_string(),
         ];
         assert_eq!(
-            check_instance_url("https://gitea.test/", &origins, &[]).unwrap(),
+            check_instance_url("https://gitea.test/", &origins, false).unwrap(),
             "https://gitea.test"
         );
-        assert!(check_instance_url("https://evil.test", &origins, &[]).is_err());
-        assert!(check_instance_url("https://gitea.test@evil.test", &origins, &[]).is_err());
-        let plain = check_instance_url("http://10.0.0.20:3000", &origins, &[]).unwrap_err();
-        assert!(plain.to_string().contains(PLAINTEXT_ORIGINS_ENV), "{plain}");
+        assert!(check_instance_url("https://evil.test", &origins, false).is_err());
+        assert!(check_instance_url("https://gitea.test@evil.test", &origins, false).is_err());
+        let plain = check_instance_url("http://10.0.0.20:3000", &origins, false).unwrap_err();
         assert!(
-            check_instance_url(
-                "http://10.0.0.20:3000",
-                &origins,
-                &["http://10.0.0.20:3000".into()]
-            )
-            .is_ok()
+            plain.to_string().contains("allow_plaintext_origin"),
+            "{plain}"
         );
-        assert!(check_instance_url("ftp://gitea.test", &origins, &[]).is_err());
+        assert!(check_instance_url("http://10.0.0.20:3000", &origins, true).is_ok());
+        assert!(check_instance_url("ftp://gitea.test", &origins, false).is_err());
+        let public = vec![
+            "http://gitea.test".to_string(),
+            "http://8.8.8.8".to_string(),
+        ];
+        for u in ["http://gitea.test", "http://8.8.8.8"] {
+            let err = check_instance_url(u, &public, true)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("non-private"), "{err}");
+        }
         assert_eq!(
             origin("HTTPS://Gitea.Test:443/x?y").as_deref(),
             Some("https://gitea.test:443")
         );
+    }
+
+    #[test]
+    fn plaintext_is_limited_to_private_and_loopback_ips() {
+        for ok in [
+            "10.0.0.20:3000",
+            "172.16.0.1",
+            "172.31.255.255",
+            "192.168.1.1:80",
+            "100.64.0.1",
+            "100.127.255.254",
+            "127.0.0.1:3000",
+            "[::1]:3000",
+        ] {
+            assert!(is_private_host(ok), "{ok}");
+        }
+        for bad in [
+            "8.8.8.8",
+            "172.32.0.1",
+            "100.128.0.1",
+            "100.63.255.255",
+            "gitea.test",
+            "localhost",
+            "[2001:db8::1]",
+            "[fd00::1]",
+        ] {
+            assert!(!is_private_host(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn install_args_carry_container_limits_and_plaintext_opt_in() {
+        let args: RunnerInstallArgs = plugin_toolkit::serde_json::from_str(
+            r#"{"endpoint":"e","name":"n","container_options":"--cpus=8 --memory=8g","force_pull":true,"allow_plaintext_origin":true}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            container_options(args.container_options.as_deref())
+                .unwrap()
+                .as_deref(),
+            Some("--cpus=8 --memory=8g")
+        );
+        assert!(args.force_pull && args.allow_plaintext_origin);
+        assert_eq!(container_options(Some("  ")).unwrap(), None);
+        assert!(container_options(Some("--privileged")).is_err());
+        let bare: RunnerInstallArgs =
+            plugin_toolkit::serde_json::from_str(r#"{"endpoint":"e","name":"n"}"#).unwrap();
+        assert!(!bare.force_pull && !bare.allow_plaintext_origin);
+        assert!(bare.container_options.is_none());
+    }
+
+    #[test]
+    fn adopt_without_registration_is_a_takeover_and_refuses_takeover_args_otherwise() {
+        let takeover: RunnerAdoptArgs = plugin_toolkit::serde_json::from_str(
+            r#"{"endpoint":"e","name":"baldur-runner","as_name":"baldur","container_options":"--cpus=8","force_pull":true}"#,
+        )
+        .unwrap();
+        assert!(takeover.registration.is_none());
+        assert_eq!(takeover.scope, "instance");
+        assert_eq!(
+            takeover_only_args(&takeover),
+            vec!["as_name", "container_options", "force_pull"]
+        );
+        let moved: RunnerAdoptArgs = plugin_toolkit::serde_json::from_str(
+            r#"{"endpoint":"e","name":"n","registration":"/r"}"#,
+        )
+        .unwrap();
+        assert!(takeover_only_args(&moved).is_empty());
+    }
+
+    #[test]
+    fn capacity_summary_joins_local_and_gitea() {
+        let mut l = local("baldur", Some(5));
+        l.capacity = Some(4);
+        l.labels = vec!["ubuntu-latest:docker://node:20".into()];
+        l.container_options = Some("--cpus=8".into());
+        let mut g = remote(5, "baldur-runner");
+        g.labels = vec!["gitea-label".into()];
+        let c = capacity_of(Some(&l), Some(&g));
+        assert_eq!(c.managed, Some(true));
+        assert_eq!(c.capacity, Some(4));
+        assert_eq!(c.labels, vec!["ubuntu-latest"]);
+        assert_eq!(c.container_options.as_deref(), Some("--cpus=8"));
+        assert_eq!(c.gitea_id, Some(5));
+        assert_eq!(c.gitea_name.as_deref(), Some("baldur-runner"));
+        let remote_only = capacity_of(None, Some(&g));
+        assert_eq!(remote_only.managed, None);
+        assert_eq!(remote_only.labels, vec!["gitea-label"]);
+        let local_only = capacity_of(Some(&l), None);
+        assert_eq!(local_only.gitea_id, Some(5));
+        assert_eq!(local_only.gitea_name, None);
+        let json = plugin_toolkit::serde_json::to_value(RunnerView {
+            name: "baldur".into(),
+            summary: c,
+            gitea: Some(g),
+            local: Some(l),
+        })
+        .unwrap();
+        assert_eq!(json["capacity"], 4);
+        assert_eq!(json["giteaId"], 5);
+        assert_eq!(json["containerOptions"], "--cpus=8");
+        assert_eq!(json["managed"], true);
     }
 
     #[test]
