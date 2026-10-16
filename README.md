@@ -166,13 +166,13 @@ caller (a call with no caller identity is refused).
 
 | verb | does |
 |---|---|
-| `gitea.runner.list` | Gitea's runner list (online, busy, labels) joined with this system's installs |
+| `gitea.runner.list` | Gitea's runner list (online, busy, labels) joined with this system's installs; each runner reports `managed`, `capacity`, `labels`, `containerOptions`, `giteaId`, `giteaName` |
 | `gitea.runner.health` | classifies each local runner: service down, offline-while-running, starved (idle while a matching job waits), launchd throttled priority, host-executor capacity > 1 |
 | `gitea.runner.install` | download a pinned, sha256-verified runner release, render `config.yaml`, register, install the supervised service |
 | `gitea.runner.heal` | applies the health findings' remedies (restart, reload, rewrite unit/config) and reports why |
 | `gitea.runner.upgrade` | swap in a pinned, verified release binary and restart |
 | `gitea.runner.drain` | host move, source side: disable the runner in Gitea so it takes no new job, wait for the running one to finish, then stop the service and verify it is down; files and Gitea record are kept |
-| `gitea.runner.adopt` | host move, target side: give a runner installed here the drained source's copied `.runner` (same Gitea id, no re-registration), wait for Gitea to show that id offline, re-enable it, start it, wait for Gitea to show it online, then delete stale records (this install's own id plus `--stale-id ID[@SCOPE]`s, never the moved one; kept in the state record until deleted) |
+| `gitea.runner.adopt` | host move, target side: give a runner installed here the drained source's copied `.runner` (same Gitea id, no re-registration), wait for Gitea to show that id offline, re-enable it, start it, wait for Gitea to show it online, then delete stale records (this install's own id plus `--stale-id ID[@SCOPE]`s, never the moved one; kept in the state record until deleted). Without `--registration`: take over the hand-placed install `--name` in place (`/usr/local/bin/act_runner` + `/etc/act_runner`, OpenRC/systemd, or the launchd agent): pinned binary, managed config and service, its `.runner` moved in (same Gitea id), hand-placed service stopped and removed once the id is online |
 | `gitea.runner.uninstall` | stop and remove the service, deregister from Gitea (under the scope recorded at install), delete files |
 
 Runner drain needs Gitea 1.26 or newer (the edit-runner API). A disabled
@@ -207,9 +207,12 @@ Releases: only versions whose sha256 is pinned in the plugin install
 |---|---|
 | `ORCA_GITEA_RUNNER_RELEASE_SOURCE` | https Gitea repo mirroring the runner releases (default `https://gitea.com/gitea/runner`) |
 | `ORCA_GITEA_RUNNER_RELEASE_HOSTS` | extra hosts the release source may be on |
-| `ORCA_GITEA_RUNNER_PLAINTEXT_ORIGINS` | plain-http Gitea origins a runner may register against |
 
-The runner's `instance_url` must be one of the endpoint's own routes. The
+The runner's `instance_url` must be one of the endpoint's own routes, and https
+unless the install passes `allow_plaintext_origin` and the origin is an RFC1918,
+100.64.0.0/10 or loopback IP. `container_options` (on install and adopt) accepts only
+`--cpus`, `--memory`, `--memory-swap`, `--pids-limit` and `--shm-size`; it and
+`force_pull` are written to `config.yaml` and kept across upgrade and heal. The
 registration token is passed to `act_runner register` in the environment,
 never argv. Gitea reuses one registration token per scope and has no API to
 rotate it; reset it in Gitea if it may have been exposed. Instance scope needs

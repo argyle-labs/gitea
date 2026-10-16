@@ -106,6 +106,54 @@ pub struct RunnerConfig<'a> {
     pub mode: Mode,
     pub capacity: u32,
     pub labels: &'a [String],
+    pub container_options: Option<&'a str>,
+    pub force_pull: bool,
+}
+
+const CONTAINER_RESOURCE_FLAGS: &[&str] = &[
+    "--cpus",
+    "--memory",
+    "--memory-swap",
+    "--pids-limit",
+    "--shm-size",
+];
+
+fn resource_value_ok(v: &str) -> bool {
+    let digits = v.strip_prefix('-').unwrap_or(v);
+    !digits.is_empty()
+        && digits.len() <= 32
+        && digits.starts_with(|c: char| c.is_ascii_digit())
+        && digits
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.')
+}
+
+pub fn validate_container_options(options: &str) -> anyhow::Result<String> {
+    let mut out = Vec::new();
+    let mut tokens = options.split_whitespace();
+    while let Some(tok) = tokens.next() {
+        let (flag, value) = match tok.split_once('=') {
+            Some((f, v)) => (f, v.to_string()),
+            None => (
+                tok,
+                tokens
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("container option '{tok}' has no value"))?
+                    .to_string(),
+            ),
+        };
+        if !CONTAINER_RESOURCE_FLAGS.contains(&flag) {
+            anyhow::bail!(
+                "container option '{flag}' is not allowed; only resource limits are: {}",
+                CONTAINER_RESOURCE_FLAGS.join(", ")
+            );
+        }
+        if !resource_value_ok(&value) {
+            anyhow::bail!("container option {flag} has an invalid value '{value}'");
+        }
+        out.push(format!("{flag}={value}"));
+    }
+    Ok(out.join(" "))
 }
 
 fn yaml_str(s: &str) -> String {
@@ -141,6 +189,11 @@ pub fn render_config(cfg: &RunnerConfig<'_>) -> String {
     out.push_str("container:\n");
     out.push_str("  network: \"\"\n");
     out.push_str("  privileged: false\n");
+    out.push_str(&format!(
+        "  options: {}\n",
+        yaml_str(cfg.container_options.unwrap_or(""))
+    ));
+    out.push_str(&format!("  force_pull: {}\n", cfg.force_pull));
     // "-": the runner finds the Docker host for itself but does NOT mount its
     // socket into job containers. Empty would mount it, handing every job
     // root on the host.
@@ -319,6 +372,48 @@ pub fn plist_process_type(plist: &str) -> Option<String> {
     Some(after[start..start + end].trim().to_string())
 }
 
+fn section_value<'a>(yaml: &'a str, section: &str, key: &str) -> Option<&'a str> {
+    let mut inside = false;
+    for line in yaml.lines() {
+        if line.trim_start().starts_with('#') || line.trim().is_empty() {
+            continue;
+        }
+        if !line.starts_with(' ') && !line.starts_with('\t') {
+            inside = line.trim_end().strip_suffix(':') == Some(section);
+            continue;
+        }
+        if inside
+            && let Some(v) = line.trim().strip_prefix(key)
+            && let Some(v) = v.strip_prefix(':')
+        {
+            return Some(v.trim());
+        }
+    }
+    None
+}
+
+fn unquote(v: &str) -> String {
+    let v = v.split(" #").next().unwrap_or(v).trim();
+    match v
+        .strip_prefix('"')
+        .and_then(|x| x.strip_suffix('"'))
+        .or_else(|| v.strip_prefix('\'').and_then(|x| x.strip_suffix('\'')))
+    {
+        Some(inner) => inner.replace("\\\"", "\"").replace("\\\\", "\\"),
+        None => v.to_string(),
+    }
+}
+
+pub fn config_container_options(yaml: &str) -> Option<String> {
+    section_value(yaml, "container", "options")
+        .map(unquote)
+        .filter(|v| !v.is_empty())
+}
+
+pub fn config_force_pull(yaml: &str) -> Option<bool> {
+    section_value(yaml, "container", "force_pull").and_then(|v| unquote(v).parse().ok())
+}
+
 /// `runner.capacity` from an act_runner `config.yaml`. A line scan, not a YAML
 /// parser: act_runner's config is flat two-level YAML and this reads one key.
 pub fn config_capacity(yaml: &str) -> Option<u32> {
@@ -385,6 +480,8 @@ mod tests {
             mode: Mode::Host,
             capacity: 1,
             labels: &labels,
+            container_options: None,
+            force_pull: false,
         });
         assert!(yaml.contains("  capacity: 1\n"));
         assert!(yaml.contains("    - \"macos:host\"\n"));
@@ -407,10 +504,80 @@ mod tests {
             mode: Mode::Docker,
             capacity: 2,
             labels: &["ubuntu-latest:docker://node:20".to_string()],
+            container_options: None,
+            force_pull: false,
         });
         assert!(yaml.contains("  docker_host: \"-\"\n"), "{yaml}");
         assert!(!yaml.contains("docker_host: \"\""));
         assert!(!yaml.contains("privileged: true"));
+    }
+
+    #[test]
+    fn config_writes_container_limits_and_reads_them_back() {
+        let l = layout(Init::Systemd);
+        let labels = vec!["ubuntu-latest:docker://node:20".to_string()];
+        let yaml = render_config(&RunnerConfig {
+            layout: &l,
+            mode: Mode::Docker,
+            capacity: 2,
+            labels: &labels,
+            container_options: Some("--cpus=8 --memory=8g"),
+            force_pull: true,
+        });
+        assert!(
+            yaml.contains("  options: \"--cpus=8 --memory=8g\"\n"),
+            "{yaml}"
+        );
+        assert!(yaml.contains("  force_pull: true\n"), "{yaml}");
+        assert_eq!(
+            config_container_options(&yaml).as_deref(),
+            Some("--cpus=8 --memory=8g")
+        );
+        assert_eq!(config_force_pull(&yaml), Some(true));
+        let bare = render_config(&RunnerConfig {
+            layout: &l,
+            mode: Mode::Docker,
+            capacity: 2,
+            labels: &labels,
+            container_options: None,
+            force_pull: false,
+        });
+        assert_eq!(config_container_options(&bare), None);
+        assert_eq!(config_force_pull(&bare), Some(false));
+        assert_eq!(
+            config_container_options("container:\n  options: --cpus 2\nhost:\n  options: x\n")
+                .as_deref(),
+            Some("--cpus 2")
+        );
+    }
+
+    #[test]
+    fn container_options_allow_only_resource_limits() {
+        assert_eq!(
+            validate_container_options(
+                "--cpus=8 --memory 8g --memory-swap=-1 --pids-limit=512 --shm-size=2g"
+            )
+            .unwrap(),
+            "--cpus=8 --memory=8g --memory-swap=-1 --pids-limit=512 --shm-size=2g"
+        );
+        assert_eq!(validate_container_options("").unwrap(), "");
+        for bad in [
+            "--privileged",
+            "--cap-add=SYS_ADMIN",
+            "--device=/dev/kvm",
+            "-v /:/host",
+            "--volume=/:/host",
+            "--network host",
+            "--network=host",
+            "--pid host",
+            "--security-opt seccomp=unconfined",
+            "--cpus",
+            "--memory=8g;rm",
+            "--memory=$(id)",
+            "--cpus=8 --mount type=bind,src=/,dst=/h",
+        ] {
+            assert!(validate_container_options(bad).is_err(), "accepted {bad:?}");
+        }
     }
 
     #[test]

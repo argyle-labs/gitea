@@ -103,6 +103,10 @@ pub struct RunnerState {
     /// succeed so a re-run after a failure still removes them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pending_stale: Vec<StaleRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container_options: Option<String>,
+    #[serde(default)]
+    pub force_pull: bool,
 }
 
 /// A Gitea runner record to delete, with the scope it lives under.
@@ -695,6 +699,8 @@ pub struct InstallSpec<'a> {
     pub instance_url: String,
     pub scope: Scope,
     pub account: AccountPlan,
+    pub container_options: Option<String>,
+    pub force_pull: bool,
 }
 
 pub fn install_steps(spec: &InstallSpec<'_>) -> Vec<Step> {
@@ -706,6 +712,8 @@ pub fn install_steps(spec: &InstallSpec<'_>) -> Vec<Step> {
         created_account: spec.account.record.created,
         added_docker_group: spec.account.record.added_docker_group,
         pending_stale: Vec::new(),
+        container_options: spec.container_options.clone(),
+        force_pull: spec.force_pull,
     };
     // Recorded before the account is touched (the state file lives outside
     // the install dir), so an install that fails later still leaves uninstall
@@ -1014,6 +1022,117 @@ pub fn adopt_steps(
     Ok(steps)
 }
 
+pub struct TakeoverSpec<'a> {
+    pub layout: &'a Layout,
+    pub legacy: &'a Layout,
+    pub legacy_state: ServiceState,
+    pub uid: u32,
+    pub artifact: Artifact,
+    pub config_yaml: String,
+    pub unit: String,
+    pub state: RunnerState,
+    pub account: AccountPlan,
+    pub timeout_secs: u64,
+}
+
+pub fn takeover_steps(spec: &TakeoverSpec<'_>) -> Result<Vec<Step>> {
+    let l = spec.layout;
+    let legacy = spec.legacy;
+    let runner_id = spec
+        .state
+        .runner_id
+        .ok_or_else(|| anyhow!("taking over '{}' needs its Gitea runner id", legacy.name))?;
+    let mut steps = vec![Step::RecordState {
+        path: l.state_file(),
+        state: spec.state.clone(),
+        runner_file: None,
+    }];
+    steps.extend(spec.account.steps.iter().cloned());
+    if let (Some(user), false) = (&l.user, spec.account.steps.is_empty()) {
+        steps.push(Step::ReconcileAccount {
+            path: l.state_file(),
+            user: user.clone(),
+        });
+    }
+    let dir_mode = if l.user.is_some() { 0o750 } else { 0o700 };
+    steps.extend([
+        Step::CreateDir {
+            path: l.dir.clone(),
+            mode: dir_mode,
+        },
+        Step::CreateDir {
+            path: l.data.clone(),
+            mode: 0o700,
+        },
+        Step::InstallBinary {
+            artifact: spec.artifact.clone(),
+            dest: l.binary.clone(),
+        },
+        Step::WriteFile {
+            path: l.config.clone(),
+            contents: spec.config_yaml.clone(),
+            mode: 0o644,
+            what: "act_runner config.yaml".to_string(),
+        },
+    ]);
+    steps.extend(service_steps(
+        legacy,
+        ServiceOp::Unload,
+        spec.uid,
+        spec.legacy_state,
+    ));
+    steps.push(Step::VerifyStopped {
+        layout: Box::new(legacy.clone()),
+    });
+    steps.push(Step::InstallRegistration {
+        src: legacy.runner_file.clone(),
+        dest: l.runner_file.clone(),
+        runner_id,
+    });
+    if let Some(user) = &l.user {
+        steps.push(Step::Chown {
+            path: l.data.clone(),
+            user: Some(user.clone()),
+            group: user.clone(),
+            recursive: true,
+        });
+        steps.push(Step::Chown {
+            path: l.dir.clone(),
+            user: None,
+            group: user.clone(),
+            recursive: false,
+        });
+    }
+    steps.push(Step::WriteFile {
+        path: l.unit_path.clone(),
+        contents: spec.unit.clone(),
+        mode: unit_mode(l.init),
+        what: format!("{:?} service definition", l.init).to_lowercase(),
+    });
+    steps.extend(service_steps(
+        l,
+        ServiceOp::Load,
+        spec.uid,
+        ServiceState::NotLoaded,
+    ));
+    steps.push(Step::VerifyOnline {
+        runner_id,
+        timeout_secs: spec.timeout_secs,
+    });
+    steps.push(Step::Remove {
+        path: legacy.unit_path.clone(),
+        recursive: false,
+    });
+    if legacy.init == Init::Systemd {
+        steps.push(run(&["systemctl", "daemon-reload"], true));
+    }
+    steps.push(Step::Remove {
+        path: legacy.runner_file.clone(),
+        recursive: false,
+    });
+    Ok(steps)
+}
+
 /// `recorded` is the managed install's state, rewritten with the new version.
 /// `check_major` guards a hand-placed install against a silent major jump.
 pub fn upgrade_steps(
@@ -1217,6 +1336,8 @@ mod tests {
                 },
                 steps: account_steps,
             },
+            container_options: None,
+            force_pull: false,
         }
     }
 
@@ -1923,6 +2044,8 @@ mod tests {
             created_account: true,
             added_docker_group: false,
             pending_stale: Vec::new(),
+            container_options: Some("--cpus=2".into()),
+            force_pull: true,
         };
         let a = actions(&upgrade_steps(
             &l,
@@ -1936,6 +2059,13 @@ mod tests {
         assert!(a[0].starts_with("install-binary"));
         assert_eq!(a[1], "record orca runner state");
         assert_eq!(a[2], "run systemctl restart gitea-runner-r1.service");
+        let steps = upgrade_steps(&l, 0, ServiceState::Running, &artifact(), Some(&st), None);
+        assert!(
+            steps
+                .iter()
+                .any(|s| matches!(s, Step::RecordState { state, .. }
+            if state.container_options.as_deref() == Some("--cpus=2") && state.force_pull))
+        );
     }
 
     #[test]
@@ -2136,6 +2266,8 @@ mod tests {
             created_account: true,
             added_docker_group: false,
             pending_stale: pending,
+            container_options: None,
+            force_pull: false,
         }
     }
 
@@ -2234,6 +2366,68 @@ mod tests {
             !steps
                 .iter()
                 .any(|s| matches!(s, Step::Deregister { runner_id: 7, .. }))
+        );
+    }
+
+    #[test]
+    fn takeover_keeps_the_registration_and_retires_the_hand_placed_service() {
+        let l = layout(Init::Openrc);
+        let legacy = Layout {
+            name: "baldur".into(),
+            ..Layout::legacy_candidates(Init::Openrc, Path::new("/root"))[0].clone()
+        };
+        let state = RunnerState {
+            runner_id: Some(12),
+            container_options: Some("--cpus=8".into()),
+            ..record(None, vec![])
+        };
+        let mk = |state: RunnerState| TakeoverSpec {
+            layout: &l,
+            legacy: &legacy,
+            legacy_state: ServiceState::Running,
+            uid: 0,
+            artifact: artifact(),
+            config_yaml: "cfg".into(),
+            unit: "unit".into(),
+            state,
+            account: AccountPlan::default(),
+            timeout_secs: 60,
+        };
+        let steps = takeover_steps(&mk(state.clone())).unwrap();
+        let pos = |f: &dyn Fn(&Step) -> bool| steps.iter().position(f).unwrap();
+        let recorded = pos(&|s| {
+            matches!(s, Step::RecordState { state, .. }
+            if state.runner_id == Some(12) && state.container_options.is_some())
+        });
+        let stop = pos(
+            &|s| matches!(s, Step::Run { argv, .. } if argv[1] == "act_runner" && argv[2] == "stop"),
+        );
+        let stopped = pos(&|s| matches!(s, Step::VerifyStopped { .. }));
+        let reg = pos(&|s| {
+            matches!(s, Step::InstallRegistration { src, runner_id: 12, .. }
+            if src == &legacy.runner_file)
+        });
+        let start = pos(
+            &|s| matches!(s, Step::Run { argv, .. } if argv[1] == "gitea-runner-r1" && argv[2] == "start"),
+        );
+        let online = pos(&|s| matches!(s, Step::VerifyOnline { runner_id: 12, .. }));
+        let retire = pos(&|s| matches!(s, Step::Remove { path, .. } if path == &legacy.unit_path));
+        let old_reg =
+            pos(&|s| matches!(s, Step::Remove { path, .. } if path == &legacy.runner_file));
+        assert_eq!(recorded, 0);
+        assert!(stop < stopped && stopped < reg && reg < start && start < online);
+        assert!(online < retire && retire < old_reg);
+        assert!(
+            !steps
+                .iter()
+                .any(|s| matches!(s, Step::Register { .. } | Step::Deregister { .. }))
+        );
+        assert!(
+            takeover_steps(&mk(RunnerState {
+                runner_id: None,
+                ..state
+            }))
+            .is_err()
         );
     }
 }

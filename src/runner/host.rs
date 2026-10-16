@@ -14,7 +14,9 @@ use plugin_toolkit::process::Command;
 use super::health::{ServiceState, mode_from_labels};
 use super::layout::{Init, Layout, Mode, managed_root, validate_name};
 use super::plan::RunnerState;
-use super::render::{config_capacity, plist_process_type};
+use super::render::{
+    config_capacity, config_container_options, config_force_pull, plist_process_type,
+};
 
 const CMD_TIMEOUT: Duration = Duration::from_secs(120);
 const LOG_TAIL_BYTES: u64 = 64 * 1024;
@@ -227,6 +229,8 @@ impl LocalHost {
             version: state.as_ref().map(|st| st.version.clone()),
             mode: mode_from_labels(&labels),
             capacity: config.as_deref().and_then(config_capacity),
+            container_options: config.as_deref().and_then(config_container_options),
+            force_pull: config.as_deref().and_then(config_force_pull),
             registered_id: if layout.managed {
                 state.as_ref().and_then(|st| st.runner_id)
             } else {
@@ -259,6 +263,8 @@ pub struct LocalInstall {
     pub version: Option<String>,
     pub mode: Option<Mode>,
     pub capacity: Option<u32>,
+    pub container_options: Option<String>,
+    pub force_pull: Option<bool>,
     /// Gitea runner id from the local registration file.
     pub registered_id: Option<i64>,
     /// Gitea address the runner registered against.

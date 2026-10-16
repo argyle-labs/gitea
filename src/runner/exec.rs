@@ -628,6 +628,8 @@ mod tests {
             created_account: true,
             added_docker_group: true,
             pending_stale: Vec::new(),
+            container_options: None,
+            force_pull: false,
         };
         write_atomic(&path, state.to_json().as_bytes(), 0o600).unwrap();
         let (_, err) = exec
@@ -665,6 +667,8 @@ mod tests {
             created_account: true,
             added_docker_group: true,
             pending_stale: Vec::new(),
+            container_options: None,
+            force_pull: false,
         };
         let (_, err) = exec
             .run(&[
@@ -716,6 +720,8 @@ mod tests {
                     created_account: true,
                     added_docker_group: true,
                     pending_stale: Vec::new(),
+                    container_options: None,
+                    force_pull: false,
                 },
                 runner_file: Some(runner_file),
             }])
