@@ -1487,8 +1487,12 @@ fn takeover_resume(
     let Some(existing) = existing else {
         return Ok(false);
     };
-    if recorded.and_then(|r| r.runner_id) == Some(runner_id) {
-        return Ok(true);
+    match recorded.map(|r| r.runner_id) {
+        Some(Some(id)) if id == runner_id => return Ok(true),
+        Some(None) if !existing.config.exists() && !existing.runner_file.exists() => {
+            return Ok(true);
+        }
+        _ => {}
     }
     bail!(
         "a managed runner '{}' already exists at {}; pass a different as_name",
@@ -1628,6 +1632,7 @@ async fn adopt_in_place(tool: &str, args: &RunnerAdoptArgs, ctx: &ToolCtx) -> Re
         account,
         timeout_secs: args.timeout_secs,
         resume,
+        prior_account,
     })?;
     let exec = Executor {
         host: &host,
@@ -2481,7 +2486,13 @@ mod tests {
         assert!(!takeover_resume(None, None, 12).unwrap());
         assert!(takeover_resume(Some(&l), Some(&state(Some(12))), 12).unwrap());
         assert!(takeover_resume(Some(&l), Some(&state(Some(13))), 12).is_err());
-        assert!(takeover_resume(Some(&l), Some(&state(None)), 12).is_err());
+        assert!(takeover_resume(Some(&l), Some(&state(None)), 12).unwrap());
+        let home = std::env::temp_dir().join(format!("gitea-resume-{}", std::process::id()));
+        let configured = Layout::managed(Init::Launchd, "baldur", &home);
+        std::fs::create_dir_all(&configured.dir).unwrap();
+        std::fs::write(&configured.config, "").unwrap();
+        assert!(takeover_resume(Some(&configured), Some(&state(None)), 12).is_err());
+        std::fs::remove_dir_all(&home).unwrap();
         assert!(takeover_resume(Some(&l), None, 12).is_err());
     }
 }

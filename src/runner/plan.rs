@@ -1041,6 +1041,7 @@ pub struct TakeoverSpec<'a> {
     pub account: AccountPlan,
     pub timeout_secs: u64,
     pub resume: bool,
+    pub prior_account: AccountRecord,
 }
 
 #[derive(Debug, Clone)]
@@ -1190,11 +1191,28 @@ fn takeover_rollback(spec: &TakeoverSpec<'_>) -> Vec<Step> {
             path: l.dir.clone(),
             recursive: true,
         },
+    ]);
+    let prior = spec.prior_account;
+    steps.push(if prior.created || prior.added_docker_group {
+        Step::RecordState {
+            path: l.state_file(),
+            state: RunnerState {
+                runner_id: None,
+                created_account: prior.created,
+                added_docker_group: prior.added_docker_group,
+                pending_stale: Vec::new(),
+                container_options: None,
+                force_pull: false,
+                ..spec.state.clone()
+            },
+            runner_file: None,
+        }
+    } else {
         Step::Remove {
             path: l.state_file(),
             recursive: false,
-        },
-    ]);
+        }
+    });
     if l.init == Init::Systemd {
         steps.push(run(&["systemctl", "daemon-reload"], true));
     }
@@ -2478,6 +2496,7 @@ mod tests {
             account: AccountPlan::default(),
             timeout_secs: 60,
             resume: false,
+            prior_account: AccountRecord::default(),
         };
         let Takeover { steps, rollback } = takeover_steps(&mk(state.clone())).unwrap();
         let pos = |f: &dyn Fn(&Step) -> bool| steps.iter().position(f).unwrap();
@@ -2583,6 +2602,7 @@ mod tests {
                 },
                 timeout_secs: 60,
                 resume: false,
+                prior_account: AccountRecord::default(),
             })
             .unwrap()
             .rollback
@@ -2622,6 +2642,77 @@ mod tests {
                 || a.contains("gpasswd")
                 || a.contains("refuse-root")),
             "{reused:?}"
+        );
+    }
+
+    #[test]
+    fn takeover_rollback_keeps_account_flags_an_earlier_attempt_recorded() {
+        let l = layout(Init::Systemd);
+        let legacy = Layout {
+            name: "baldur".into(),
+            ..Layout::legacy_candidates(Init::Systemd, Path::new("/root"))[0].clone()
+        };
+        let rollback_for = |prior: AccountRecord| {
+            takeover_steps(&TakeoverSpec {
+                layout: &l,
+                legacy: &legacy,
+                legacy_state: ServiceState::Running,
+                uid: 0,
+                artifact: artifact(),
+                config_yaml: "cfg".into(),
+                unit: "unit".into(),
+                state: RunnerState {
+                    runner_id: Some(12),
+                    container_options: Some("--cpus=8".into()),
+                    ..record(None, vec![])
+                },
+                account: AccountPlan::default(),
+                timeout_secs: 60,
+                resume: true,
+                prior_account: prior,
+            })
+            .unwrap()
+            .rollback
+            .steps
+        };
+        let state_file = l.state_file();
+        for prior in [
+            AccountRecord {
+                created: true,
+                added_docker_group: false,
+            },
+            AccountRecord {
+                created: false,
+                added_docker_group: true,
+            },
+        ] {
+            let rb = rollback_for(prior);
+            let kept = rb
+                .iter()
+                .find_map(|s| match s {
+                    Step::RecordState { path, state, .. } if path == &state_file => Some(state),
+                    _ => None,
+                })
+                .expect("minimal record");
+            assert_eq!(kept.runner_id, None);
+            assert_eq!(kept.created_account, prior.created);
+            assert_eq!(kept.added_docker_group, prior.added_docker_group);
+            assert_eq!(kept.container_options, None);
+            assert!(
+                !rb.iter()
+                    .any(|s| matches!(s, Step::Remove { path, .. } if path == &state_file))
+            );
+            let a = actions(&rb);
+            assert!(
+                !a.iter()
+                    .any(|a| a.contains("userdel") || a.contains("gpasswd")),
+                "{a:?}"
+            );
+        }
+        assert!(
+            rollback_for(AccountRecord::default())
+                .iter()
+                .any(|s| matches!(s, Step::Remove { path, .. } if path == &state_file))
         );
     }
 }
