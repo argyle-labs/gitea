@@ -238,6 +238,16 @@ pub fn check_instance_url(
     Ok(url.trim().trim_end_matches('/').to_string())
 }
 
+fn runner_locks(host: &LocalHost, names: &[&str], execute: bool) -> Result<Vec<std::fs::File>> {
+    if !execute {
+        return Ok(Vec::new());
+    }
+    let mut names = names.to_vec();
+    names.sort_unstable();
+    names.dedup();
+    names.into_iter().map(|n| host.lock_runner(n)).collect()
+}
+
 fn change_list(steps: &[Step]) -> String {
     steps
         .iter()
@@ -262,6 +272,7 @@ async fn plan_or_apply<A: Serialize>(
     summary: String,
     steps: Vec<Step>,
     rollback: Option<plan::Rollback>,
+    locks: Vec<std::fs::File>,
     exec: Executor<'_>,
     findings: Vec<Finding>,
     mut notes: Vec<String>,
@@ -293,6 +304,9 @@ async fn plan_or_apply<A: Serialize>(
     authorize_execute(tool, caller)?;
     if let Some(why) = blocker {
         bail!("{tool}: refusing to execute: {why}");
+    }
+    if locks.is_empty() {
+        bail!("{tool}: refusing to execute without holding the lock on runner '{runner}'");
     }
     let (outcomes, err) = exec.run(&steps).await;
     if let Some(e) = err {
@@ -761,6 +775,7 @@ pub async fn gitea_runner_install(args: RunnerInstallArgs, ctx: &ToolCtx) -> Res
     layout::validate_name(&args.name)?;
     let options = container_options(args.container_options.as_deref())?;
     let host = LocalHost::current()?;
+    let locks = runner_locks(&host, &[&args.name], !args.dry_run)?;
     if let Some(existing) = host.find(&args.name) {
         if existing.managed && !existing.config.exists() && !existing.runner_file.exists() {
             bail!(
@@ -884,6 +899,7 @@ pub async fn gitea_runner_install(args: RunnerInstallArgs, ctx: &ToolCtx) -> Res
         summary,
         steps,
         None,
+        locks,
         exec,
         Vec::new(),
         notes,
@@ -932,6 +948,7 @@ pub async fn gitea_runner_uninstall(
     const TOOL: &str = "gitea.runner.uninstall";
     guard(TOOL, ctx)?;
     let host = LocalHost::current()?;
+    let locks = runner_locks(&host, &[&args.name], !args.dry_run)?;
     let l = host.find(&args.name).ok_or_else(|| {
         anyhow!(
             "no runner named '{}' is installed on this system",
@@ -985,6 +1002,7 @@ pub async fn gitea_runner_uninstall(
         format!("uninstall runner '{}'", args.name),
         steps,
         None,
+        locks,
         exec,
         Vec::new(),
         notes,
@@ -1055,6 +1073,7 @@ pub async fn gitea_runner_upgrade(args: RunnerUpgradeArgs, ctx: &ToolCtx) -> Res
     const TOOL: &str = "gitea.runner.upgrade";
     guard(TOOL, ctx)?;
     let host = LocalHost::current()?;
+    let locks = runner_locks(&host, &[&args.name], !args.dry_run)?;
     let l = host.find(&args.name).ok_or_else(|| {
         anyhow!(
             "no runner named '{}' is installed on this system",
@@ -1101,6 +1120,7 @@ pub async fn gitea_runner_upgrade(args: RunnerUpgradeArgs, ctx: &ToolCtx) -> Res
         summary,
         steps,
         None,
+        locks,
         exec,
         Vec::new(),
         Vec::new(),
@@ -1146,6 +1166,7 @@ pub async fn gitea_runner_heal(args: RunnerHealArgs, ctx: &ToolCtx) -> Result<Ru
     const TOOL: &str = "gitea.runner.heal";
     guard(TOOL, ctx)?;
     let host = LocalHost::current()?;
+    let locks = runner_locks(&host, &[&args.name], !args.dry_run)?;
     let l = host.find(&args.name).ok_or_else(|| {
         anyhow!(
             "no runner named '{}' is installed on this system",
@@ -1228,6 +1249,7 @@ pub async fn gitea_runner_heal(args: RunnerHealArgs, ctx: &ToolCtx) -> Result<Ru
         summary,
         steps,
         None,
+        locks,
         exec,
         findings,
         notes,
@@ -1286,6 +1308,7 @@ pub async fn gitea_runner_drain(args: RunnerDrainArgs, ctx: &ToolCtx) -> Result<
     const TOOL: &str = "gitea.runner.drain";
     guard(TOOL, ctx)?;
     let host = LocalHost::current()?;
+    let locks = runner_locks(&host, &[&args.name], !args.dry_run)?;
     let l = host.find(&args.name).ok_or_else(|| {
         anyhow!(
             "no runner named '{}' is installed on this system",
@@ -1329,6 +1352,7 @@ pub async fn gitea_runner_drain(args: RunnerDrainArgs, ctx: &ToolCtx) -> Result<
         ),
         steps,
         None,
+        locks,
         exec,
         Vec::new(),
         Vec::new(),
@@ -1479,6 +1503,25 @@ pub async fn gitea_runner_adopt(args: RunnerAdoptArgs, ctx: &ToolCtx) -> Result<
     }
 }
 
+fn prior_account_in_effect(
+    user: &str,
+    recorded: Option<&RunnerState>,
+    passwd: &str,
+    groups: &str,
+) -> (plan::AccountRecord, Option<u32>) {
+    let seen = account_still_applied(Some(user), recorded, passwd, groups);
+    let recorded_uid = recorded.and_then(|r| r.account_uid);
+    let local = host::local_uid(passwd, user);
+    let same = match recorded_uid {
+        Some(r) => local == Some(r),
+        None => true,
+    };
+    if seen == plan::AccountRecord::default() || !same {
+        return (plan::AccountRecord::default(), None);
+    }
+    (seen, recorded_uid)
+}
+
 fn takeover_resume(
     existing: Option<&Layout>,
     recorded: Option<&RunnerState>,
@@ -1489,7 +1532,11 @@ fn takeover_resume(
     };
     match recorded.map(|r| r.runner_id) {
         Some(Some(id)) if id == runner_id => return Ok(true),
-        Some(None) if !existing.config.exists() && !existing.runner_file.exists() => {
+        Some(None)
+            if recorded.is_some_and(|r| r.rolled_back)
+                && !existing.config.exists()
+                && !existing.runner_file.exists() =>
+        {
             return Ok(true);
         }
         _ => {}
@@ -1503,6 +1550,9 @@ fn takeover_resume(
 
 async fn adopt_in_place(tool: &str, args: &RunnerAdoptArgs, ctx: &ToolCtx) -> Result<RunnerChange> {
     let host = LocalHost::current()?;
+    let target_name = args.as_name.clone().unwrap_or_else(|| args.name.clone());
+    layout::validate_name(&target_name)?;
+    let locks = runner_locks(&host, &[&args.name, &target_name], !args.dry_run)?;
     let installs = host.discover();
     let legacy = installs
         .iter()
@@ -1518,8 +1568,6 @@ async fn adopt_in_place(tool: &str, args: &RunnerAdoptArgs, ctx: &ToolCtx) -> Re
                 )
             }
         })?;
-    let target_name = args.as_name.clone().unwrap_or_else(|| args.name.clone());
-    layout::validate_name(&target_name)?;
     if host.init != Init::Launchd {
         layout::account_for(&target_name)?;
     }
@@ -1532,7 +1580,6 @@ async fn adopt_in_place(tool: &str, args: &RunnerAdoptArgs, ctx: &ToolCtx) -> Re
     let existing = installs.iter().find(|l| l.managed && l.name == target_name);
     let prior = existing.and_then(|l| RunnerState::read(&l.state_file()));
     let resume = takeover_resume(existing, prior.as_ref(), reg.id)?;
-    let prior_account = plan::AccountRecord::from_state(prior.as_ref());
     let scope: Scope = args.scope.parse()?;
     let cfg = gitea_config(&args.endpoint).await?;
     if !api::runner_in_scope(&cfg, &scope, reg.id).await? {
@@ -1587,6 +1634,15 @@ async fn adopt_in_place(tool: &str, args: &RunnerAdoptArgs, ctx: &ToolCtx) -> Re
         force_pull,
     });
     let unit = render::render_service(&l, mode, &host.home, &path_env);
+    let (prior_account, prior_uid) = match l.user.as_deref() {
+        Some(user) if prior.is_some() => prior_account_in_effect(
+            user,
+            prior.as_ref(),
+            &read_local_db(std::path::Path::new(ETC_PASSWD))?,
+            &read_local_db(std::path::Path::new(ETC_GROUP))?,
+        ),
+        _ => (plan::AccountRecord::default(), None),
+    };
     let account = plan::account_plan(
         host.init,
         l.user.as_deref(),
@@ -1603,6 +1659,8 @@ async fn adopt_in_place(tool: &str, args: &RunnerAdoptArgs, ctx: &ToolCtx) -> Re
         pending_stale: Vec::new(),
         container_options: options.clone(),
         force_pull,
+        account_uid: prior_uid,
+        rolled_back: false,
     };
     let (legacy_state, _) = host.service_state(&legacy).await;
     let summary = format!(
@@ -1647,6 +1705,7 @@ async fn adopt_in_place(tool: &str, args: &RunnerAdoptArgs, ctx: &ToolCtx) -> Re
         summary,
         takeover.steps,
         Some(takeover.rollback),
+        locks,
         exec,
         Vec::new(),
         capacity.note.into_iter().collect(),
@@ -1661,6 +1720,7 @@ async fn adopt_moved(
     ctx: &ToolCtx,
 ) -> Result<RunnerChange> {
     let host = LocalHost::current()?;
+    let locks = runner_locks(&host, &[&args.name], !args.dry_run)?;
     let l = host.find(&args.name).ok_or_else(|| {
         anyhow!(
             "no runner named '{}' is installed on this system; install it first",
@@ -1759,6 +1819,7 @@ async fn adopt_moved(
         ),
         steps,
         None,
+        locks,
         exec,
         Vec::new(),
         notes,
@@ -1784,6 +1845,8 @@ mod tests {
             pending_stale: Vec::new(),
             container_options: None,
             force_pull: false,
+            account_uid: None,
+            rolled_back: false,
         }
     }
 
@@ -2264,6 +2327,7 @@ mod tests {
             "upgrade".into(),
             steps,
             None,
+            vec![],
             exec,
             vec![],
             vec![],
@@ -2316,6 +2380,7 @@ mod tests {
                 tolerate_failure: false,
             }],
             None,
+            vec![],
             exec,
             vec![],
             vec![],
@@ -2348,6 +2413,7 @@ mod tests {
             "s".into(),
             steps.clone(),
             None,
+            vec![],
             mk(),
             vec![],
             vec![],
@@ -2366,6 +2432,7 @@ mod tests {
             "s".into(),
             steps,
             None,
+            vec![],
             mk(),
             vec![],
             vec![],
@@ -2406,6 +2473,7 @@ mod tests {
             "s".into(),
             steps,
             Some(rollback),
+            vec![host.lock_runner("r1").unwrap()],
             exec,
             vec![],
             vec![],
@@ -2473,7 +2541,7 @@ mod tests {
     #[test]
     fn a_half_finished_takeover_of_the_same_registration_is_redone() {
         let l = Layout::managed(Init::Systemd, "baldur", std::path::Path::new("/root"));
-        let state = |id| RunnerState {
+        let state = |id: Option<i64>| RunnerState {
             scope: "instance".into(),
             version: "0.2.13".into(),
             runner_id: id,
@@ -2482,8 +2550,15 @@ mod tests {
             pending_stale: vec![],
             container_options: None,
             force_pull: false,
+            account_uid: None,
+            rolled_back: id.is_none(),
         };
         assert!(!takeover_resume(None, None, 12).unwrap());
+        let untagged = RunnerState {
+            rolled_back: false,
+            ..state(None)
+        };
+        assert!(takeover_resume(Some(&l), Some(&untagged), 12).is_err());
         assert!(takeover_resume(Some(&l), Some(&state(Some(12))), 12).unwrap());
         assert!(takeover_resume(Some(&l), Some(&state(Some(13))), 12).is_err());
         assert!(takeover_resume(Some(&l), Some(&state(None)), 12).unwrap());
@@ -2494,5 +2569,83 @@ mod tests {
         assert!(takeover_resume(Some(&configured), Some(&state(None)), 12).is_err());
         std::fs::remove_dir_all(&home).unwrap();
         assert!(takeover_resume(Some(&l), None, 12).is_err());
+    }
+
+    #[test]
+    fn earlier_account_flags_count_only_while_the_recorded_account_is_present() {
+        let rec = |uid| RunnerState {
+            scope: "instance".into(),
+            version: "0.2.13".into(),
+            runner_id: None,
+            created_account: true,
+            added_docker_group: false,
+            pending_stale: vec![],
+            container_options: None,
+            force_pull: false,
+            account_uid: uid,
+            rolled_back: true,
+        };
+        let passwd = "gitea-runner-r1:x:990:990::/:/sbin/nologin\n";
+        let created = plan::AccountRecord {
+            created: true,
+            added_docker_group: false,
+        };
+        assert_eq!(
+            prior_account_in_effect("gitea-runner-r1", Some(&rec(Some(990))), passwd, ""),
+            (created, Some(990))
+        );
+        assert_eq!(
+            prior_account_in_effect("gitea-runner-r1", Some(&rec(None)), passwd, ""),
+            (created, None)
+        );
+        assert_eq!(
+            prior_account_in_effect("gitea-runner-r1", Some(&rec(Some(991))), passwd, ""),
+            (plan::AccountRecord::default(), None)
+        );
+        assert_eq!(
+            prior_account_in_effect("gitea-runner-r1", Some(&rec(Some(990))), "", ""),
+            (plan::AccountRecord::default(), None)
+        );
+    }
+
+    #[tokio::test]
+    async fn verbs_lock_the_runner_before_deciding_and_execute_needs_the_lock() {
+        let home = std::env::temp_dir().join(format!("gitea-verb-lock-{}", std::process::id()));
+        let host = LocalHost {
+            init: Init::Launchd,
+            home: home.clone(),
+            uid: 501,
+        };
+        assert!(runner_locks(&host, &["r1"], false).unwrap().is_empty());
+        let held = runner_locks(&host, &["r1", "r1", "r2"], true).unwrap();
+        assert_eq!(held.len(), 2);
+        assert!(
+            host.lock_runner_within("r2", std::time::Duration::ZERO)
+                .is_err()
+        );
+        drop(held);
+        let exec = Executor {
+            host: &host,
+            gitea: None,
+        };
+        let err = plan_or_apply(
+            "t",
+            &upgrade_args(false),
+            true,
+            Some(&admin()),
+            "r1",
+            "s".into(),
+            vec![sh("true")],
+            None,
+            vec![],
+            exec,
+            vec![],
+            vec![],
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("without holding the lock"), "{err}");
+        std::fs::remove_dir_all(&home).unwrap();
     }
 }
