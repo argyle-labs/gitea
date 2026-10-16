@@ -37,7 +37,7 @@ path = "src/main.rs"
 # Thin profile: `delegated-http` retargets the generated client
 # onto orca's `http.request` capability (no reqwest/rustls/hyper linked); `tools`
 # (orca_tool anchors) + `db` (endpoint_resource CRUD over db_op) round it out.
-plugin-toolkit = { git = "https://github.com/argyle-labs/orca", branch = "main", default-features = false, features = ["tools", "db", "delegated-http"] }
+plugin-toolkit = { git = "https://github.com/argyle-labs/orca", branch = "main", package = "orca-plugin-toolkit", default-features = false, features = ["tools", "db", "delegated-http"] }
 
 serde       = { version = "1", features = ["derive"] }
 serde_json  = "1"
@@ -53,7 +53,7 @@ libc        = "0.2"
 tokio    = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 [build-dependencies]
-plugin-toolkit-build = { git = "https://github.com/argyle-labs/orca", branch = "main" }
+plugin-toolkit-build = { git = "https://github.com/argyle-labs/orca", branch = "main", package = "orca-plugin-toolkit-build" }
 
 # Prototype spec→orca-surface generator inputs (same as proxmox).
 syn         = { version = "2", features = ["full", "extra-traits", "parsing", "printing"] }
