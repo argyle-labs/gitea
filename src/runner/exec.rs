@@ -432,6 +432,13 @@ impl Executor<'_> {
                 write_atomic(dest, &bytes, 0o600)?;
                 Ok(Some(format!("gitea runner id {runner_id}")))
             }
+            Step::RefuseRootAccount { user } => {
+                let passwd = host::read_local_db(Path::new(host::ETC_PASSWD))?;
+                if host::local_user_has_uid0(&passwd, user) {
+                    bail!("refusing to change account {user}: it has uid 0");
+                }
+                Ok(None)
+            }
             Step::Remove { path, recursive } => {
                 let result = if *recursive {
                     // Recursive removal is confined to the managed root so a bad

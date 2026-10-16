@@ -238,6 +238,17 @@ pub fn check_instance_url(
     Ok(url.trim().trim_end_matches('/').to_string())
 }
 
+fn change_list(steps: &[Step]) -> String {
+    steps
+        .iter()
+        .map(|s| {
+            let c = s.to_change();
+            format!("{} {}", c.action, c.target)
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 /// Return the plan, or run it and report. A failed step is an error that
 /// names the step and what already ran: a partial apply must never read as
 /// success.
@@ -250,6 +261,7 @@ async fn plan_or_apply<A: Serialize>(
     runner: &str,
     summary: String,
     steps: Vec<Step>,
+    rollback: Option<plan::Rollback>,
     exec: Executor<'_>,
     findings: Vec<Finding>,
     mut notes: Vec<String>,
@@ -264,6 +276,14 @@ async fn plan_or_apply<A: Serialize>(
         }
         if steps.is_empty() {
             summary.push_str("; nothing to change");
+        }
+        if let Some(rb) = &rollback {
+            summary.push_str(&format!(
+                "; on a failure from step {} to {}, roll back: [{}]",
+                rb.armed.start() + 1,
+                rb.armed.end() + 1,
+                change_list(&rb.steps)
+            ));
         }
         let changes = steps.iter().map(Step::to_change).collect();
         return Ok(RunnerChange::Plan(
@@ -284,8 +304,35 @@ async fn plan_or_apply<A: Serialize>(
         let failed = outcomes
             .last()
             .map(|o| format!("{} {}", o.action, o.target));
+        let undo = match rollback.filter(|rb| rb.armed.contains(&(outcomes.len() - 1))) {
+            None => String::new(),
+            Some(rb) => match exec.run(&rb.steps).await {
+                (undone, None) => format!(
+                    ". Rolled back: [{}]",
+                    undone
+                        .iter()
+                        .map(|o| format!("{} {}", o.action, o.target))
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                ),
+                (undone, Some(re)) => format!(
+                    ". ROLLBACK FAILED at `{}`: {re:#}; rolled back only: [{}]; not done: [{}]",
+                    undone
+                        .last()
+                        .map(|o| format!("{} {}", o.action, o.target))
+                        .unwrap_or_default(),
+                    undone
+                        .iter()
+                        .filter(|o| o.ok)
+                        .map(|o| format!("{} {}", o.action, o.target))
+                        .collect::<Vec<_>>()
+                        .join("; "),
+                    change_list(&rb.steps[undone.len()..])
+                ),
+            },
+        };
         bail!(
-            "{tool} failed at `{}`: {e:#}. Already applied: [{}]",
+            "{tool} failed at `{}`: {e:#}. Already applied: [{}]{undo}",
             failed.unwrap_or_default(),
             done.join("; ")
         );
@@ -836,6 +883,7 @@ pub async fn gitea_runner_install(args: RunnerInstallArgs, ctx: &ToolCtx) -> Res
         &args.name,
         summary,
         steps,
+        None,
         exec,
         Vec::new(),
         notes,
@@ -936,6 +984,7 @@ pub async fn gitea_runner_uninstall(
         &args.name,
         format!("uninstall runner '{}'", args.name),
         steps,
+        None,
         exec,
         Vec::new(),
         notes,
@@ -1051,6 +1100,7 @@ pub async fn gitea_runner_upgrade(args: RunnerUpgradeArgs, ctx: &ToolCtx) -> Res
         &args.name,
         summary,
         steps,
+        None,
         exec,
         Vec::new(),
         Vec::new(),
@@ -1177,6 +1227,7 @@ pub async fn gitea_runner_heal(args: RunnerHealArgs, ctx: &ToolCtx) -> Result<Ru
         &args.name,
         summary,
         steps,
+        None,
         exec,
         findings,
         notes,
@@ -1277,6 +1328,7 @@ pub async fn gitea_runner_drain(args: RunnerDrainArgs, ctx: &ToolCtx) -> Result<
             l.runner_file.display()
         ),
         steps,
+        None,
         exec,
         Vec::new(),
         Vec::new(),
@@ -1427,27 +1479,49 @@ pub async fn gitea_runner_adopt(args: RunnerAdoptArgs, ctx: &ToolCtx) -> Result<
     }
 }
 
+fn takeover_resume(
+    existing: Option<&Layout>,
+    recorded: Option<&RunnerState>,
+    runner_id: i64,
+) -> Result<bool> {
+    let Some(existing) = existing else {
+        return Ok(false);
+    };
+    match recorded.map(|r| r.runner_id) {
+        Some(Some(id)) if id == runner_id => return Ok(true),
+        Some(None) if !existing.config.exists() && !existing.runner_file.exists() => {
+            return Ok(true);
+        }
+        _ => {}
+    }
+    bail!(
+        "a managed runner '{}' already exists at {}; pass a different as_name",
+        existing.name,
+        existing.dir.display()
+    )
+}
+
 async fn adopt_in_place(tool: &str, args: &RunnerAdoptArgs, ctx: &ToolCtx) -> Result<RunnerChange> {
     let host = LocalHost::current()?;
-    let legacy = host.find(&args.name).ok_or_else(|| {
-        anyhow!(
-            "no runner named '{}' is installed on this system",
-            args.name
-        )
-    })?;
-    if legacy.managed {
-        bail!("runner '{}' is already managed by this plugin", args.name);
-    }
+    let installs = host.discover();
+    let legacy = installs
+        .iter()
+        .find(|l| !l.managed && l.name == args.name)
+        .cloned()
+        .ok_or_else(|| {
+            if installs.iter().any(|l| l.managed && l.name == args.name) {
+                anyhow!("runner '{}' is already managed by this plugin", args.name)
+            } else {
+                anyhow!(
+                    "no runner named '{}' is installed on this system",
+                    args.name
+                )
+            }
+        })?;
     let target_name = args.as_name.clone().unwrap_or_else(|| args.name.clone());
     layout::validate_name(&target_name)?;
     if host.init != Init::Launchd {
         layout::account_for(&target_name)?;
-    }
-    if let Some(existing) = host.find(&target_name).filter(|l| l.managed) {
-        bail!(
-            "a managed runner '{target_name}' already exists at {}; pass a different as_name",
-            existing.dir.display()
-        );
     }
     let reg = host::read_registration(&legacy.runner_file).ok_or_else(|| {
         anyhow!(
@@ -1455,6 +1529,10 @@ async fn adopt_in_place(tool: &str, args: &RunnerAdoptArgs, ctx: &ToolCtx) -> Re
             legacy.runner_file.display()
         )
     })?;
+    let existing = installs.iter().find(|l| l.managed && l.name == target_name);
+    let prior = existing.and_then(|l| RunnerState::read(&l.state_file()));
+    let resume = takeover_resume(existing, prior.as_ref(), reg.id)?;
+    let prior_account = plan::AccountRecord::from_state(prior.as_ref());
     let scope: Scope = args.scope.parse()?;
     let cfg = gitea_config(&args.endpoint).await?;
     if !api::runner_in_scope(&cfg, &scope, reg.id).await? {
@@ -1520,8 +1598,8 @@ async fn adopt_in_place(tool: &str, args: &RunnerAdoptArgs, ctx: &ToolCtx) -> Re
         scope: scope.label(),
         version: artifact.version.clone(),
         runner_id: Some(reg.id),
-        created_account: account.record.created,
-        added_docker_group: account.record.added_docker_group,
+        created_account: account.record.created || prior_account.created,
+        added_docker_group: account.record.added_docker_group || prior_account.added_docker_group,
         pending_stale: Vec::new(),
         container_options: options.clone(),
         force_pull,
@@ -1542,7 +1620,7 @@ async fn adopt_in_place(tool: &str, args: &RunnerAdoptArgs, ctx: &ToolCtx) -> Re
             .unwrap_or_default(),
         legacy.service
     );
-    let steps = plan::takeover_steps(&plan::TakeoverSpec {
+    let takeover = plan::takeover_steps(&plan::TakeoverSpec {
         layout: &l,
         legacy: &legacy,
         legacy_state,
@@ -1553,6 +1631,8 @@ async fn adopt_in_place(tool: &str, args: &RunnerAdoptArgs, ctx: &ToolCtx) -> Re
         state,
         account,
         timeout_secs: args.timeout_secs,
+        resume,
+        prior_account,
     })?;
     let exec = Executor {
         host: &host,
@@ -1565,7 +1645,8 @@ async fn adopt_in_place(tool: &str, args: &RunnerAdoptArgs, ctx: &ToolCtx) -> Re
         ctx.caller().as_ref(),
         &target_name,
         summary,
-        steps,
+        takeover.steps,
+        Some(takeover.rollback),
         exec,
         Vec::new(),
         capacity.note.into_iter().collect(),
@@ -1677,6 +1758,7 @@ async fn adopt_moved(
                 .join(", ")
         ),
         steps,
+        None,
         exec,
         Vec::new(),
         notes,
@@ -2181,6 +2263,7 @@ mod tests {
             "r1",
             "upgrade".into(),
             steps,
+            None,
             exec,
             vec![],
             vec![],
@@ -2232,6 +2315,7 @@ mod tests {
                 argv: vec!["false".into()],
                 tolerate_failure: false,
             }],
+            None,
             exec,
             vec![],
             vec![],
@@ -2263,6 +2347,7 @@ mod tests {
             "r1",
             "s".into(),
             steps.clone(),
+            None,
             mk(),
             vec![],
             vec![],
@@ -2280,6 +2365,7 @@ mod tests {
             "r1",
             "s".into(),
             steps,
+            None,
             mk(),
             vec![],
             vec![],
@@ -2288,5 +2374,125 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("refusing to execute"), "{err}");
+    }
+
+    fn sh(cmd: &str) -> Step {
+        Step::Run {
+            argv: vec![cmd.into()],
+            tolerate_failure: false,
+        }
+    }
+
+    async fn apply_with_rollback(
+        home: &std::path::Path,
+        steps: Vec<Step>,
+        rollback: plan::Rollback,
+    ) -> String {
+        let host = LocalHost {
+            init: Init::Launchd,
+            home: home.to_path_buf(),
+            uid: 501,
+        };
+        let exec = Executor {
+            host: &host,
+            gitea: None,
+        };
+        plan_or_apply(
+            "gitea.runner.adopt",
+            &upgrade_args(false),
+            true,
+            Some(&admin()),
+            "r1",
+            "s".into(),
+            steps,
+            Some(rollback),
+            exec,
+            vec![],
+            vec![],
+        )
+        .await
+        .unwrap_err()
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn a_failure_mid_takeover_runs_the_rollback_and_reports_it() {
+        let home = std::env::temp_dir().join(format!("gitea-rollback-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        let copied = home.join(".runner");
+        std::fs::write(&copied, "{}").unwrap();
+        let rollback = |steps| plan::Rollback {
+            armed: 1..=2,
+            steps,
+        };
+        let undo = vec![
+            Step::Remove {
+                path: copied.clone(),
+                recursive: false,
+            },
+            sh("true"),
+        ];
+        let err = apply_with_rollback(
+            &home,
+            vec![sh("true"), sh("false"), sh("true")],
+            rollback(undo.clone()),
+        )
+        .await;
+        assert!(err.contains("Rolled back: [remove-file"), "{err}");
+        assert!(!copied.exists());
+
+        std::fs::write(&copied, "{}").unwrap();
+        let err = apply_with_rollback(&home, vec![sh("false")], rollback(undo)).await;
+        assert!(!err.contains("Rolled back"), "{err}");
+        assert!(
+            copied.exists(),
+            "a failure before the armed range keeps everything"
+        );
+
+        let err = apply_with_rollback(
+            &home,
+            vec![sh("true"), sh("true"), sh("false")],
+            rollback(vec![
+                sh("false"),
+                Step::Remove {
+                    path: copied.clone(),
+                    recursive: false,
+                },
+            ]),
+        )
+        .await;
+        assert!(err.contains("ROLLBACK FAILED at `run false`"), "{err}");
+        assert!(
+            err.contains(&format!("not done: [remove-file {}]", copied.display())),
+            "{err}"
+        );
+        assert!(copied.exists());
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
+    fn a_half_finished_takeover_of_the_same_registration_is_redone() {
+        let l = Layout::managed(Init::Systemd, "baldur", std::path::Path::new("/root"));
+        let state = |id| RunnerState {
+            scope: "instance".into(),
+            version: "0.2.13".into(),
+            runner_id: id,
+            created_account: false,
+            added_docker_group: false,
+            pending_stale: vec![],
+            container_options: None,
+            force_pull: false,
+        };
+        assert!(!takeover_resume(None, None, 12).unwrap());
+        assert!(takeover_resume(Some(&l), Some(&state(Some(12))), 12).unwrap());
+        assert!(takeover_resume(Some(&l), Some(&state(Some(13))), 12).is_err());
+        assert!(takeover_resume(Some(&l), Some(&state(None)), 12).unwrap());
+        let home = std::env::temp_dir().join(format!("gitea-resume-{}", std::process::id()));
+        let configured = Layout::managed(Init::Launchd, "baldur", &home);
+        std::fs::create_dir_all(&configured.dir).unwrap();
+        std::fs::write(&configured.config, "").unwrap();
+        assert!(takeover_resume(Some(&configured), Some(&state(None)), 12).is_err());
+        std::fs::remove_dir_all(&home).unwrap();
+        assert!(takeover_resume(Some(&l), None, 12).is_err());
     }
 }
