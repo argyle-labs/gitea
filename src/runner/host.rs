@@ -153,6 +153,38 @@ impl LocalHost {
         found
     }
 
+    pub fn lock_runner(&self, name: &str) -> Result<std::fs::File> {
+        use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+        let dir = managed_root(self.init, &self.home).join(".orca");
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&dir)
+            .with_context(|| format!("create {}", dir.display()))?;
+        let path = dir.join(format!("{name}.lock"));
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)
+            .with_context(|| format!("open {}", path.display()))?;
+        match file.try_lock() {
+            Ok(()) => Ok(file),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                bail!(
+                    "another gitea.runner verb holds runner '{name}' ({})",
+                    path.display()
+                )
+            }
+            Err(std::fs::TryLockError::Error(e)) => {
+                Err(e).with_context(|| format!("lock {}", path.display()))
+            }
+        }
+    }
+
     /// Find the install for runner `name`.
     pub fn find(&self, name: &str) -> Option<Layout> {
         self.discover().into_iter().find(|l| l.name == name)
@@ -500,8 +532,28 @@ pub fn local_user_exists(passwd: &str, user: &str) -> bool {
     local_entries(passwd, user).next().is_some()
 }
 
-pub fn local_user_has_uid0(passwd: &str, user: &str) -> bool {
-    local_entries(passwd, user).any(|f| f.get(2).is_none_or(|uid| uid.trim() == "0"))
+pub fn local_uid(passwd: &str, user: &str) -> Option<u32> {
+    let mut entries = local_entries(passwd, user);
+    let only = entries.next()?;
+    if entries.next().is_some() {
+        return None;
+    }
+    only.get(2)?.parse::<u32>().ok()
+}
+
+pub fn account_removable(passwd: &str, user: &str, recorded: Option<u32>) -> Result<u32> {
+    let uid = local_uid(passwd, user).ok_or_else(|| {
+        anyhow!("refusing to change account {user}: not exactly one well-formed passwd entry")
+    })?;
+    if uid == 0 {
+        bail!("refusing to change account {user}: it has uid 0");
+    }
+    if let Some(r) = recorded
+        && r != uid
+    {
+        bail!("refusing to change account {user}: uid {uid} is not the recorded uid {r}");
+    }
+    Ok(uid)
 }
 
 /// Whether `/etc/group`-format `groups` lists `user` as a member of `group`:
@@ -547,6 +599,19 @@ pub fn parse_launchctl_print(out: &str) -> (ServiceState, Option<String>) {
         }
     }
     (state, spawn)
+}
+
+pub fn parse_launchctl_pid(out: &str) -> Option<i32> {
+    out.lines()
+        .filter(|l| l.len() - l.trim_start().len() <= 1)
+        .find_map(|l| l.trim().strip_prefix("pid = "))
+        .and_then(|v| v.trim().parse().ok())
+        .filter(|&p: &i32| p > 0)
+}
+
+pub fn pid_gone(pid: i32) -> bool {
+    let r = unsafe { libc::kill(pid, 0) };
+    r != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
 }
 
 pub fn parse_systemctl_active(out: &str) -> ServiceState {
@@ -827,11 +892,48 @@ mod tests {
     }
 
     #[test]
-    fn uid0_is_detected_by_the_passwd_entry() {
-        let passwd = "root:x:0:0::/root:/bin/sh\nevil:x:0:0::/:/bin/sh\nrunner:x:990:990::/:/sbin/nologin\nbroken:x\n";
-        assert!(local_user_has_uid0(passwd, "evil"));
-        assert!(local_user_has_uid0(passwd, "broken"));
-        assert!(!local_user_has_uid0(passwd, "runner"));
-        assert!(!local_user_has_uid0(passwd, "absent"));
+    fn account_changes_need_one_entry_with_the_recorded_non_zero_uid() {
+        let passwd = "root:x:0:0::/root:/bin/sh\nevil:x:0:0::/:/bin/sh\nrunner:x:990:990::/:/sbin/nologin\ntwice:x:991:1::/:/bin/sh\ntwice:x:992:1::/:/bin/sh\nbroken:x\nodd:x:-5:1::/:/bin/sh\n";
+        assert!(account_removable(passwd, "evil", None).is_err());
+        assert!(account_removable(passwd, "root", Some(0)).is_err());
+        assert!(account_removable(passwd, "broken", None).is_err());
+        assert!(account_removable(passwd, "odd", None).is_err());
+        assert!(account_removable(passwd, "twice", None).is_err());
+        assert!(account_removable(passwd, "absent", None).is_err());
+        assert_eq!(account_removable(passwd, "runner", None).unwrap(), 990);
+        assert_eq!(account_removable(passwd, "runner", Some(990)).unwrap(), 990);
+        assert!(account_removable(passwd, "runner", Some(1001)).is_err());
+    }
+
+    #[test]
+    fn launchctl_pid_is_read_from_the_top_level() {
+        let out = "gui/501/x = {\n\tstate = running\n\tpid = 4242\n\tendpoints = {\n\t\tpid = 7\n\t}\n}\n";
+        assert_eq!(parse_launchctl_pid(out), Some(4242));
+        assert_eq!(
+            parse_launchctl_pid("gui/501/x = {\n\tstate = not running\n}\n"),
+            None
+        );
+        assert!(!pid_gone(std::process::id() as i32));
+    }
+
+    #[test]
+    fn a_runner_lock_excludes_a_second_holder_until_dropped() {
+        let home = std::env::temp_dir().join(format!("gitea-lock-{}", std::process::id()));
+        let host = LocalHost {
+            init: Init::Launchd,
+            home: home.clone(),
+            uid: 501,
+        };
+        let held = host.lock_runner("r1").unwrap();
+        let err = host.lock_runner("r1").unwrap_err().to_string();
+        assert!(
+            err.contains("another gitea.runner verb holds runner 'r1'"),
+            "{err}"
+        );
+        let other = host.lock_runner("r2").unwrap();
+        drop(held);
+        drop(other);
+        host.lock_runner("r1").unwrap();
+        std::fs::remove_dir_all(&home).unwrap();
     }
 }

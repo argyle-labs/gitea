@@ -136,7 +136,7 @@ fn resource_value_ok(flag: &str, v: &str) -> bool {
             let n = v
                 .strip_suffix(|c: char| matches!(c, 'b' | 'k' | 'm' | 'g' | 'B' | 'K' | 'M' | 'G'))
                 .unwrap_or(v);
-            all_digits(n)
+            all_digits(n) && n.parse::<u64>().is_ok_and(|v| v >= 1)
         }
         _ => false,
     }
@@ -613,6 +613,13 @@ mod tests {
             "--memory-swap=-1g",
             "--shm-size=-1",
             "--shm-size=0x10",
+            "--memory=0",
+            "--memory=0g",
+            "--memory=000m",
+            "--memory-swap=0",
+            "--memory-swap=0k",
+            "--shm-size=0",
+            "--shm-size=0b",
         ] {
             assert!(validate_container_options(bad).is_err(), "accepted {bad:?}");
         }

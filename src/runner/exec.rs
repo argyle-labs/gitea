@@ -7,7 +7,7 @@ use plugin_toolkit::prelude::*;
 use super::api;
 use super::health::ServiceState;
 use super::host::{self, LocalHost};
-use super::layout::managed_root;
+use super::layout::{Init, managed_root};
 use super::plan::{AccountRecord, RunnerState, Scope, Step};
 use super::release;
 use crate::Config;
@@ -204,7 +204,11 @@ impl Executor<'_> {
             .ok_or_else(|| anyhow!("this step needs a Gitea endpoint (pass `endpoint`)"))
     }
 
-    async fn step(&self, step: &Step) -> Result<Option<String>> {
+    async fn step(
+        &self,
+        step: &Step,
+        pids: &mut std::collections::HashMap<String, i32>,
+    ) -> Result<Option<String>> {
         match step {
             Step::CreateDir { path, mode } => {
                 create_dir_mode(path, *mode)?;
@@ -272,6 +276,7 @@ impl Executor<'_> {
                     })?;
                     state.created_account = disk.created_account;
                     state.added_docker_group = disk.added_docker_group;
+                    state.account_uid = disk.account_uid;
                 }
                 if let Some(rf) = runner_file {
                     state.runner_id = Some(
@@ -304,6 +309,13 @@ impl Executor<'_> {
                 );
                 state.created_account = record.created;
                 state.added_docker_group = record.added_docker_group;
+                if record.created || record.added_docker_group {
+                    state.account_uid = state.account_uid.or_else(|| {
+                        host::read_local_db(Path::new(host::ETC_PASSWD))
+                            .ok()
+                            .and_then(|p| host::local_uid(&p, user))
+                    });
+                }
                 write_atomic(path, state.to_json().as_bytes(), 0o600)?;
                 Ok(Some(format!(
                     "created account {}, added docker group {}",
@@ -402,8 +414,24 @@ impl Executor<'_> {
                 // systemd reports `deactivating` while the stop is in flight; an
                 // Unknown state gets the same grace before failing.
                 let deadline = std::time::Instant::now() + STOP_GRACE;
+                let pid = pids.get(&layout.service).copied();
                 loop {
-                    match self.host.service_state(layout).await.0 {
+                    let state = self.host.service_state(layout).await.0;
+                    let launchd_alive = layout.init == Init::Launchd
+                        && (state != ServiceState::NotLoaded
+                            || pid.is_some_and(|p| !host::pid_gone(p)));
+                    if launchd_alive {
+                        if std::time::Instant::now() >= deadline {
+                            bail!(
+                                "{} is still {state:?}{} after stopping it",
+                                layout.service,
+                                pid.map(|p| format!(" (pid {p})")).unwrap_or_default()
+                            )
+                        }
+                        tokio::time::sleep(STOP_POLL).await;
+                        continue;
+                    }
+                    match state {
                         state @ (ServiceState::Running | ServiceState::Unknown) => {
                             if std::time::Instant::now() >= deadline {
                                 bail!("{} is still {state:?} after stopping it", layout.service)
@@ -432,11 +460,43 @@ impl Executor<'_> {
                 write_atomic(dest, &bytes, 0o600)?;
                 Ok(Some(format!("gitea runner id {runner_id}")))
             }
-            Step::RefuseRootAccount { user } => {
-                let passwd = host::read_local_db(Path::new(host::ETC_PASSWD))?;
-                if host::local_user_has_uid0(&passwd, user) {
-                    bail!("refusing to change account {user}: it has uid 0");
+            Step::VerifyAccount { user, state } => {
+                let recorded = RunnerState::read(state).and_then(|s| s.account_uid);
+                let uid = host::account_removable(
+                    &host::read_local_db(Path::new(host::ETC_PASSWD))?,
+                    user,
+                    recorded,
+                )?;
+                Ok(Some(format!("uid {uid}")))
+            }
+            Step::CapturePid { layout } => {
+                let out = self
+                    .host
+                    .run(
+                        &[
+                            "launchctl".into(),
+                            "print".into(),
+                            layout.launchd_target(self.host.uid),
+                        ],
+                        None,
+                    )
+                    .await?;
+                match out
+                    .ok
+                    .then(|| host::parse_launchctl_pid(&out.stdout))
+                    .flatten()
+                {
+                    Some(pid) => {
+                        pids.insert(layout.service.clone(), pid);
+                        Ok(Some(format!("pid {pid}")))
+                    }
+                    None => Ok(Some("no running process".to_string())),
                 }
+            }
+            Step::RecordRolledBack { path, state } => {
+                let mut state = state.clone();
+                state.account_uid = RunnerState::read(path).and_then(|d| d.account_uid);
+                write_atomic(path, state.to_json().as_bytes(), 0o600)?;
                 Ok(None)
             }
             Step::Remove { path, recursive } => {
@@ -473,9 +533,10 @@ impl Executor<'_> {
     pub async fn run(&self, steps: &[Step]) -> (Vec<StepOutcome>, Option<anyhow::Error>) {
         let mut outcomes = Vec::new();
         let mut held: Option<(i64, &Scope)> = None;
+        let mut pids = std::collections::HashMap::new();
         for step in steps {
             let change = step.to_change();
-            match self.step(step).await {
+            match self.step(step, &mut pids).await {
                 Ok(detail) => {
                     if let Step::SetDisabled {
                         runner_id,
@@ -637,6 +698,8 @@ mod tests {
             pending_stale: Vec::new(),
             container_options: None,
             force_pull: false,
+            account_uid: None,
+            rolled_back: false,
         };
         write_atomic(&path, state.to_json().as_bytes(), 0o600).unwrap();
         let (_, err) = exec
@@ -676,6 +739,8 @@ mod tests {
             pending_stale: Vec::new(),
             container_options: None,
             force_pull: false,
+            account_uid: None,
+            rolled_back: false,
         };
         let (_, err) = exec
             .run(&[
@@ -729,6 +794,8 @@ mod tests {
                     pending_stale: Vec::new(),
                     container_options: None,
                     force_pull: false,
+                    account_uid: None,
+                    rolled_back: false,
                 },
                 runner_file: Some(runner_file),
             }])
@@ -1068,5 +1135,53 @@ mod tests {
         assert!(via_dir.unwrap().contains("not a regular file"));
         assert!(via_fifo.unwrap().contains("not a regular file"));
         assert!(!written);
+    }
+
+    #[tokio::test]
+    async fn a_rolled_back_record_keeps_the_account_uid_and_root_is_never_removable() {
+        let home = scratch("rolledback");
+        let host = test_host(&home);
+        let exec = Executor {
+            host: &host,
+            gitea: None,
+        };
+        let path = home.join("r1.json");
+        let base = RunnerState {
+            scope: "instance".into(),
+            version: "0.2.13".into(),
+            runner_id: Some(12),
+            created_account: true,
+            added_docker_group: false,
+            pending_stale: vec![],
+            container_options: Some("--cpus=8".into()),
+            force_pull: false,
+            account_uid: Some(990),
+            rolled_back: false,
+        };
+        write_atomic(&path, base.to_json().as_bytes(), 0o600).unwrap();
+        let narrowed = RunnerState {
+            runner_id: None,
+            container_options: None,
+            account_uid: None,
+            rolled_back: true,
+            ..base
+        };
+        let (_, err) = exec
+            .run(&[
+                Step::RecordRolledBack {
+                    path: path.clone(),
+                    state: narrowed,
+                },
+                Step::VerifyAccount {
+                    user: "root".into(),
+                    state: path.clone(),
+                },
+            ])
+            .await;
+        let disk = RunnerState::read(&path).unwrap();
+        assert_eq!(disk.account_uid, Some(990));
+        assert!(disk.rolled_back && disk.runner_id.is_none() && disk.created_account);
+        assert!(format!("{:#}", err.unwrap()).contains("refusing to change account root"));
+        std::fs::remove_dir_all(&home).unwrap();
     }
 }

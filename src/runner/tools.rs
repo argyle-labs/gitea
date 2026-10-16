@@ -294,6 +294,7 @@ async fn plan_or_apply<A: Serialize>(
     if let Some(why) = blocker {
         bail!("{tool}: refusing to execute: {why}");
     }
+    let _lock = exec.host.lock_runner(runner)?;
     let (outcomes, err) = exec.run(&steps).await;
     if let Some(e) = err {
         let done: Vec<String> = outcomes
@@ -1479,6 +1480,25 @@ pub async fn gitea_runner_adopt(args: RunnerAdoptArgs, ctx: &ToolCtx) -> Result<
     }
 }
 
+fn prior_account_in_effect(
+    user: &str,
+    recorded: Option<&RunnerState>,
+    passwd: &str,
+    groups: &str,
+) -> (plan::AccountRecord, Option<u32>) {
+    let seen = account_still_applied(Some(user), recorded, passwd, groups);
+    let recorded_uid = recorded.and_then(|r| r.account_uid);
+    let local = host::local_uid(passwd, user);
+    let same = match recorded_uid {
+        Some(r) => local == Some(r),
+        None => true,
+    };
+    if seen == plan::AccountRecord::default() || !same {
+        return (plan::AccountRecord::default(), None);
+    }
+    (seen, recorded_uid)
+}
+
 fn takeover_resume(
     existing: Option<&Layout>,
     recorded: Option<&RunnerState>,
@@ -1489,7 +1509,11 @@ fn takeover_resume(
     };
     match recorded.map(|r| r.runner_id) {
         Some(Some(id)) if id == runner_id => return Ok(true),
-        Some(None) if !existing.config.exists() && !existing.runner_file.exists() => {
+        Some(None)
+            if recorded.is_some_and(|r| r.rolled_back)
+                && !existing.config.exists()
+                && !existing.runner_file.exists() =>
+        {
             return Ok(true);
         }
         _ => {}
@@ -1532,7 +1556,6 @@ async fn adopt_in_place(tool: &str, args: &RunnerAdoptArgs, ctx: &ToolCtx) -> Re
     let existing = installs.iter().find(|l| l.managed && l.name == target_name);
     let prior = existing.and_then(|l| RunnerState::read(&l.state_file()));
     let resume = takeover_resume(existing, prior.as_ref(), reg.id)?;
-    let prior_account = plan::AccountRecord::from_state(prior.as_ref());
     let scope: Scope = args.scope.parse()?;
     let cfg = gitea_config(&args.endpoint).await?;
     if !api::runner_in_scope(&cfg, &scope, reg.id).await? {
@@ -1587,6 +1610,15 @@ async fn adopt_in_place(tool: &str, args: &RunnerAdoptArgs, ctx: &ToolCtx) -> Re
         force_pull,
     });
     let unit = render::render_service(&l, mode, &host.home, &path_env);
+    let (prior_account, prior_uid) = match l.user.as_deref() {
+        Some(user) if prior.is_some() => prior_account_in_effect(
+            user,
+            prior.as_ref(),
+            &read_local_db(std::path::Path::new(ETC_PASSWD))?,
+            &read_local_db(std::path::Path::new(ETC_GROUP))?,
+        ),
+        _ => (plan::AccountRecord::default(), None),
+    };
     let account = plan::account_plan(
         host.init,
         l.user.as_deref(),
@@ -1603,6 +1635,8 @@ async fn adopt_in_place(tool: &str, args: &RunnerAdoptArgs, ctx: &ToolCtx) -> Re
         pending_stale: Vec::new(),
         container_options: options.clone(),
         force_pull,
+        account_uid: prior_uid,
+        rolled_back: false,
     };
     let (legacy_state, _) = host.service_state(&legacy).await;
     let summary = format!(
@@ -1784,6 +1818,8 @@ mod tests {
             pending_stale: Vec::new(),
             container_options: None,
             force_pull: false,
+            account_uid: None,
+            rolled_back: false,
         }
     }
 
@@ -2473,7 +2509,7 @@ mod tests {
     #[test]
     fn a_half_finished_takeover_of_the_same_registration_is_redone() {
         let l = Layout::managed(Init::Systemd, "baldur", std::path::Path::new("/root"));
-        let state = |id| RunnerState {
+        let state = |id: Option<i64>| RunnerState {
             scope: "instance".into(),
             version: "0.2.13".into(),
             runner_id: id,
@@ -2482,8 +2518,15 @@ mod tests {
             pending_stale: vec![],
             container_options: None,
             force_pull: false,
+            account_uid: None,
+            rolled_back: id.is_none(),
         };
         assert!(!takeover_resume(None, None, 12).unwrap());
+        let untagged = RunnerState {
+            rolled_back: false,
+            ..state(None)
+        };
+        assert!(takeover_resume(Some(&l), Some(&untagged), 12).is_err());
         assert!(takeover_resume(Some(&l), Some(&state(Some(12))), 12).unwrap());
         assert!(takeover_resume(Some(&l), Some(&state(Some(13))), 12).is_err());
         assert!(takeover_resume(Some(&l), Some(&state(None)), 12).unwrap());
@@ -2494,5 +2537,42 @@ mod tests {
         assert!(takeover_resume(Some(&configured), Some(&state(None)), 12).is_err());
         std::fs::remove_dir_all(&home).unwrap();
         assert!(takeover_resume(Some(&l), None, 12).is_err());
+    }
+
+    #[test]
+    fn earlier_account_flags_count_only_while_the_recorded_account_is_present() {
+        let rec = |uid| RunnerState {
+            scope: "instance".into(),
+            version: "0.2.13".into(),
+            runner_id: None,
+            created_account: true,
+            added_docker_group: false,
+            pending_stale: vec![],
+            container_options: None,
+            force_pull: false,
+            account_uid: uid,
+            rolled_back: true,
+        };
+        let passwd = "gitea-runner-r1:x:990:990::/:/sbin/nologin\n";
+        let created = plan::AccountRecord {
+            created: true,
+            added_docker_group: false,
+        };
+        assert_eq!(
+            prior_account_in_effect("gitea-runner-r1", Some(&rec(Some(990))), passwd, ""),
+            (created, Some(990))
+        );
+        assert_eq!(
+            prior_account_in_effect("gitea-runner-r1", Some(&rec(None)), passwd, ""),
+            (created, None)
+        );
+        assert_eq!(
+            prior_account_in_effect("gitea-runner-r1", Some(&rec(Some(991))), passwd, ""),
+            (plan::AccountRecord::default(), None)
+        );
+        assert_eq!(
+            prior_account_in_effect("gitea-runner-r1", Some(&rec(Some(990))), "", ""),
+            (plan::AccountRecord::default(), None)
+        );
     }
 }

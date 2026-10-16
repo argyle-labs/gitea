@@ -107,6 +107,10 @@ pub struct RunnerState {
     pub container_options: Option<String>,
     #[serde(default)]
     pub force_pull: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_uid: Option<u32>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub rolled_back: bool,
 }
 
 /// A Gitea runner record to delete, with the scope it lives under.
@@ -262,8 +266,16 @@ pub enum Step {
         dest: PathBuf,
         runner_id: i64,
     },
-    RefuseRootAccount {
+    VerifyAccount {
         user: String,
+        state: PathBuf,
+    },
+    CapturePid {
+        layout: Box<Layout>,
+    },
+    RecordRolledBack {
+        path: PathBuf,
+        state: RunnerState,
     },
 }
 
@@ -423,9 +435,20 @@ impl Step {
                     "copy {} (mode 600); refused unless it holds runner id {runner_id}",
                     src.display()
                 )),
-            Step::RefuseRootAccount { user } => {
-                PlannedChange::new(format!("account {user}"), "refuse-root")
-                    .with_detail("gate: fail if /etc/passwd gives it uid 0")
+            Step::VerifyAccount { user, .. } => {
+                PlannedChange::new(format!("account {user}"), "verify-account").with_detail(
+                    "gate: exactly one passwd entry, non-zero uid, matching the recorded uid",
+                )
+            }
+            Step::CapturePid { layout } => {
+                PlannedChange::new(layout.service.clone(), "capture-pid")
+            }
+            Step::RecordRolledBack { state, .. } => {
+                PlannedChange::new("orca runner state".to_string(), "record-rolled-back")
+                    .with_detail(format!(
+                        "account flags only: created account {}, added docker group {}",
+                        state.created_account, state.added_docker_group
+                    ))
             }
         }
     }
@@ -721,6 +744,8 @@ pub fn install_steps(spec: &InstallSpec<'_>) -> Vec<Step> {
         pending_stale: Vec::new(),
         container_options: spec.container_options.clone(),
         force_pull: spec.force_pull,
+        account_uid: None,
+        rolled_back: false,
     };
     // Recorded before the account is touched (the state file lives outside
     // the install dir), so an install that fails later still leaves uninstall
@@ -857,6 +882,12 @@ pub fn uninstall_steps(
     // Account changes precede the removals, and the state file goes last: a
     // failed revoke or userdel stops here with the record intact to retry.
     if let Some(user) = &layout.user {
+        if (!keep_files && account.created) || (account.added_docker_group && !account.created) {
+            steps.push(Step::VerifyAccount {
+                user: user.clone(),
+                state: layout.state_file(),
+            });
+        }
         if !keep_files && account.created {
             steps.extend(user_removal_steps(layout.init, user));
         }
@@ -1096,26 +1127,10 @@ pub fn takeover_steps(spec: &TakeoverSpec<'_>) -> Result<Takeover> {
         },
     ]);
     if spec.resume {
-        steps.extend(service_steps(
-            l,
-            ServiceOp::Unload,
-            spec.uid,
-            ServiceState::Unknown,
-        ));
-        steps.push(Step::VerifyStopped {
-            layout: Box::new(l.clone()),
-        });
+        steps.extend(stop_steps(l, spec.uid, ServiceState::Unknown));
     }
     let armed_from = steps.len();
-    steps.extend(service_steps(
-        legacy,
-        ServiceOp::Unload,
-        spec.uid,
-        spec.legacy_state,
-    ));
-    steps.push(Step::VerifyStopped {
-        layout: Box::new(legacy.clone()),
-    });
+    steps.extend(stop_steps(legacy, spec.uid, spec.legacy_state));
     steps.push(Step::InstallRegistration {
         src: legacy.runner_file.clone(),
         dest: l.runner_file.clone(),
@@ -1174,10 +1189,7 @@ pub fn takeover_steps(spec: &TakeoverSpec<'_>) -> Result<Takeover> {
 
 fn takeover_rollback(spec: &TakeoverSpec<'_>) -> Vec<Step> {
     let l = spec.layout;
-    let mut steps = service_steps(l, ServiceOp::Unload, spec.uid, ServiceState::Unknown);
-    steps.push(Step::VerifyStopped {
-        layout: Box::new(l.clone()),
-    });
+    let mut steps = stop_steps(l, spec.uid, ServiceState::Unknown);
     steps.extend([
         Step::Remove {
             path: l.unit_path.clone(),
@@ -1192,47 +1204,91 @@ fn takeover_rollback(spec: &TakeoverSpec<'_>) -> Vec<Step> {
             recursive: true,
         },
     ]);
+    let made = match &l.user {
+        Some(_) => spec.account.record,
+        None => AccountRecord::default(),
+    };
     let prior = spec.prior_account;
-    steps.push(if prior.created || prior.added_docker_group {
-        Step::RecordState {
-            path: l.state_file(),
-            state: RunnerState {
-                runner_id: None,
-                created_account: prior.created,
-                added_docker_group: prior.added_docker_group,
-                pending_stale: Vec::new(),
-                container_options: None,
-                force_pull: false,
-                ..spec.state.clone()
-            },
-            runner_file: None,
-        }
-    } else {
-        Step::Remove {
-            path: l.state_file(),
-            recursive: false,
-        }
-    });
+    let both = AccountRecord {
+        created: made.created || prior.created,
+        added_docker_group: made.added_docker_group || prior.added_docker_group,
+    };
+    steps.push(account_record_step(l, spec, both));
     if l.init == Init::Systemd {
         steps.push(run(&["systemctl", "daemon-reload"], true));
     }
-    steps.extend(service_steps(
-        spec.legacy,
-        ServiceOp::Load,
-        spec.uid,
-        ServiceState::NotLoaded,
-    ));
-    if let Some(user) = &l.user {
-        let made = spec.account.record;
-        if made.created || made.added_docker_group {
-            steps.push(Step::RefuseRootAccount { user: user.clone() });
-        }
+    steps.extend(restart_legacy_steps(spec));
+    if let (Some(user), true) = (&l.user, made != AccountRecord::default()) {
+        steps.push(Step::VerifyAccount {
+            user: user.clone(),
+            state: l.state_file(),
+        });
         if made.created {
             steps.extend(user_removal_steps(l.init, user));
-        } else if made.added_docker_group {
+        } else {
             steps.extend(docker_group_revoke_steps(l.init, user));
         }
+        steps.push(account_record_step(l, spec, prior));
     }
+    steps
+}
+
+fn account_record_step(l: &Layout, spec: &TakeoverSpec<'_>, flags: AccountRecord) -> Step {
+    if flags == AccountRecord::default() {
+        return Step::Remove {
+            path: l.state_file(),
+            recursive: false,
+        };
+    }
+    Step::RecordRolledBack {
+        path: l.state_file(),
+        state: RunnerState {
+            runner_id: None,
+            created_account: flags.created,
+            added_docker_group: flags.added_docker_group,
+            pending_stale: Vec::new(),
+            container_options: None,
+            force_pull: false,
+            account_uid: None,
+            rolled_back: true,
+            ..spec.state.clone()
+        },
+    }
+}
+
+fn restart_legacy_steps(spec: &TakeoverSpec<'_>) -> Vec<Step> {
+    let legacy = spec.legacy;
+    match legacy.init {
+        Init::Launchd => vec![
+            run(
+                &[
+                    "launchctl",
+                    "bootstrap",
+                    &format!("gui/{}", spec.uid),
+                    &legacy.unit_path.to_string_lossy(),
+                ],
+                true,
+            ),
+            run(
+                &["launchctl", "kickstart", &legacy.launchd_target(spec.uid)],
+                false,
+            ),
+        ],
+        _ => service_steps(legacy, ServiceOp::Load, spec.uid, ServiceState::NotLoaded),
+    }
+}
+
+fn stop_steps(layout: &Layout, uid: u32, state: ServiceState) -> Vec<Step> {
+    let mut steps = Vec::new();
+    if layout.init == Init::Launchd {
+        steps.push(Step::CapturePid {
+            layout: Box::new(layout.clone()),
+        });
+    }
+    steps.extend(service_steps(layout, ServiceOp::Unload, uid, state));
+    steps.push(Step::VerifyStopped {
+        layout: Box::new(layout.clone()),
+    });
     steps
 }
 
@@ -1709,6 +1765,7 @@ mod tests {
                 "run rc-update del gitea-runner-r1 default",
                 "remove-file /etc/init.d/gitea-runner-r1",
                 "deregister gitea runner id 7",
+                "verify-account account gitea-runner-r1",
                 "run deluser gitea-runner-r1",
                 "run delgroup gitea-runner-r1",
                 "remove-dir /var/lib/gitea-runner/r1",
@@ -2149,6 +2206,8 @@ mod tests {
             pending_stale: Vec::new(),
             container_options: Some("--cpus=2".into()),
             force_pull: true,
+            account_uid: None,
+            rolled_back: false,
         };
         let a = actions(&upgrade_steps(
             &l,
@@ -2371,6 +2430,8 @@ mod tests {
             pending_stale: pending,
             container_options: None,
             force_pull: false,
+            account_uid: None,
+            rolled_back: false,
         }
     }
 
@@ -2575,129 +2636,120 @@ mod tests {
         );
     }
 
-    #[test]
-    fn takeover_rollback_undoes_only_account_changes_made_by_this_attempt() {
-        let l = layout(Init::Systemd);
+    fn takeover_rollback(made: AccountRecord, prior: AccountRecord, init: Init) -> Vec<Step> {
+        let l = layout(init);
         let legacy = Layout {
             name: "baldur".into(),
-            ..Layout::legacy_candidates(Init::Systemd, Path::new("/root"))[0].clone()
+            ..Layout::legacy_candidates(init, Path::new("/root"))[0].clone()
         };
-        let user = l.user.clone().unwrap();
-        let rollback_for = |made: AccountRecord| {
-            let steps = takeover_steps(&TakeoverSpec {
-                layout: &l,
-                legacy: &legacy,
-                legacy_state: ServiceState::Running,
-                uid: 0,
-                artifact: artifact(),
-                config_yaml: "cfg".into(),
-                unit: "unit".into(),
-                state: RunnerState {
-                    runner_id: Some(12),
-                    ..record(None, vec![])
-                },
-                account: AccountPlan {
-                    steps: vec![],
-                    record: made,
-                },
-                timeout_secs: 60,
-                resume: false,
-                prior_account: AccountRecord::default(),
+        takeover_steps(&TakeoverSpec {
+            layout: &l,
+            legacy: &legacy,
+            legacy_state: ServiceState::Running,
+            uid: 501,
+            artifact: artifact(),
+            config_yaml: "cfg".into(),
+            unit: "unit".into(),
+            state: RunnerState {
+                runner_id: Some(12),
+                container_options: Some("--cpus=8".into()),
+                ..record(None, vec![])
+            },
+            account: AccountPlan {
+                steps: vec![],
+                record: made,
+            },
+            timeout_secs: 60,
+            resume: false,
+            prior_account: prior,
+        })
+        .unwrap()
+        .rollback
+        .steps
+    }
+
+    const NONE: AccountRecord = AccountRecord {
+        created: false,
+        added_docker_group: false,
+    };
+    const CREATED: AccountRecord = AccountRecord {
+        created: true,
+        added_docker_group: false,
+    };
+    const GRANTED: AccountRecord = AccountRecord {
+        created: false,
+        added_docker_group: true,
+    };
+
+    fn kept_records(rb: &[Step]) -> Vec<(usize, RunnerState)> {
+        rb.iter()
+            .enumerate()
+            .filter_map(|(i, s)| match s {
+                Step::RecordRolledBack { state, .. } => Some((i, state.clone())),
+                _ => None,
             })
-            .unwrap()
-            .rollback
-            .steps;
-            actions(&steps)
+            .collect()
+    }
+
+    #[test]
+    fn takeover_rollback_records_account_flags_before_undoing_them() {
+        let l = layout(Init::Systemd);
+        let user = l.user.clone().unwrap();
+        let state_file = l.state_file();
+        let rb = takeover_rollback(CREATED, NONE, Init::Systemd);
+        let a = actions(&rb);
+        let pos = |want: &str| {
+            a.iter()
+                .position(|x| x == want)
+                .unwrap_or_else(|| panic!("{want} missing from {a:?}"))
         };
-        let created = rollback_for(AccountRecord {
-            created: true,
-            added_docker_group: false,
-        });
-        let start = created
-            .iter()
-            .position(|a| a == "run systemctl enable --now act_runner.service")
-            .unwrap_or_else(|| panic!("{created:?}"));
-        let guard = created
-            .iter()
-            .position(|a| a == &format!("refuse-root account {user}"))
-            .unwrap();
-        let del = created
-            .iter()
-            .position(|a| a == &format!("run userdel {user}"))
-            .unwrap();
-        assert!(start < guard && guard < del);
-        assert!(!created.iter().any(|a| a.contains("gpasswd")));
+        let start = pos("run systemctl enable --now act_runner.service");
+        let verify = pos(&format!("verify-account account {user}"));
+        let del = pos(&format!("run userdel {user}"));
+        let kept = kept_records(&rb);
+        assert_eq!(kept.len(), 1);
+        let (rec, st) = &kept[0];
+        assert!(st.created_account && st.rolled_back && st.runner_id.is_none());
+        assert!(*rec < start && start < verify && verify < del);
+        assert!(matches!(&rb[del + 1], Step::Remove { path, .. } if path == &state_file));
+        assert_eq!(del + 2, rb.len());
+        assert!(!a.iter().any(|x| x.contains("gpasswd")));
 
-        let granted = rollback_for(AccountRecord {
-            created: false,
-            added_docker_group: true,
-        });
-        assert!(granted.contains(&format!("refuse-root account {user}")));
-        assert!(granted.contains(&format!("run gpasswd -d {user} docker")));
-        assert!(!granted.iter().any(|a| a.contains("userdel")));
+        let rb = takeover_rollback(GRANTED, NONE, Init::Systemd);
+        let a = actions(&rb);
+        assert!(a.contains(&format!("verify-account account {user}")));
+        assert!(a.contains(&format!("run gpasswd -d {user} docker")));
+        assert!(!a.iter().any(|x| x.contains("userdel")));
+        assert!(kept_records(&rb)[0].1.added_docker_group);
 
-        let reused = rollback_for(AccountRecord::default());
+        let rb = takeover_rollback(NONE, NONE, Init::Systemd);
+        let a = actions(&rb);
         assert!(
-            !reused.iter().any(|a| a.contains("userdel")
-                || a.contains("gpasswd")
-                || a.contains("refuse-root")),
-            "{reused:?}"
+            !a.iter().any(|x| x.contains("userdel")
+                || x.contains("gpasswd")
+                || x.contains("verify-account")),
+            "{a:?}"
+        );
+        assert!(kept_records(&rb).is_empty());
+        assert!(
+            rb.iter()
+                .any(|s| matches!(s, Step::Remove { path, .. } if path == &state_file))
         );
     }
 
     #[test]
     fn takeover_rollback_keeps_account_flags_an_earlier_attempt_recorded() {
-        let l = layout(Init::Systemd);
-        let legacy = Layout {
-            name: "baldur".into(),
-            ..Layout::legacy_candidates(Init::Systemd, Path::new("/root"))[0].clone()
-        };
-        let rollback_for = |prior: AccountRecord| {
-            takeover_steps(&TakeoverSpec {
-                layout: &l,
-                legacy: &legacy,
-                legacy_state: ServiceState::Running,
-                uid: 0,
-                artifact: artifact(),
-                config_yaml: "cfg".into(),
-                unit: "unit".into(),
-                state: RunnerState {
-                    runner_id: Some(12),
-                    container_options: Some("--cpus=8".into()),
-                    ..record(None, vec![])
-                },
-                account: AccountPlan::default(),
-                timeout_secs: 60,
-                resume: true,
-                prior_account: prior,
-            })
-            .unwrap()
-            .rollback
-            .steps
-        };
-        let state_file = l.state_file();
-        for prior in [
-            AccountRecord {
-                created: true,
-                added_docker_group: false,
-            },
-            AccountRecord {
-                created: false,
-                added_docker_group: true,
-            },
-        ] {
-            let rb = rollback_for(prior);
-            let kept = rb
-                .iter()
-                .find_map(|s| match s {
-                    Step::RecordState { path, state, .. } if path == &state_file => Some(state),
-                    _ => None,
-                })
-                .expect("minimal record");
-            assert_eq!(kept.runner_id, None);
-            assert_eq!(kept.created_account, prior.created);
-            assert_eq!(kept.added_docker_group, prior.added_docker_group);
-            assert_eq!(kept.container_options, None);
+        let state_file = layout(Init::Systemd).state_file();
+        for prior in [CREATED, GRANTED] {
+            let rb = takeover_rollback(NONE, prior, Init::Systemd);
+            let kept = kept_records(&rb);
+            assert_eq!(kept.len(), 1);
+            let st = &kept[0].1;
+            assert_eq!(st.runner_id, None);
+            assert!(st.rolled_back);
+            assert_eq!(st.created_account, prior.created);
+            assert_eq!(st.added_docker_group, prior.added_docker_group);
+            assert_eq!(st.container_options, None);
             assert!(
                 !rb.iter()
                     .any(|s| matches!(s, Step::Remove { path, .. } if path == &state_file))
@@ -2709,10 +2761,28 @@ mod tests {
                 "{a:?}"
             );
         }
+        let rb = takeover_rollback(GRANTED, CREATED, Init::Systemd);
+        let kept = kept_records(&rb);
+        assert_eq!(kept.len(), 2);
+        assert!(kept[0].1.created_account && kept[0].1.added_docker_group);
+        assert!(kept[1].1.created_account && !kept[1].1.added_docker_group);
+        assert_eq!(kept[1].0, rb.len() - 1);
+    }
+
+    #[test]
+    fn launchd_takeover_captures_pids_and_restarts_a_loaded_legacy_job() {
+        let l = layout(Init::Launchd);
+        let legacy = Layout::legacy_candidates(Init::Launchd, Path::new("/root"))[0].clone();
+        let rb = takeover_rollback(NONE, NONE, Init::Launchd);
+        let a = actions(&rb);
+        assert_eq!(a[0], format!("capture-pid {}", l.service));
+        assert!(matches!(&rb[2], Step::VerifyStopped { layout } if layout.service == l.service));
+        let n = rb.len();
         assert!(
-            rollback_for(AccountRecord::default())
-                .iter()
-                .any(|s| matches!(s, Step::Remove { path, .. } if path == &state_file))
+            matches!(&rb[n - 2], Step::Run { argv, tolerate_failure: true } if argv[1] == "bootstrap")
+        );
+        assert!(
+            matches!(&rb[n - 1], Step::Run { argv, tolerate_failure: false } if argv[1] == "kickstart" && argv[2] == legacy.launchd_target(501))
         );
     }
 }
