@@ -262,6 +262,9 @@ pub enum Step {
         dest: PathBuf,
         runner_id: i64,
     },
+    RefuseRootAccount {
+        user: String,
+    },
 }
 
 fn run(argv: &[&str], tolerate_failure: bool) -> Step {
@@ -420,6 +423,10 @@ impl Step {
                     "copy {} (mode 600); refused unless it holds runner id {runner_id}",
                     src.display()
                 )),
+            Step::RefuseRootAccount { user } => {
+                PlannedChange::new(format!("account {user}"), "refuse-root")
+                    .with_detail("gate: fail if /etc/passwd gives it uid 0")
+            }
         }
     }
 }
@@ -1197,6 +1204,17 @@ fn takeover_rollback(spec: &TakeoverSpec<'_>) -> Vec<Step> {
         spec.uid,
         ServiceState::NotLoaded,
     ));
+    if let Some(user) = &l.user {
+        let made = spec.account.record;
+        if made.created || made.added_docker_group {
+            steps.push(Step::RefuseRootAccount { user: user.clone() });
+        }
+        if made.created {
+            steps.extend(user_removal_steps(l.init, user));
+        } else if made.added_docker_group {
+            steps.extend(docker_group_revoke_steps(l.init, user));
+        }
+    }
     steps
 }
 
@@ -2535,6 +2553,75 @@ mod tests {
                 ..state
             }))
             .is_err()
+        );
+    }
+
+    #[test]
+    fn takeover_rollback_undoes_only_account_changes_made_by_this_attempt() {
+        let l = layout(Init::Systemd);
+        let legacy = Layout {
+            name: "baldur".into(),
+            ..Layout::legacy_candidates(Init::Systemd, Path::new("/root"))[0].clone()
+        };
+        let user = l.user.clone().unwrap();
+        let rollback_for = |made: AccountRecord| {
+            let steps = takeover_steps(&TakeoverSpec {
+                layout: &l,
+                legacy: &legacy,
+                legacy_state: ServiceState::Running,
+                uid: 0,
+                artifact: artifact(),
+                config_yaml: "cfg".into(),
+                unit: "unit".into(),
+                state: RunnerState {
+                    runner_id: Some(12),
+                    ..record(None, vec![])
+                },
+                account: AccountPlan {
+                    steps: vec![],
+                    record: made,
+                },
+                timeout_secs: 60,
+                resume: false,
+            })
+            .unwrap()
+            .rollback
+            .steps;
+            actions(&steps)
+        };
+        let created = rollback_for(AccountRecord {
+            created: true,
+            added_docker_group: false,
+        });
+        let start = created
+            .iter()
+            .position(|a| a == "run systemctl enable --now act_runner.service")
+            .unwrap_or_else(|| panic!("{created:?}"));
+        let guard = created
+            .iter()
+            .position(|a| a == &format!("refuse-root account {user}"))
+            .unwrap();
+        let del = created
+            .iter()
+            .position(|a| a == &format!("run userdel {user}"))
+            .unwrap();
+        assert!(start < guard && guard < del);
+        assert!(!created.iter().any(|a| a.contains("gpasswd")));
+
+        let granted = rollback_for(AccountRecord {
+            created: false,
+            added_docker_group: true,
+        });
+        assert!(granted.contains(&format!("refuse-root account {user}")));
+        assert!(granted.contains(&format!("run gpasswd -d {user} docker")));
+        assert!(!granted.iter().any(|a| a.contains("userdel")));
+
+        let reused = rollback_for(AccountRecord::default());
+        assert!(
+            !reused.iter().any(|a| a.contains("userdel")
+                || a.contains("gpasswd")
+                || a.contains("refuse-root")),
+            "{reused:?}"
         );
     }
 }

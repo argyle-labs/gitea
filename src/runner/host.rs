@@ -500,6 +500,10 @@ pub fn local_user_exists(passwd: &str, user: &str) -> bool {
     local_entries(passwd, user).next().is_some()
 }
 
+pub fn local_user_has_uid0(passwd: &str, user: &str) -> bool {
+    local_entries(passwd, user).any(|f| f.get(2).is_none_or(|uid| uid.trim() == "0"))
+}
+
 /// Whether `/etc/group`-format `groups` lists `user` as a member of `group`:
 /// the membership `gpasswd -d` / `delgroup` can remove.
 pub fn local_group_lists(groups: &str, group: &str, user: &str) -> bool {
@@ -820,5 +824,14 @@ mod tests {
         assert!(why.contains("need root"), "{why}");
         let root = LocalHost { uid: 0, ..host };
         assert!(root.write_blocker(&[Path::new("/etc/x")]).is_none());
+    }
+
+    #[test]
+    fn uid0_is_detected_by_the_passwd_entry() {
+        let passwd = "root:x:0:0::/root:/bin/sh\nevil:x:0:0::/:/bin/sh\nrunner:x:990:990::/:/sbin/nologin\nbroken:x\n";
+        assert!(local_user_has_uid0(passwd, "evil"));
+        assert!(local_user_has_uid0(passwd, "broken"));
+        assert!(!local_user_has_uid0(passwd, "runner"));
+        assert!(!local_user_has_uid0(passwd, "absent"));
     }
 }
