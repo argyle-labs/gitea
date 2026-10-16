@@ -422,7 +422,8 @@
      "200": {
       "$ref": "#/components/responses/HookList"
      }
-    }
+    },
+    "x-orca-admin": true
    },
    "post": {
     "tags": [
@@ -463,7 +464,8 @@
      "200": {
       "$ref": "#/components/responses/Hook"
      }
-    }
+    },
+    "x-orca-admin": true
    },
    "delete": {
     "tags": [
@@ -1982,7 +1984,8 @@
      "200": {
       "$ref": "#/components/responses/SecretList"
      }
-    }
+    },
+    "x-orca-admin": true
    }
   },
   "/orgs/{org}/actions/secrets/{secretname}": {
@@ -2517,7 +2520,8 @@
      "200": {
       "$ref": "#/components/responses/HookList"
      }
-    }
+    },
+    "x-orca-admin": true
    },
    "post": {
     "tags": [
@@ -2578,7 +2582,8 @@
      "200": {
       "$ref": "#/components/responses/Hook"
      }
-    }
+    },
+    "x-orca-admin": true
    },
    "delete": {
     "tags": [
@@ -4441,7 +4446,8 @@
      "302": {
       "description": "redirect to the blob download"
      }
-    }
+    },
+    "x-orca-admin": true
    }
   },
   "/repos/{owner}/{repo}/actions/jobs": {
@@ -4601,7 +4607,8 @@
      "200": {
       "description": "output blob content"
      }
-    }
+    },
+    "x-orca-admin": true
    }
   },
   "/repos/{owner}/{repo}/actions/runners": {
@@ -5437,7 +5444,8 @@
      "200": {
       "$ref": "#/components/responses/SecretList"
      }
-    }
+    },
+    "x-orca-admin": true
    }
   },
   "/repos/{owner}/{repo}/actions/secrets/{secretname}": {
@@ -6258,7 +6266,8 @@
      "200": {
       "description": "success"
      }
-    }
+    },
+    "x-orca-admin": true
    }
   },
   "/repos/{owner}/{repo}/assignees": {
@@ -8639,7 +8648,8 @@
      "200": {
       "$ref": "#/components/responses/HookList"
      }
-    }
+    },
+    "x-orca-admin": true
    },
    "post": {
     "tags": [
@@ -8714,7 +8724,8 @@
      "200": {
       "$ref": "#/components/responses/GitHookList"
      }
-    }
+    },
+    "x-orca-admin": true
    }
   },
   "/repos/{owner}/{repo}/hooks/git/{id}": {
@@ -8757,7 +8768,8 @@
      "200": {
       "$ref": "#/components/responses/GitHook"
      }
-    }
+    },
+    "x-orca-admin": true
    },
    "delete": {
     "tags": [
@@ -8892,7 +8904,8 @@
      "200": {
       "$ref": "#/components/responses/Hook"
      }
-    }
+    },
+    "x-orca-admin": true
    },
    "delete": {
     "tags": [
@@ -12394,7 +12407,8 @@
      "200": {
       "$ref": "#/components/responses/DeployKeyList"
      }
-    }
+    },
+    "x-orca-admin": true
    },
    "post": {
     "tags": [
@@ -12473,7 +12487,8 @@
      "200": {
       "$ref": "#/components/responses/DeployKey"
      }
-    }
+    },
+    "x-orca-admin": true
    },
    "delete": {
     "tags": [
@@ -18998,7 +19013,8 @@
      "200": {
       "$ref": "#/components/responses/string"
      }
-    }
+    },
+    "x-orca-admin": true
    }
   },
   "/user/gpg_key_verify": {
@@ -19147,7 +19163,8 @@
      "200": {
       "$ref": "#/components/responses/HookList"
      }
-    }
+    },
+    "x-orca-admin": true
    },
    "post": {
     "tags": [
@@ -19188,7 +19205,8 @@
      "200": {
       "$ref": "#/components/responses/Hook"
      }
-    }
+    },
+    "x-orca-admin": true
    },
    "delete": {
     "tags": [
@@ -20355,7 +20373,8 @@
      "200": {
       "$ref": "#/components/responses/AccessTokenList"
      }
-    }
+    },
+    "x-orca-admin": true
    },
    "post": {
     "tags": [

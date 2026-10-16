@@ -23,9 +23,8 @@ fn main() {
     )
     .expect("gitea openapi codegen");
 
-    // Emit the orca tool surface from the codegen'd client. Write methods
-    // surface as `data_mutation = true` + `role = "admin"`; an operation can opt
-    // out to `role = "read"` via `x-orca-user-callable: true` in the spec.
+    // Writes surface as `role = "admin"`; `x-orca-*` spec markers adjust per
+    // operation (see `plugin_toolkit_build::surface`).
     plugin_toolkit_build::surface::openapi::generate(&specs_dir, &out_dir, "gitea")
         .expect("gitea surface codegen");
 }
