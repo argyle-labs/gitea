@@ -10,6 +10,7 @@
 
 pub mod artifacts;
 pub mod backup;
+pub mod bot;
 pub mod ci;
 pub mod deploy;
 pub mod dump;
@@ -41,7 +42,7 @@ pub mod surface {
 
 /// No-op the `[[bin]]` entrypoint calls so rustc links this lib crate — and with
 /// it, every `#[orca_tool]` inventory item in [`surface`], [`tools`], [`deploy`],
-/// [`backup`], [`runner`], [`signing`], [`ci`] and [`artifacts`]. Without a reference from the bin, the whole rlib
+/// [`backup`], [`runner`], [`signing`], [`bot`], [`ci`] and [`artifacts`]. Without a reference from the bin, the whole rlib
 /// (and its tool surface) is dropped at link time. See `src/main.rs`.
 pub fn link_anchor() {}
 
