@@ -165,7 +165,7 @@ impl LocalHost {
             .mode(0o700)
             .create(&dir)
             .with_context(|| format!("create {}", dir.display()))?;
-        let path = dir.join(format!("{name}.lock"));
+        let path = dir.join(lock_file_name(name));
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -514,6 +514,11 @@ fn group_list(user: &str, primary: u32) -> Result<Vec<u32>> {
         }
         cap = (cap * 2).max(n);
     }
+}
+
+pub fn lock_file_name(name: &str) -> String {
+    let hash = sha256_hex(name.as_bytes());
+    format!("{}.lock", &hash[..32])
 }
 
 pub const LOCK_WAIT: Duration = Duration::from_secs(2);
@@ -949,6 +954,38 @@ mod tests {
         drop(held);
         drop(other);
         host.lock_runner("r1").unwrap();
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
+    fn any_runner_name_maps_to_a_fixed_shape_lock_file() {
+        let home = std::env::temp_dir().join(format!("gitea-lock-names-{}", std::process::id()));
+        let host = LocalHost {
+            init: Init::Launchd,
+            home: home.clone(),
+            uid: 501,
+        };
+        let odd = [
+            "../../etc/passwd",
+            "Baldur Runner",
+            "r/1",
+            "",
+            ".hidden",
+            "ünïcode",
+        ];
+        let mut seen = std::collections::BTreeSet::new();
+        for name in odd {
+            let file = lock_file_name(name);
+            assert_eq!(file.len(), 32 + ".lock".len());
+            assert!(file[..32].chars().all(|c| c.is_ascii_hexdigit()));
+            assert!(seen.insert(file));
+            let held = host.lock_runner(name).unwrap();
+            assert!(host.lock_runner_within(name, Duration::ZERO).is_err());
+            drop(held);
+        }
+        assert_eq!(lock_file_name("r1"), lock_file_name("r1"));
+        let dir = managed_root(Init::Launchd, &home).join(".orca");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), odd.len());
         std::fs::remove_dir_all(&home).unwrap();
     }
 }
