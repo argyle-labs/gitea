@@ -8,19 +8,25 @@ use plugin_toolkit::url::encode;
 
 use crate::Config;
 use crate::runner::api::{status_error, verified_client};
-use crate::runner::host::LocalHost;
+use crate::runner::host::{LocalHost, lookup_user};
 use crate::runner::layout::Init;
 use crate::runner::tools::authorize_execute;
 use crate::signing::ini_get;
 
 const DEFAULT_APP_INI: &str = "/etc/gitea/app.ini";
-const DEFAULT_RUN_USER: &str = "git";
 const SYSTEMD_UNITS: &[&str] = &[
     "/etc/systemd/system/gitea.service",
     "/lib/systemd/system/gitea.service",
     "/usr/lib/systemd/system/gitea.service",
 ];
+const SYSTEMD_DROP_IN_DIRS: &[&str] = &[
+    "/etc/systemd/system/gitea.service.d",
+    "/run/systemd/system/gitea.service.d",
+    "/lib/systemd/system/gitea.service.d",
+    "/usr/lib/systemd/system/gitea.service.d",
+];
 const OPENRC_SCRIPT: &str = "/etc/init.d/gitea";
+const OWNERS_TEAM: &str = "Owners";
 const TEAM_MARKER: &str = "[managed by orca gitea.bot.create]";
 const TEAM_UNITS: &[&str] = &[
     "repo.code",
@@ -44,6 +50,7 @@ pub fn scrub(text: &str) -> String {
 pub struct Launch {
     pub binary: PathBuf,
     pub app_ini: PathBuf,
+    pub user: Option<String>,
 }
 
 fn unquote(s: &str) -> &str {
@@ -75,9 +82,17 @@ pub fn parse_systemd_exec(unit: &str) -> Option<Launch> {
         .split_whitespace()
         .collect();
     let binary = unquote(words.first()?);
+    let user = unit
+        .lines()
+        .map(str::trim)
+        .rev()
+        .find_map(|l| l.strip_prefix("User="))
+        .map(|u| unquote(u.trim()).to_string())
+        .filter(|u| !u.is_empty());
     Some(Launch {
         binary: PathBuf::from(binary),
         app_ini: PathBuf::from(config_flag(&words).unwrap_or_else(|| DEFAULT_APP_INI.into())),
+        user,
     })
 }
 
@@ -92,46 +107,116 @@ pub fn parse_openrc_script(script: &str) -> Option<Launch> {
     let binary = value("command")?;
     let args = value("command_args").unwrap_or_default();
     let words: Vec<&str> = args.split_whitespace().collect();
+    let user = value("command_user")
+        .and_then(|u| u.split(':').next().map(str::to_string))
+        .filter(|u| !u.is_empty());
     Some(Launch {
         binary: PathBuf::from(binary),
         app_ini: PathBuf::from(config_flag(&words).unwrap_or_else(|| DEFAULT_APP_INI.into())),
+        user,
     })
 }
 
-fn discover_launch(init: Init) -> Result<Launch> {
-    let found = match init {
-        Init::Systemd => SYSTEMD_UNITS.iter().find_map(|p| {
-            std::fs::read_to_string(p)
-                .ok()
-                .and_then(|u| parse_systemd_exec(&u))
-        }),
-        Init::Openrc => std::fs::read_to_string(OPENRC_SCRIPT)
+pub fn drop_ins(dirs: &[&Path]) -> Vec<PathBuf> {
+    let mut found: Vec<PathBuf> = dirs
+        .iter()
+        .filter_map(|d| std::fs::read_dir(d).ok())
+        .flatten()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "conf"))
+        .collect();
+    found.sort();
+    found
+}
+
+fn discover_launch(init: Init) -> Result<(PathBuf, Launch)> {
+    let read = |p: &str| {
+        std::fs::read_to_string(p)
             .ok()
-            .and_then(|s| parse_openrc_script(&s)),
+            .map(|text| (PathBuf::from(p), text))
+    };
+    let found = match init {
+        Init::Systemd => {
+            let dirs: Vec<&Path> = SYSTEMD_DROP_IN_DIRS.iter().map(Path::new).collect();
+            let overrides = drop_ins(&dirs);
+            if !overrides.is_empty() {
+                bail!(
+                    "gitea.service has systemd drop-ins ({}); refusing to guess the effective ExecStart=/User=",
+                    overrides
+                        .iter()
+                        .map(|p| p.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+            SYSTEMD_UNITS
+                .iter()
+                .find_map(|p| read(p))
+                .and_then(|(p, u)| parse_systemd_exec(&u).map(|l| (p, l)))
+        }
+        Init::Openrc => {
+            read(OPENRC_SCRIPT).and_then(|(p, s)| parse_openrc_script(&s).map(|l| (p, l)))
+        }
         Init::Launchd => None,
     };
     found.ok_or_else(|| anyhow!("no gitea systemd unit or OpenRC script found on this host"))
 }
 
-pub fn check_binary_trust(path: &Path, uid: u32, mode: u32) -> Result<()> {
+pub fn check_path_trust(path: &Path, stat: impl Fn(&Path) -> Result<(u32, u32)>) -> Result<()> {
     if !path.is_absolute() {
-        bail!("gitea binary {} is not an absolute path", path.display());
+        bail!("{} is not an absolute path", path.display());
     }
-    if uid != 0 {
-        bail!("gitea binary {} is not owned by root", path.display());
-    }
-    if mode & 0o022 != 0 {
-        bail!(
-            "gitea binary {} is writable by group or others",
-            path.display()
-        );
+    for p in path.ancestors() {
+        let (uid, mode) = stat(p)?;
+        if uid != 0 {
+            bail!("{} is not owned by root", p.display());
+        }
+        if mode & 0o022 != 0 {
+            bail!("{} is writable by group or others", p.display());
+        }
     }
     Ok(())
 }
 
-pub fn check_run_user(run_user: &str) -> Result<()> {
-    if run_user == "root" {
-        bail!("app.ini RUN_USER is root; refusing to run the gitea CLI as root");
+fn trusted_canonical(path: &Path) -> Result<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    let canonical =
+        std::fs::canonicalize(path).with_context(|| format!("resolve {}", path.display()))?;
+    check_path_trust(&canonical, |p| {
+        let m = std::fs::metadata(p).with_context(|| format!("stat {}", p.display()))?;
+        Ok((m.uid(), m.mode()))
+    })?;
+    Ok(canonical)
+}
+
+pub fn check_run_uid(run_user: &str, uid: u32) -> Result<()> {
+    if uid == 0 {
+        bail!("gitea runs as '{run_user}' (uid 0); refusing to run the gitea CLI as root");
+    }
+    Ok(())
+}
+
+pub fn check_ini_run_user(ini_run_user: Option<&str>, unit_user: &str) -> Result<()> {
+    match ini_run_user {
+        Some(u) if u != unit_user => {
+            bail!("app.ini RUN_USER '{u}' does not match the service user '{unit_user}'")
+        }
+        _ => Ok(()),
+    }
+}
+
+pub fn check_app_ini_trust(path: &Path, uid: u32, gid: u32, mode: u32, run_uid: u32) -> Result<()> {
+    if uid != 0 && uid != run_uid {
+        bail!(
+            "{} is owned by uid {uid}, not root or the gitea run user",
+            path.display()
+        );
+    }
+    if mode & 0o002 != 0 || (mode & 0o020 != 0 && gid != 0) {
+        bail!(
+            "{} is writable by users other than root and the gitea run user",
+            path.display()
+        );
     }
     Ok(())
 }
@@ -146,16 +231,32 @@ pub struct GiteaCli {
 impl GiteaCli {
     fn discover(host: &LocalHost) -> Result<Self> {
         use std::os::unix::fs::MetadataExt;
-        let launch = discover_launch(host.init)?;
-        let meta = std::fs::metadata(&launch.binary)
-            .with_context(|| format!("stat {}", launch.binary.display()))?;
-        check_binary_trust(&launch.binary, meta.uid(), meta.mode())?;
+        let (unit, launch) = discover_launch(host.init)?;
+        trusted_canonical(&unit)?;
+        let binary = trusted_canonical(&launch.binary)?;
+        let run_user = launch.user.ok_or_else(|| {
+            anyhow!(
+                "{} sets no service user, so gitea runs as root; refusing",
+                unit.display()
+            )
+        })?;
+        let (run_uid, _) = lookup_user(&run_user)?
+            .ok_or_else(|| anyhow!("gitea service user '{run_user}' does not exist"))?;
+        check_run_uid(&run_user, run_uid)?;
+        let meta = std::fs::metadata(&launch.app_ini)
+            .with_context(|| format!("stat {}", launch.app_ini.display()))?;
+        check_app_ini_trust(
+            &launch.app_ini,
+            meta.uid(),
+            meta.gid(),
+            meta.mode(),
+            run_uid,
+        )?;
         let ini = std::fs::read_to_string(&launch.app_ini)
             .with_context(|| format!("read {}", launch.app_ini.display()))?;
-        let run_user = ini_get(&ini, "", "RUN_USER").unwrap_or_else(|| DEFAULT_RUN_USER.into());
-        check_run_user(&run_user)?;
+        check_ini_run_user(ini_get(&ini, "", "RUN_USER").as_deref(), &run_user)?;
         Ok(Self {
-            binary: launch.binary.display().to_string(),
+            binary: binary.display().to_string(),
             app_ini: launch.app_ini.display().to_string(),
             run_user,
             as_root: host.is_root(),
@@ -273,19 +374,6 @@ pub fn generate_token_args(username: &str, token_name: &str, scopes: &[String]) 
     ]
 }
 
-pub fn change_password_args(username: &str, password: &str) -> Vec<String> {
-    vec![
-        "admin".into(),
-        "user".into(),
-        "change-password".into(),
-        "--username".into(),
-        username.into(),
-        "--password".into(),
-        password.into(),
-        "--must-change-password=false".into(),
-    ]
-}
-
 pub fn minted_name(token_name: &str, unix_secs: u64) -> String {
     format!("{token_name}-{unix_secs}")
 }
@@ -349,7 +437,6 @@ fn minted_secret_name(secret: &str) -> String {
 pub struct GiteaUser {
     #[serde(default, rename = "type")]
     pub kind: String,
-    #[serde(default)]
     pub is_admin: bool,
 }
 
@@ -394,6 +481,44 @@ async fn fetch_user(cfg: &Config, username: &str) -> Result<Option<GiteaUser>> {
         200..=299 => Ok(Some(plugin_toolkit::serde_json::from_str(&body)?)),
         _ => Err(status_error("get user", status, &scrub(&body))),
     }
+}
+
+pub fn admin_denied(what: &str, status: u16) -> Option<anyhow::Error> {
+    matches!(status, 401 | 403).then(|| {
+        anyhow!(
+            "{what}: HTTP {status} — the endpoint token must belong to a Gitea site admin (write:admin scope); refusing"
+        )
+    })
+}
+
+#[derive(Deserialize)]
+struct Me {
+    is_admin: bool,
+}
+
+async fn require_admin_token(cfg: &Config) -> Result<()> {
+    let url = format!("{}/user", cfg.base_url.trim_end_matches('/'));
+    let resp = verified_client(cfg)?
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| anyhow!("get token user: {e}"))?;
+    let status = resp.status().as_u16();
+    let body = resp.text().await.unwrap_or_default();
+    if let Some(e) = admin_denied("get token user", status) {
+        return Err(e);
+    }
+    if !(200..300).contains(&status) {
+        return Err(status_error("get token user", status, &scrub(&body)));
+    }
+    let me: Me = plugin_toolkit::serde_json::from_str(&body)
+        .context("cannot determine whether the endpoint token is a site admin")?;
+    if !me.is_admin {
+        bail!(
+            "the endpoint token is not a Gitea site admin, so user admin status cannot be verified; refusing"
+        );
+    }
+    Ok(())
 }
 
 async fn require_bot_user(cfg: &Config, username: &str) -> Result<()> {
@@ -473,6 +598,23 @@ pub fn basic_auth(username: &str, password: &str) -> String {
     out
 }
 
+pub fn admin_user_url(base_url: &str, username: &str) -> String {
+    format!(
+        "{}/admin/users/{}",
+        base_url.trim_end_matches('/'),
+        encode(username)
+    )
+}
+
+pub fn password_body(username: &str, password: &str) -> plugin_toolkit::serde_json::Value {
+    json!({
+        "password": password,
+        "login_name": username,
+        "source_id": 0,
+        "must_change_password": false,
+    })
+}
+
 fn random_password() -> Result<String> {
     use std::io::Read;
     let mut buf = [0u8; 24];
@@ -482,24 +624,35 @@ fn random_password() -> Result<String> {
     Ok(buf.iter().map(|b| format!("{b:02x}")).collect())
 }
 
-async fn set_password(cli: &GiteaCli, host: &LocalHost, username: &str) -> Result<String> {
+async fn set_password(cfg: &Config, username: &str) -> Result<String> {
+    let url = admin_user_url(&cfg.base_url, username);
+    require_secure_url(&url)?;
     let password = random_password()?;
-    cli.run(host, &change_password_args(username, &password))
+    let resp = verified_client(cfg)?
+        .patch(url)
+        .json(&password_body(username, &password))
+        .send()
         .await
-        .map_err(|e| anyhow!("{}", format!("{e:#}").replace(&password, "<redacted>")))?;
+        .map_err(|e| anyhow!("set bot password: {e}"))?;
+    let status = resp.status().as_u16();
+    if let Some(e) = admin_denied("set bot password", status) {
+        return Err(e);
+    }
+    if !(200..300).contains(&status) {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(status_error(
+            "set bot password",
+            status,
+            &scrub(&body.replace(&password, "<redacted>")),
+        ));
+    }
     Ok(password)
 }
 
-async fn revoke_token(
-    cli: &GiteaCli,
-    host: &LocalHost,
-    cfg: &Config,
-    username: &str,
-    token_name: &str,
-) -> Result<()> {
+async fn revoke_token(cfg: &Config, username: &str, token_name: &str) -> Result<()> {
     let url = delete_token_url(&cfg.base_url, username, token_name);
     require_secure_url(&url)?;
-    let password = set_password(cli, host, username).await?;
+    let password = set_password(cfg, username).await?;
     let deleted = async {
         let client = plugin_toolkit::api_client::ApiClientBuilder::new()
             .header("authorization", basic_auth(username, &password))
@@ -517,7 +670,7 @@ async fn revoke_token(
         Ok(())
     }
     .await;
-    let rerolled = set_password(cli, host, username).await;
+    let rerolled = set_password(cfg, username).await;
     deleted?;
     rerolled.map(|_| ())
 }
@@ -552,6 +705,9 @@ pub struct BotCreateArgs {
     pub team_units: Vec<String>,
     #[arg(long)]
     #[serde(default)]
+    pub allow_unmanaged_team: bool,
+    #[arg(long)]
+    #[serde(default)]
     pub dry_run: bool,
 }
 
@@ -576,6 +732,22 @@ struct Team {
 
 pub fn team_is_managed(description: Option<&str>) -> bool {
     description.is_some_and(|d| d.contains(TEAM_MARKER))
+}
+
+pub fn refuse_owners_team(team: &str) -> Result<()> {
+    if team.eq_ignore_ascii_case(OWNERS_TEAM) {
+        bail!("refusing to add a bot to the {OWNERS_TEAM} team");
+    }
+    Ok(())
+}
+
+pub fn check_unmanaged_team(org: &str, team: &str, allow_unmanaged: bool) -> Result<()> {
+    if !allow_unmanaged {
+        bail!(
+            "team {org}/{team} is not orca-managed; pass allow_unmanaged_team: true to add the bot to it"
+        );
+    }
+    Ok(())
 }
 
 async fn find_team(cfg: &Config, org: &str, team: &str) -> Result<Option<Team>> {
@@ -615,6 +787,7 @@ async fn ensure_team(
     org: &str,
     team: &str,
     units: &BTreeMap<String, String>,
+    allow_unmanaged: bool,
 ) -> Result<(i64, String)> {
     let client = verified_client(cfg)?;
     let base = cfg.base_url.trim_end_matches('/');
@@ -631,10 +804,14 @@ async fn ensure_team(
         Some(t) if team_is_managed(t.description.as_deref()) => {
             Ok((t.id, format!("team {org}/{team} unchanged")))
         }
-        Some(t) => Ok((
-            t.id,
-            format!("team {org}/{team} is not orca-managed; units left unchanged"),
-        )),
+        Some(t) => {
+            refuse_owners_team(&t.name)?;
+            check_unmanaged_team(org, team, allow_unmanaged)?;
+            Ok((
+                t.id,
+                format!("team {org}/{team} is not orca-managed; units left unchanged"),
+            ))
+        }
         None => {
             let created = send(
                 "create team",
@@ -666,9 +843,13 @@ pub async fn gitea_bot_create(args: BotCreateArgs, ctx: &ToolCtx) -> Result<BotC
         (None, None) if units.is_empty() => None,
         _ => bail!("org and team go together, and team units need both"),
     };
+    if let Some((_, t)) = &team {
+        refuse_owners_team(t)?;
+    }
     let host = LocalHost::current()?;
     let cli = GiteaCli::discover(&host)?;
     let cfg = crate::tools::resolve_config(&args.endpoint).await?;
+    require_admin_token(&cfg).await?;
     let existing = fetch_user(&cfg, &args.username).await?;
     if let Some(user) = &existing {
         require_bot(&args.username, user)?;
@@ -710,7 +891,7 @@ pub async fn gitea_bot_create(args: BotCreateArgs, ctx: &ToolCtx) -> Result<BotC
         applied.push(format!("created bot user {}", args.username));
     }
     if let Some((org, t)) = &team {
-        let (id, did) = ensure_team(&cfg, org, t, &units).await?;
+        let (id, did) = ensure_team(&cfg, org, t, &units, args.allow_unmanaged_team).await?;
         applied.push(did);
         send(
             "add team member",
@@ -775,6 +956,7 @@ pub async fn gitea_token_create(args: TokenCreateArgs, ctx: &ToolCtx) -> Result<
     let host = LocalHost::current()?;
     let cli = GiteaCli::discover(&host)?;
     let cfg = crate::tools::resolve_config(&args.endpoint).await?;
+    require_admin_token(&cfg).await?;
     require_bot_user(&cfg, &args.username).await?;
     let secret = token_secret_name(&args.endpoint, &args.username, &args.token_name);
     let minted_secret = minted_secret_name(&secret);
@@ -832,7 +1014,7 @@ pub async fn gitea_token_create(args: TokenCreateArgs, ctx: &ToolCtx) -> Result<
     secret_set(&minted_secret, &minted, &desc).await?;
     let revoked = match previous.filter(|p| *p != minted) {
         Some(prev) => {
-            revoke_token(&cli, &host, &cfg, &args.username, &prev)
+            revoke_token(&cfg, &args.username, &prev)
                 .await
                 .with_context(|| {
                     format!(
@@ -874,7 +1056,8 @@ mod tests {
             parse_systemd_exec(unit),
             Some(Launch {
                 binary: "/usr/local/bin/gitea".into(),
-                app_ini: "/etc/gitea/app.ini".into()
+                app_ini: "/etc/gitea/app.ini".into(),
+                user: Some("git".into()),
             })
         );
         let unit = "ExecStart=-/opt/gitea/gitea web -c=/srv/gitea.ini";
@@ -889,35 +1072,99 @@ mod tests {
             PathBuf::from(DEFAULT_APP_INI)
         );
         assert!(parse_systemd_exec("[Unit]").is_none());
-    }
-
-    #[test]
-    fn discovers_launch_from_openrc_script() {
-        let script =
-            "command=\"/usr/bin/gitea\"\ncommand_args=\"web --config /etc/gitea/app.ini\"\n";
         assert_eq!(
-            parse_openrc_script(script),
-            Some(Launch {
-                binary: "/usr/bin/gitea".into(),
-                app_ini: "/etc/gitea/app.ini".into()
-            })
+            parse_systemd_exec("ExecStart=/usr/bin/gitea web")
+                .unwrap()
+                .user,
+            None
+        );
+        assert_eq!(
+            parse_systemd_exec("User=git\nUser=\"svc\"\nExecStart=/usr/bin/gitea web")
+                .unwrap()
+                .user
+                .as_deref(),
+            Some("svc")
         );
     }
 
     #[test]
-    fn binary_must_be_root_owned_and_not_writable() {
-        let p = Path::new("/usr/local/bin/gitea");
-        assert!(check_binary_trust(p, 0, 0o100755).is_ok());
-        assert!(check_binary_trust(p, 1000, 0o100755).is_err());
-        assert!(check_binary_trust(p, 0, 0o100775).is_err());
-        assert!(check_binary_trust(p, 0, 0o100757).is_err());
-        assert!(check_binary_trust(Path::new("gitea"), 0, 0o100755).is_err());
+    fn discovers_launch_from_openrc_script() {
+        let script = "command=\"/usr/bin/gitea\"\ncommand_user=\"git:git\"\ncommand_args=\"web --config /etc/gitea/app.ini\"\n";
+        assert_eq!(
+            parse_openrc_script(script),
+            Some(Launch {
+                binary: "/usr/bin/gitea".into(),
+                app_ini: "/etc/gitea/app.ini".into(),
+                user: Some("git".into()),
+            })
+        );
+        assert_eq!(
+            parse_openrc_script("command=/usr/bin/gitea\n")
+                .unwrap()
+                .user,
+            None
+        );
     }
 
     #[test]
-    fn refuses_root_run_user() {
-        assert!(check_run_user("root").is_err());
-        assert!(check_run_user("git").is_ok());
+    fn finds_systemd_drop_ins() {
+        let dir = std::env::temp_dir().join(format!("gitea-dropin-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(drop_ins(&[dir.as_path(), Path::new("/nonexistent/x.d")]).is_empty());
+        std::fs::write(dir.join("notes.txt"), "").unwrap();
+        assert!(drop_ins(&[dir.as_path()]).is_empty());
+        std::fs::write(dir.join("override.conf"), "[Service]\nUser=root\n").unwrap();
+        assert_eq!(drop_ins(&[dir.as_path()]), vec![dir.join("override.conf")]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn every_ancestor_must_be_root_owned_and_not_writable() {
+        let ok = |_: &Path| Ok((0, 0o40755));
+        let p = Path::new("/usr/local/bin/gitea");
+        assert!(check_path_trust(p, ok).is_ok());
+        assert!(check_path_trust(Path::new("gitea"), ok).is_err());
+        for (bad, uid, mode) in [
+            ("/usr/local/bin/gitea", 1000, 0o100755),
+            ("/usr/local/bin/gitea", 0, 0o100775),
+            ("/usr/local/bin", 0, 0o40757),
+            ("/usr/local", 1000, 0o40755),
+            ("/", 0, 0o41777),
+        ] {
+            let stat = |q: &Path| {
+                Ok(if q == Path::new(bad) {
+                    (uid, mode)
+                } else {
+                    (0, 0o40755)
+                })
+            };
+            assert!(check_path_trust(p, stat).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn refuses_uid_zero_run_user() {
+        assert!(check_run_uid("git", 0).is_err());
+        assert!(check_run_uid("toor", 0).is_err());
+        assert!(check_run_uid("git", 1000).is_ok());
+    }
+
+    #[test]
+    fn ini_run_user_must_match_service_user() {
+        assert!(check_ini_run_user(None, "git").is_ok());
+        assert!(check_ini_run_user(Some("git"), "git").is_ok());
+        assert!(check_ini_run_user(Some("root"), "git").is_err());
+    }
+
+    #[test]
+    fn app_ini_writable_only_by_root_and_run_user() {
+        let p = Path::new("/etc/gitea/app.ini");
+        assert!(check_app_ini_trust(p, 0, 1000, 0o100640, 1000).is_ok());
+        assert!(check_app_ini_trust(p, 1000, 1000, 0o100600, 1000).is_ok());
+        assert!(check_app_ini_trust(p, 0, 0, 0o100660, 1000).is_ok());
+        assert!(check_app_ini_trust(p, 1001, 1000, 0o100600, 1000).is_err());
+        assert!(check_app_ini_trust(p, 0, 1000, 0o100660, 1000).is_err());
+        assert!(check_app_ini_trust(p, 0, 0, 0o100646, 1000).is_err());
     }
 
     #[test]
@@ -1012,6 +1259,19 @@ mod tests {
             plugin_toolkit::serde_json::from_str(r#"{"login":"b","type":"bot","is_admin":false}"#)
                 .unwrap();
         assert_eq!(parsed, user("bot", false));
+        assert!(
+            plugin_toolkit::serde_json::from_str::<GiteaUser>(r#"{"login":"b","type":"bot"}"#)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn owners_and_unmanaged_teams_are_refused() {
+        assert!(refuse_owners_team("Owners").is_err());
+        assert!(refuse_owners_team("owners").is_err());
+        assert!(refuse_owners_team("readers").is_ok());
+        assert!(check_unmanaged_team("o", "readers", false).is_err());
+        assert!(check_unmanaged_team("o", "readers", true).is_ok());
     }
 
     #[test]
@@ -1066,11 +1326,28 @@ mod tests {
     }
 
     #[test]
-    fn rotate_helpers() {
+    fn password_is_set_over_the_admin_api() {
         assert_eq!(
-            change_password_args("b", "pw").join(" "),
-            "admin user change-password --username b --password pw --must-change-password=false"
+            admin_user_url("https://g.test/api/v1/", "a/b"),
+            "https://g.test/api/v1/admin/users/a%2Fb"
         );
+        let body = password_body("b", "pw");
+        assert_eq!(body["password"], "pw");
+        assert_eq!(body["login_name"], "b");
+        assert_eq!(body["source_id"], 0);
+        assert_eq!(body["must_change_password"], false);
+        assert!(
+            admin_denied("x", 403)
+                .unwrap()
+                .to_string()
+                .contains("site admin")
+        );
+        assert!(admin_denied("x", 401).is_some());
+        assert!(admin_denied("x", 500).is_none());
+    }
+
+    #[test]
+    fn rotate_helpers() {
         assert_eq!(
             basic_auth("Aladdin", "open sesame"),
             "Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ=="
