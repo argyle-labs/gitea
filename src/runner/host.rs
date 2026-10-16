@@ -154,6 +154,10 @@ impl LocalHost {
     }
 
     pub fn lock_runner(&self, name: &str) -> Result<std::fs::File> {
+        self.lock_runner_within(name, LOCK_WAIT)
+    }
+
+    pub fn lock_runner_within(&self, name: &str, wait: Duration) -> Result<std::fs::File> {
         use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
         let dir = managed_root(self.init, &self.home).join(".orca");
         std::fs::DirBuilder::new()
@@ -171,16 +175,22 @@ impl LocalHost {
             .custom_flags(libc::O_NOFOLLOW)
             .open(&path)
             .with_context(|| format!("open {}", path.display()))?;
-        match file.try_lock() {
-            Ok(()) => Ok(file),
-            Err(std::fs::TryLockError::WouldBlock) => {
-                bail!(
-                    "another gitea.runner verb holds runner '{name}' ({})",
-                    path.display()
-                )
-            }
-            Err(std::fs::TryLockError::Error(e)) => {
-                Err(e).with_context(|| format!("lock {}", path.display()))
+        let deadline = std::time::Instant::now() + wait;
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Ok(file),
+                Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    bail!(
+                        "another gitea.runner verb holds runner '{name}' ({})",
+                        path.display()
+                    )
+                }
+                Err(std::fs::TryLockError::Error(e)) => {
+                    return Err(e).with_context(|| format!("lock {}", path.display()));
+                }
             }
         }
     }
@@ -505,6 +515,8 @@ fn group_list(user: &str, primary: u32) -> Result<Vec<u32>> {
         cap = (cap * 2).max(n);
     }
 }
+
+pub const LOCK_WAIT: Duration = Duration::from_secs(2);
 
 pub const ETC_PASSWD: &str = "/etc/passwd";
 pub const ETC_GROUP: &str = "/etc/group";
@@ -925,7 +937,10 @@ mod tests {
             uid: 501,
         };
         let held = host.lock_runner("r1").unwrap();
-        let err = host.lock_runner("r1").unwrap_err().to_string();
+        let err = host
+            .lock_runner_within("r1", Duration::ZERO)
+            .unwrap_err()
+            .to_string();
         assert!(
             err.contains("another gitea.runner verb holds runner 'r1'"),
             "{err}"

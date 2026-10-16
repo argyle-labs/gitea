@@ -238,6 +238,16 @@ pub fn check_instance_url(
     Ok(url.trim().trim_end_matches('/').to_string())
 }
 
+fn runner_locks(host: &LocalHost, names: &[&str], execute: bool) -> Result<Vec<std::fs::File>> {
+    if !execute {
+        return Ok(Vec::new());
+    }
+    let mut names = names.to_vec();
+    names.sort_unstable();
+    names.dedup();
+    names.into_iter().map(|n| host.lock_runner(n)).collect()
+}
+
 fn change_list(steps: &[Step]) -> String {
     steps
         .iter()
@@ -262,6 +272,7 @@ async fn plan_or_apply<A: Serialize>(
     summary: String,
     steps: Vec<Step>,
     rollback: Option<plan::Rollback>,
+    locks: Vec<std::fs::File>,
     exec: Executor<'_>,
     findings: Vec<Finding>,
     mut notes: Vec<String>,
@@ -294,7 +305,9 @@ async fn plan_or_apply<A: Serialize>(
     if let Some(why) = blocker {
         bail!("{tool}: refusing to execute: {why}");
     }
-    let _lock = exec.host.lock_runner(runner)?;
+    if locks.is_empty() {
+        bail!("{tool}: refusing to execute without holding the lock on runner '{runner}'");
+    }
     let (outcomes, err) = exec.run(&steps).await;
     if let Some(e) = err {
         let done: Vec<String> = outcomes
@@ -762,6 +775,7 @@ pub async fn gitea_runner_install(args: RunnerInstallArgs, ctx: &ToolCtx) -> Res
     layout::validate_name(&args.name)?;
     let options = container_options(args.container_options.as_deref())?;
     let host = LocalHost::current()?;
+    let locks = runner_locks(&host, &[&args.name], !args.dry_run)?;
     if let Some(existing) = host.find(&args.name) {
         if existing.managed && !existing.config.exists() && !existing.runner_file.exists() {
             bail!(
@@ -885,6 +899,7 @@ pub async fn gitea_runner_install(args: RunnerInstallArgs, ctx: &ToolCtx) -> Res
         summary,
         steps,
         None,
+        locks,
         exec,
         Vec::new(),
         notes,
@@ -933,6 +948,7 @@ pub async fn gitea_runner_uninstall(
     const TOOL: &str = "gitea.runner.uninstall";
     guard(TOOL, ctx)?;
     let host = LocalHost::current()?;
+    let locks = runner_locks(&host, &[&args.name], !args.dry_run)?;
     let l = host.find(&args.name).ok_or_else(|| {
         anyhow!(
             "no runner named '{}' is installed on this system",
@@ -986,6 +1002,7 @@ pub async fn gitea_runner_uninstall(
         format!("uninstall runner '{}'", args.name),
         steps,
         None,
+        locks,
         exec,
         Vec::new(),
         notes,
@@ -1056,6 +1073,7 @@ pub async fn gitea_runner_upgrade(args: RunnerUpgradeArgs, ctx: &ToolCtx) -> Res
     const TOOL: &str = "gitea.runner.upgrade";
     guard(TOOL, ctx)?;
     let host = LocalHost::current()?;
+    let locks = runner_locks(&host, &[&args.name], !args.dry_run)?;
     let l = host.find(&args.name).ok_or_else(|| {
         anyhow!(
             "no runner named '{}' is installed on this system",
@@ -1102,6 +1120,7 @@ pub async fn gitea_runner_upgrade(args: RunnerUpgradeArgs, ctx: &ToolCtx) -> Res
         summary,
         steps,
         None,
+        locks,
         exec,
         Vec::new(),
         Vec::new(),
@@ -1147,6 +1166,7 @@ pub async fn gitea_runner_heal(args: RunnerHealArgs, ctx: &ToolCtx) -> Result<Ru
     const TOOL: &str = "gitea.runner.heal";
     guard(TOOL, ctx)?;
     let host = LocalHost::current()?;
+    let locks = runner_locks(&host, &[&args.name], !args.dry_run)?;
     let l = host.find(&args.name).ok_or_else(|| {
         anyhow!(
             "no runner named '{}' is installed on this system",
@@ -1229,6 +1249,7 @@ pub async fn gitea_runner_heal(args: RunnerHealArgs, ctx: &ToolCtx) -> Result<Ru
         summary,
         steps,
         None,
+        locks,
         exec,
         findings,
         notes,
@@ -1287,6 +1308,7 @@ pub async fn gitea_runner_drain(args: RunnerDrainArgs, ctx: &ToolCtx) -> Result<
     const TOOL: &str = "gitea.runner.drain";
     guard(TOOL, ctx)?;
     let host = LocalHost::current()?;
+    let locks = runner_locks(&host, &[&args.name], !args.dry_run)?;
     let l = host.find(&args.name).ok_or_else(|| {
         anyhow!(
             "no runner named '{}' is installed on this system",
@@ -1330,6 +1352,7 @@ pub async fn gitea_runner_drain(args: RunnerDrainArgs, ctx: &ToolCtx) -> Result<
         ),
         steps,
         None,
+        locks,
         exec,
         Vec::new(),
         Vec::new(),
@@ -1527,6 +1550,9 @@ fn takeover_resume(
 
 async fn adopt_in_place(tool: &str, args: &RunnerAdoptArgs, ctx: &ToolCtx) -> Result<RunnerChange> {
     let host = LocalHost::current()?;
+    let target_name = args.as_name.clone().unwrap_or_else(|| args.name.clone());
+    layout::validate_name(&target_name)?;
+    let locks = runner_locks(&host, &[&args.name, &target_name], !args.dry_run)?;
     let installs = host.discover();
     let legacy = installs
         .iter()
@@ -1542,8 +1568,6 @@ async fn adopt_in_place(tool: &str, args: &RunnerAdoptArgs, ctx: &ToolCtx) -> Re
                 )
             }
         })?;
-    let target_name = args.as_name.clone().unwrap_or_else(|| args.name.clone());
-    layout::validate_name(&target_name)?;
     if host.init != Init::Launchd {
         layout::account_for(&target_name)?;
     }
@@ -1681,6 +1705,7 @@ async fn adopt_in_place(tool: &str, args: &RunnerAdoptArgs, ctx: &ToolCtx) -> Re
         summary,
         takeover.steps,
         Some(takeover.rollback),
+        locks,
         exec,
         Vec::new(),
         capacity.note.into_iter().collect(),
@@ -1695,6 +1720,7 @@ async fn adopt_moved(
     ctx: &ToolCtx,
 ) -> Result<RunnerChange> {
     let host = LocalHost::current()?;
+    let locks = runner_locks(&host, &[&args.name], !args.dry_run)?;
     let l = host.find(&args.name).ok_or_else(|| {
         anyhow!(
             "no runner named '{}' is installed on this system; install it first",
@@ -1793,6 +1819,7 @@ async fn adopt_moved(
         ),
         steps,
         None,
+        locks,
         exec,
         Vec::new(),
         notes,
@@ -2300,6 +2327,7 @@ mod tests {
             "upgrade".into(),
             steps,
             None,
+            vec![],
             exec,
             vec![],
             vec![],
@@ -2352,6 +2380,7 @@ mod tests {
                 tolerate_failure: false,
             }],
             None,
+            vec![],
             exec,
             vec![],
             vec![],
@@ -2384,6 +2413,7 @@ mod tests {
             "s".into(),
             steps.clone(),
             None,
+            vec![],
             mk(),
             vec![],
             vec![],
@@ -2402,6 +2432,7 @@ mod tests {
             "s".into(),
             steps,
             None,
+            vec![],
             mk(),
             vec![],
             vec![],
@@ -2442,6 +2473,7 @@ mod tests {
             "s".into(),
             steps,
             Some(rollback),
+            vec![host.lock_runner("r1").unwrap()],
             exec,
             vec![],
             vec![],
@@ -2574,5 +2606,46 @@ mod tests {
             prior_account_in_effect("gitea-runner-r1", Some(&rec(Some(990))), "", ""),
             (plan::AccountRecord::default(), None)
         );
+    }
+
+    #[tokio::test]
+    async fn verbs_lock_the_runner_before_deciding_and_execute_needs_the_lock() {
+        let home = std::env::temp_dir().join(format!("gitea-verb-lock-{}", std::process::id()));
+        let host = LocalHost {
+            init: Init::Launchd,
+            home: home.clone(),
+            uid: 501,
+        };
+        assert!(runner_locks(&host, &["r1"], false).unwrap().is_empty());
+        let held = runner_locks(&host, &["r1", "r1", "r2"], true).unwrap();
+        assert_eq!(held.len(), 2);
+        assert!(
+            host.lock_runner_within("r2", std::time::Duration::ZERO)
+                .is_err()
+        );
+        drop(held);
+        let exec = Executor {
+            host: &host,
+            gitea: None,
+        };
+        let err = plan_or_apply(
+            "t",
+            &upgrade_args(false),
+            true,
+            Some(&admin()),
+            "r1",
+            "s".into(),
+            vec![sh("true")],
+            None,
+            vec![],
+            exec,
+            vec![],
+            vec![],
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("without holding the lock"), "{err}");
+        std::fs::remove_dir_all(&home).unwrap();
     }
 }
