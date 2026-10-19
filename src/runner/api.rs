@@ -60,19 +60,21 @@ pub async fn list_runners(cfg: &Config) -> Result<Vec<GiteaRunnerView>> {
         .into_inner()
         .runners
         .into_iter()
-        .map(|r| {
-            let status = r.status.unwrap_or_default();
-            GiteaRunnerView {
-                id: r.id.unwrap_or_default(),
-                name: r.name.unwrap_or_default(),
-                online: GiteaRunnerView::is_online_status(&status),
-                status,
-                busy: r.busy.unwrap_or(false),
-                disabled: r.disabled.unwrap_or(false),
-                labels: r.labels.into_iter().filter_map(|l| l.name).collect(),
-            }
-        })
+        .map(runner_view)
         .collect())
+}
+
+pub(crate) fn runner_view(r: crate::generated::types::ActionRunner) -> GiteaRunnerView {
+    let status = r.status.unwrap_or_default();
+    GiteaRunnerView {
+        id: r.id.unwrap_or_default(),
+        name: r.name.unwrap_or_default(),
+        online: GiteaRunnerView::is_online_status(&status),
+        status,
+        busy: r.busy.unwrap_or(false),
+        disabled: r.disabled.unwrap_or(false),
+        labels: r.labels.into_iter().filter_map(|l| l.name).collect(),
+    }
 }
 
 /// One runner by id, `None` when Gitea has no such runner.

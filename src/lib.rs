@@ -14,6 +14,8 @@ pub mod bot;
 pub mod ci;
 pub mod deploy;
 pub mod dump;
+pub mod release_watch;
+pub mod releases;
 pub mod runner;
 pub mod signing;
 pub mod tools;
