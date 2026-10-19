@@ -540,6 +540,17 @@ pub async fn list_release_runs(
     status: Option<&str>,
     now: i64,
 ) -> Result<Vec<ReleaseRun>> {
+    let runs = release_runs(cfg, org, since, status, now).await?;
+    Ok(with_failures(cfg, runs).await)
+}
+
+pub async fn release_runs(
+    cfg: &Config,
+    org: &str,
+    since: i64,
+    status: Option<&str>,
+    now: i64,
+) -> Result<Vec<ReleaseRun>> {
     let raw: Vec<RawRun> = get_pages(
         cfg,
         &format!("/orgs/{}/actions/runs", encode(org)),
@@ -557,7 +568,7 @@ pub async fn list_release_runs(
         .filter_map(|r| release_run_view(r, now))
         .filter(|r| status_matches(r, status))
         .collect();
-    Ok(with_failures(cfg, runs).await)
+    Ok(runs)
 }
 
 pub async fn with_failures(cfg: &Config, runs: Vec<ReleaseRun>) -> Vec<ReleaseRun> {
