@@ -425,8 +425,9 @@ pub fn validate_scopes(scopes: &[String]) -> Result<()> {
     Ok(())
 }
 
-pub fn token_secret_name(endpoint: &str, username: &str, token_name: &str) -> String {
+pub fn token_secret_name(endpoint: &str, username: &str, token_name: &str) -> Result<String> {
     plugin_toolkit::secrets::scoped_name("gitea", endpoint, &format!("{username}.{token_name}"))
+        .map(|r| r.to_string())
 }
 
 fn minted_secret_name(secret: &str) -> String {
@@ -677,7 +678,8 @@ async fn revoke_token(cfg: &Config, username: &str, token_name: &str) -> Result<
 
 async fn secret_get(name: &str) -> Result<Option<String>> {
     let name = name.to_string();
-    tokio::task::spawn_blocking(move || plugin_toolkit::secrets::get(&name)).await?
+    let got = tokio::task::spawn_blocking(move || plugin_toolkit::secrets::get(&name)).await??;
+    Ok(got.map(|s| s.expose_secret().clone()))
 }
 
 async fn secret_set(name: &str, value: &str, desc: &str) -> Result<SecretRef> {
@@ -958,7 +960,7 @@ pub async fn gitea_token_create(args: TokenCreateArgs, ctx: &ToolCtx) -> Result<
     let cfg = crate::tools::resolve_config(&args.endpoint).await?;
     require_admin_token(&cfg).await?;
     require_bot_user(&cfg, &args.username).await?;
-    let secret = token_secret_name(&args.endpoint, &args.username, &args.token_name);
+    let secret = token_secret_name(&args.endpoint, &args.username, &args.token_name)?;
     let minted_secret = minted_secret_name(&secret);
     let existing = secret_get(&secret).await?.is_some();
     let previous = secret_get(&minted_secret).await?;
@@ -989,7 +991,10 @@ pub async fn gitea_token_create(args: TokenCreateArgs, ctx: &ToolCtx) -> Result<
         return Ok(TokenCreateOutput {
             dry_run: args.dry_run,
             plan,
-            secret: existing.then(|| SecretRef(secret.clone())),
+            secret: existing
+                .then(|| SecretRef::parse(secret.clone()))
+                .transpose()
+                .map_err(|e| anyhow!(e))?,
             created: false,
             gitea_token_name: previous,
             revoked: None,
@@ -1294,7 +1299,7 @@ mod tests {
 
     #[test]
     fn secret_name_is_namespaced() {
-        let s = token_secret_name("home", "pkg-bot", "ci");
+        let s = token_secret_name("home", "pkg-bot", "ci").unwrap();
         assert_eq!(s, "gitea.home.pkg-bot.ci");
         assert_eq!(minted_secret_name(&s), "gitea.home.pkg-bot.ci.minted");
     }

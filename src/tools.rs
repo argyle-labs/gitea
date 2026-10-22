@@ -35,13 +35,9 @@ pub struct GiteaEndpoint {
 
 // ── secret resolution ──────────────────────────────────────────────────────
 
-fn resolve_token(name: &str, row: &GiteaEndpoint) -> Result<String> {
-    plugin_toolkit::secrets::resolve_scoped(
-        "gitea",
-        name,
-        "token",
-        (!row.token.is_empty()).then_some(row.token.as_str()),
-    )
+fn resolve_token(name: &str) -> Result<String> {
+    plugin_toolkit::secrets::resolve_scoped("gitea", name, "token")
+        .map(|s| s.expose_secret().clone())
 }
 
 // ── client resolution ──────────────────────────────────────────────────────
