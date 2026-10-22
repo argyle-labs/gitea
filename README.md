@@ -257,6 +257,45 @@ are listed in `unreached`; re-run to finish.
 gitea.actions.artifacts.prune --endpoint home --keep-days 1
 ```
 
+### Storage pressure — `gitea.storage.*`, `gitea.actions.artifacts.delete`, `gitea.admin.cron.exec`
+
+Gitea has no disk-threshold cleanup; these verbs own it. All are role `admin`,
+dry runs included.
+
+- `gitea.storage.detail` — Actions artifact count and bytes per repo
+  (`--org` narrows), disk usage of the host running Gitea, watermark pressure
+  and an `ARTIFACT_RETENTION_DAYS` check against the observed 24h upload rate.
+- `gitea.actions.artifacts.delete` — delete artifacts older than
+  `--older-than-hours` (default 24), optionally by `--name` pattern (`*`
+  wildcard) and `--org`, then run `cleanup_actions`.
+- `gitea.admin.cron.exec --task cleanup_actions|delete_old_actions|archive_cleanup|cleanup_packages`
+  — start a Gitea admin cron task. The token needs the `write:admin` scope; a
+  401/403 says so.
+- `gitea.storage.remediate` — at or above the high watermark, delete the oldest
+  artifacts (never ones under an hour old) until usage would fall under the low
+  watermark, then run `cleanup_actions`. Below it, a no-op.
+
+Disk usage comes from orca's `system.health` for the endpoint's `host_system`
+(the orca system id of the host running Gitea); without it, artifact bytes are
+judged against 50 GiB warn / 100 GiB critical. Per endpoint:
+
+```sh
+gitea.update --name home --host-system <system-id> \
+  --disk-high-pct 80 --disk-low-pct 70 --disk-crit-pct 95 \
+  --artifact-retention-days 7
+```
+
+The plugin's `diagnostics` provider reports `storage-pressure:<endpoint>`
+(warn at high, critical at crit; critical reaches the user as a notification)
+with a `storage-remediate::<endpoint>` repair, and `artifact-retention:<endpoint>`
+when the retention window outgrows the artifact budget. To clean up
+automatically, schedule the remediation:
+
+```sh
+orca config upsert schedule gitea-storage \
+  '{"job": "gitea.storage.remediate", "cron": "*/15 * * * *", "args": {"endpoint": "home"}}'
+```
+
 ---
 
 ## Layout
@@ -275,6 +314,8 @@ gitea.actions.artifacts.prune --endpoint home --keep-days 1
     causes and open PRs with their CI state.
   - `artifacts.rs` — `gitea.actions.artifacts.prune`: Actions artifact
     retention through the API.
+  - `storage.rs` — storage pressure, watermark cleanup, admin cron tasks and
+    the `diagnostics` provider.
   - `lib.rs`, `main.rs` — plugin wiring and the `serve_tool_plugin!` entrypoint.
 - `specs/` — the vendored Gitea API spec (`gitea.swagger2.json` and the
   converted `gitea.openapi.json` the REST surface is generated from).

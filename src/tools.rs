@@ -31,6 +31,11 @@ pub struct GiteaEndpoint {
     pub token: String,
     pub insecure: bool,
     pub enabled: bool,
+    pub host_system: Option<String>,
+    pub disk_high_pct: Option<u32>,
+    pub disk_low_pct: Option<u32>,
+    pub disk_crit_pct: Option<u32>,
+    pub artifact_retention_days: Option<u32>,
 }
 
 // ── secret resolution ──────────────────────────────────────────────────────
@@ -47,7 +52,7 @@ fn resolve_token(name: &str) -> Result<String> {
 /// promoted to the Gitea API root (`.../api/v1`), plus the secure-first token.
 pub(crate) async fn resolve_config(name: &str) -> Result<Config> {
     let row = endpoint_db::require(name)?;
-    let token = resolve_token(name, &row)?;
+    let token = resolve_token(name)?;
     let reachable = route::resolve_reachable(name, &row.routes, row.insecure).await?;
     let base_url = api_root(&reachable);
     Ok(Config::new(base_url, token).insecure(row.insecure))
