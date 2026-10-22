@@ -50,8 +50,8 @@ const KEY_SECS: u64 = 30;
 const UPDATE_STYLE_SECS: u64 = 25;
 const RUN_KEY_FIRST: &str = "run `gitea.signing.key` first";
 
-fn secret_name(endpoint: &str) -> String {
-    plugin_toolkit::secrets::scoped_name("gitea", endpoint, "signing_key")
+fn secret_name(endpoint: &str) -> Result<String> {
+    plugin_toolkit::secrets::scoped_name("gitea", endpoint, "signing_key").map(|r| r.to_string())
 }
 
 /// A verb that needs admin to execute needs it to dry-run too: the plan
@@ -379,7 +379,7 @@ async fn blocking<T: Send + 'static>(
 async fn secret_get(limit: Duration, secret: &str) -> Result<Option<String>> {
     let name = secret.to_string();
     blocking(limit, "read orca secret", move || {
-        plugin_toolkit::secrets::get(&name)
+        Ok(plugin_toolkit::secrets::get(&name)?.map(|s| s.expose_secret().clone()))
     })
     .await
 }
@@ -884,7 +884,7 @@ pub async fn gitea_signing(args: SigningArgs, ctx: &ToolCtx) -> Result<SigningOu
     .await
     .map_err(|e| setup_expired(e, setup, "resolving the endpoint"))?;
     let key_path = PathBuf::from(&args.key_path);
-    let public_key = existing_key(&host, &key_path, &secret_name(&args.endpoint), setup)
+    let public_key = existing_key(&host, &key_path, &secret_name(&args.endpoint)?, setup)
         .await
         .map_err(|e| setup_expired(e, setup, "checking the key against the orca secret"))?;
     let instance = instance_url(&cfg);
@@ -1189,7 +1189,7 @@ pub async fn gitea_signing_key(args: SigningKeyArgs, ctx: &ToolCtx) -> Result<Si
         crate::tools::endpoint_db::require(&endpoint).map(|_| ())
     })
     .await?;
-    let secret = secret_name(&args.endpoint);
+    let secret = secret_name(&args.endpoint)?;
     let key_path = PathBuf::from(&args.key_path);
     let ini = read_ini(&args.app_ini)?;
     let owner = run_user(&ini);

@@ -18,7 +18,8 @@ use crate::signing::left;
 
 /// Total budget of one call, under orca's 35s plugin-call timeout.
 const PRUNE_SECS: u64 = 25;
-const CLEANUP_TASK: &str = "cleanup_actions";
+pub(crate) const CLEANUP_TASK: &str = "cleanup_actions";
+pub(crate) const HOUR_SECS: i64 = 3_600;
 const DAY_SECS: i64 = 86_400;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -29,19 +30,43 @@ pub struct StaleArtifact {
     pub name: Option<String>,
     pub bytes: i64,
     pub age_days: i64,
+    pub age_hours: i64,
+}
+
+/// `*` matches any run of characters; everything else matches literally.
+pub fn glob_match(pattern: &str, name: &str) -> bool {
+    let parts: Vec<&str> = pattern.split('*').collect();
+    if parts.len() == 1 {
+        return pattern == name;
+    }
+    let (first, last) = (parts[0], parts[parts.len() - 1]);
+    if name.len() < first.len() + last.len() || !name.starts_with(first) || !name.ends_with(last) {
+        return false;
+    }
+    let mut rest = &name[first.len()..name.len() - last.len()];
+    for mid in &parts[1..parts.len() - 1] {
+        match rest.find(mid) {
+            Some(i) => rest = &rest[i + mid.len()..],
+            None => return false,
+        }
+    }
+    true
 }
 
 /// Artifacts created before `cutoff` (unix seconds) that Gitea has not already
-/// expired. Artifacts with no creation time are kept: their age is unknown.
+/// expired and whose name matches `pattern`. Artifacts with no creation time
+/// are kept: their age is unknown.
 pub fn stale_artifacts(
     repo: &str,
     artifacts: &[ActionArtifact],
     now: i64,
     cutoff: i64,
+    pattern: Option<&str>,
 ) -> Vec<StaleArtifact> {
     artifacts
         .iter()
         .filter(|a| a.expired != Some(true))
+        .filter(|a| pattern.is_none_or(|p| glob_match(p, a.name.as_deref().unwrap_or_default())))
         .filter_map(|a| {
             let created = a.created_at.as_ref()?.unix_seconds();
             let id = a.id?;
@@ -51,6 +76,7 @@ pub fn stale_artifacts(
                 name: a.name.clone(),
                 bytes: a.size_in_bytes.unwrap_or_default(),
                 age_days: (now - created) / DAY_SECS,
+                age_hours: (now - created) / HOUR_SECS,
             })
         })
         .collect()
@@ -104,7 +130,7 @@ pub struct ArtifactPruneOutput {
 
 /// `owner/name` of every repo, paging via `fetch`. The flag is false when the
 /// deadline cut paging off and the list is partial.
-async fn all_repos<F, Fut>(fetch: F, deadline: Instant) -> Result<(Vec<String>, bool)>
+pub(crate) async fn all_repos<F, Fut>(fetch: F, deadline: Instant) -> Result<(Vec<String>, bool)>
 where
     F: Fn(usize) -> Fut,
     Fut: std::future::Future<Output = Result<Vec<String>>>,
@@ -127,7 +153,7 @@ where
 }
 
 /// One page of repo names. An admin token's search sees every repo.
-async fn repo_page(
+pub(crate) async fn repo_page(
     client: &plugin_toolkit::reqwest::Client,
     cfg: &Config,
     page: usize,
@@ -159,17 +185,20 @@ async fn repo_page(
     Ok(page.data.into_iter().map(|r| r.full_name).collect())
 }
 
-struct Listing {
-    stale: Vec<StaleArtifact>,
-    unlisted: Vec<String>,
-    unreached: Vec<String>,
+pub(crate) struct Listing {
+    pub stale: Vec<StaleArtifact>,
+    pub unlisted: Vec<String>,
+    pub unreached: Vec<String>,
 }
 
 const ARTIFACT_PAGE: usize = 50;
 
 /// Every artifact of a repo, paging until `total_count` is reached. `fetch`
 /// returns one page and the total. `Ok(None)` when the deadline cut paging off.
-async fn all_artifacts<F, Fut>(fetch: F, deadline: Instant) -> Result<Option<Vec<ActionArtifact>>>
+pub(crate) async fn all_artifacts<F, Fut>(
+    fetch: F,
+    deadline: Instant,
+) -> Result<Option<Vec<ActionArtifact>>>
 where
     F: Fn(usize) -> Fut,
     Fut: std::future::Future<Output = Result<(i64, Vec<ActionArtifact>)>>,
@@ -194,7 +223,7 @@ where
 
 /// One page of a repo's artifacts, read raw: the generated client exposes no
 /// paging parameters.
-async fn artifact_page(
+pub(crate) async fn artifact_page(
     client: &plugin_toolkit::reqwest::Client,
     cfg: &Config,
     full: &str,
@@ -224,15 +253,15 @@ async fn artifact_page(
     Ok((page.total_count, page.artifacts))
 }
 
-async fn list_stale(
+pub(crate) async fn list_stale(
     cfg: &Config,
     repos: &[String],
-    keep_days: u32,
+    cutoff: i64,
+    pattern: Option<&str>,
     deadline: Instant,
 ) -> Result<Listing> {
     let client = verified_client(cfg)?;
     let now = Timestamp::now().unix_seconds();
-    let cutoff = now - i64::from(keep_days) * DAY_SECS;
     let mut listing = Listing {
         stale: Vec::new(),
         unlisted: Vec::new(),
@@ -250,7 +279,7 @@ async fn list_stale(
         match all_artifacts(|page| artifact_page(&client, cfg, full, page), deadline).await {
             Ok(Some(all)) => listing
                 .stale
-                .extend(stale_artifacts(full, &all, now, cutoff)),
+                .extend(stale_artifacts(full, &all, now, cutoff, pattern)),
             Ok(None) => {
                 listing.unreached.extend_from_slice(&repos[i..]);
                 break;
@@ -259,6 +288,106 @@ async fn list_stale(
         }
     }
     Ok(listing)
+}
+
+pub(crate) fn delete_changes(stale: &[StaleArtifact]) -> Vec<PlannedChange> {
+    stale
+        .iter()
+        .map(|a| {
+            PlannedChange::new(format!("{}#{}", a.repo, a.id), "delete-artifact").with_detail(
+                format!(
+                    "{} ({} bytes, {} hours old)",
+                    a.name.as_deref().unwrap_or("?"),
+                    a.bytes,
+                    a.age_hours
+                ),
+            )
+        })
+        .collect()
+}
+
+pub(crate) struct Deletion {
+    pub deleted: Vec<StaleArtifact>,
+    pub failed: Vec<String>,
+    /// Repos whose artifacts were not reached before the deadline.
+    pub unreached: Vec<String>,
+}
+
+pub(crate) async fn delete_artifacts(
+    cfg: &Config,
+    stale: &[StaleArtifact],
+    deadline: Instant,
+) -> Result<Deletion> {
+    let client = verified_generated_client(cfg)?;
+    let mut out = Deletion {
+        deleted: vec![],
+        failed: vec![],
+        unreached: vec![],
+    };
+    for (i, a) in stale.iter().enumerate() {
+        if left(deadline).is_zero() {
+            let mut rest: Vec<String> = stale[i..].iter().map(|a| a.repo.clone()).collect();
+            rest.dedup();
+            out.unreached = rest;
+            break;
+        }
+        let (owner, repo) = a.repo.split_once('/').unwrap_or((&a.repo, ""));
+        match timeout(
+            left(deadline),
+            client.delete_artifact(owner, repo, &a.id.to_string()),
+        )
+        .await
+        {
+            None => out.failed.push(format!(
+                "{}#{} (no answer within the time budget)",
+                a.repo, a.id
+            )),
+            Some(Ok(_)) => out.deleted.push(a.clone()),
+            Some(Err(e)) => out.failed.push(match e.status() {
+                Some(s) => format!("{}#{} (HTTP {})", a.repo, a.id, s.as_u16()),
+                None => format!("{}#{} ({e})", a.repo, a.id),
+            }),
+        }
+    }
+    Ok(out)
+}
+
+/// Why a cron call failed, naming the missing `write:admin` scope on 401/403.
+pub fn cron_error(task: &str, status: Option<u16>, detail: &str) -> String {
+    match status {
+        Some(401 | 403) => format!(
+            "{task}: HTTP {} — the endpoint token lacks the write:admin scope POST /admin/cron/{task} requires; reissue it with write:admin",
+            status.unwrap_or_default()
+        ),
+        Some(s) => format!("{task}: HTTP {s}"),
+        None => format!("{task}: {detail}"),
+    }
+}
+
+/// Start a Gitea admin cron task. `(started, error)`.
+pub(crate) async fn run_cron(
+    cfg: &Config,
+    task: &str,
+    deadline: Instant,
+) -> Result<(bool, Option<String>)> {
+    let client = verified_generated_client(cfg)?;
+    Ok(
+        match timeout(left(deadline), client.admin_cron_run(task)).await {
+            None => (
+                false,
+                Some(format!("{task}: no answer within the time budget")),
+            ),
+            Some(Ok(_)) => (true, None),
+            Some(Err(e)) => (
+                false,
+                Some(cron_error(
+                    task,
+                    e.status().map(|s| s.as_u16()),
+                    &e.to_string(),
+                )),
+            ),
+        },
+    )
 }
 
 /// Delete Actions artifacts older than `keep_days` on every repo, then start
@@ -285,7 +414,14 @@ pub async fn gitea_actions_artifacts_prune(
         stale,
         unlisted,
         mut unreached,
-    } = list_stale(&cfg, &repos, args.keep_days, deadline).await?;
+    } = list_stale(
+        &cfg,
+        &repos,
+        Timestamp::now().unix_seconds() - i64::from(args.keep_days) * DAY_SECS,
+        None,
+        deadline,
+    )
+    .await?;
     if !complete {
         unreached.push(format!(
             "repos after the first {} (listing ran out of time)",
@@ -293,19 +429,7 @@ pub async fn gitea_actions_artifacts_prune(
         ));
     }
     let bytes = stale.iter().map(|a| a.bytes).sum();
-    let changes = stale
-        .iter()
-        .map(|a| {
-            PlannedChange::new(format!("{}#{}", a.repo, a.id), "delete-artifact").with_detail(
-                format!(
-                    "{} ({} bytes, {} days old)",
-                    a.name.as_deref().unwrap_or("?"),
-                    a.bytes,
-                    a.age_days
-                ),
-            )
-        })
-        .collect();
+    let changes = delete_changes(&stale);
     let plan = ExecutionPlan::generic(TOOL, plugin_toolkit::serde_json::to_value(&args)?.into())
         .detailed(
             format!(
@@ -330,43 +454,14 @@ pub async fn gitea_actions_artifacts_prune(
         out.unreached = unreached;
         return Ok(out);
     }
-    let client = verified_generated_client(&cfg)?;
-    for (i, a) in stale.iter().enumerate() {
-        if left(deadline).is_zero() {
-            let mut rest: Vec<String> = stale[i..].iter().map(|a| a.repo.clone()).collect();
-            rest.dedup();
-            unreached.splice(0..0, rest);
-            break;
-        }
-        let (owner, repo) = a.repo.split_once('/').unwrap_or((&a.repo, ""));
-        match timeout(
-            left(deadline),
-            client.delete_artifact(owner, repo, &a.id.to_string()),
-        )
-        .await
-        {
-            None => out.failed.push(format!(
-                "{}#{} (no answer within the time budget)",
-                a.repo, a.id
-            )),
-            Some(Ok(_)) => out.deleted.push(a.clone()),
-            Some(Err(e)) => out.failed.push(match e.status() {
-                Some(s) => format!("{}#{} (HTTP {})", a.repo, a.id, s.as_u16()),
-                None => format!("{}#{} ({e})", a.repo, a.id),
-            }),
-        }
-    }
+    let done = delete_artifacts(&cfg, &stale, deadline).await?;
+    out.deleted = done.deleted;
+    out.failed = done.failed;
+    unreached.splice(0..0, done.unreached);
     out.unreached = unreached;
-    let cleanup = timeout(left(deadline), client.admin_cron_run(CLEANUP_TASK)).await;
-    out.cleanup_started = Some(matches!(cleanup, Some(Ok(_))));
-    out.cleanup_error = match cleanup {
-        None => Some(format!("{CLEANUP_TASK}: no answer within the time budget")),
-        Some(Ok(_)) => None,
-        Some(Err(e)) => Some(match e.status() {
-            Some(s) => format!("{CLEANUP_TASK}: HTTP {}", s.as_u16()),
-            None => format!("{CLEANUP_TASK}: {e}"),
-        }),
-    };
+    let (started, error) = run_cron(&cfg, CLEANUP_TASK, deadline).await?;
+    out.cleanup_started = Some(started);
+    out.cleanup_error = error;
     Ok(out)
 }
 
@@ -398,7 +493,7 @@ mod tests {
             artifact(3, Some("2026-10-01T00:00:00Z"), Some(true)),
             artifact(4, None, None),
         ];
-        let got = stale_artifacts("o/r", &all, now, cutoff);
+        let got = stale_artifacts("o/r", &all, now, cutoff, None);
         assert_eq!(
             got,
             vec![StaleArtifact {
@@ -407,7 +502,56 @@ mod tests {
                 name: Some("a1".into()),
                 bytes: 100,
                 age_days: 3,
+                age_hours: 72,
             }]
+        );
+    }
+
+    #[test]
+    fn glob_matches_star_runs() {
+        assert!(glob_match("ci-*", "ci-build-123"));
+        assert!(glob_match("*-handoff", "build-handoff"));
+        assert!(glob_match("ci-*-x86_64", "ci-build-x86_64"));
+        assert!(glob_match("*", ""));
+        assert!(glob_match("exact", "exact"));
+        assert!(!glob_match("exact", "exact2"));
+        assert!(!glob_match("ci-*", "cd-build"));
+        assert!(!glob_match("a*a", "a"));
+        assert!(!glob_match("a*b*c", "acb"));
+    }
+
+    #[test]
+    fn name_pattern_narrows_the_selection() {
+        let now = Timestamp::parse_rfc3339("2026-10-13T00:00:00Z")
+            .unwrap()
+            .unix_seconds();
+        let all = [
+            artifact(1, Some("2026-10-10T00:00:00Z"), None),
+            artifact(12, Some("2026-10-10T00:00:00Z"), None),
+        ];
+        let ids: Vec<i64> = stale_artifacts("o/r", &all, now, now, Some("a1*"))
+            .iter()
+            .map(|a| a.id)
+            .collect();
+        assert_eq!(ids, vec![1, 12]);
+        let ids: Vec<i64> = stale_artifacts("o/r", &all, now, now, Some("a12"))
+            .iter()
+            .map(|a| a.id)
+            .collect();
+        assert_eq!(ids, vec![12]);
+    }
+
+    #[test]
+    fn cron_403_names_the_missing_scope() {
+        let e = cron_error("cleanup_actions", Some(403), "");
+        assert!(e.contains("write:admin") && e.contains("HTTP 403"), "{e}");
+        assert_eq!(
+            cron_error("cleanup_actions", Some(500), ""),
+            "cleanup_actions: HTTP 500"
+        );
+        assert_eq!(
+            cron_error("cleanup_actions", None, "refused"),
+            "cleanup_actions: refused"
         );
     }
 
