@@ -10,7 +10,7 @@ use crate::releases::{
     DEFAULT_ORG, FailureStage, ReleaseRun, ReleaseView, list_releases, release_runs, with_failures,
 };
 
-pub const SOURCE: &str = "gitea-releases";
+pub const SOURCE: &str = "gitea";
 const PREFIX: &str = "gitea.__notification_source";
 const RUN_WINDOW_SECS: i64 = 48 * 3600;
 pub const STALE_DRAFT_SECS: i64 = 24 * 3600;
@@ -274,5 +274,10 @@ mod tests {
         let def = backend_def();
         assert_eq!(def.domain, "notification_source");
         assert_eq!(def.invoke_prefix, PREFIX);
+    }
+
+    #[test]
+    fn backend_name_is_the_plugin_name() {
+        assert_eq!(backend_def().name, env!("CARGO_PKG_NAME"));
     }
 }
