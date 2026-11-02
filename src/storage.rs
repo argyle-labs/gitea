@@ -232,7 +232,18 @@ pub fn parse_disk(health: &Value) -> std::result::Result<DiskUsage, String> {
     }
 }
 
-async fn host_disk(system: Option<&str>) -> (Option<DiskUsage>, Option<String>) {
+pub const DISK_UNAVAILABLE_IN_BACKGROUND: &str = "unavailable from background diagnostics";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Invoke {
+    User,
+    Background,
+}
+
+async fn host_disk(system: Option<&str>, invoke: Invoke) -> (Option<DiskUsage>, Option<String>) {
+    if invoke == Invoke::Background {
+        return (None, Some(DISK_UNAVAILABLE_IN_BACKGROUND.to_string()));
+    }
     let Some(id) = system.map(str::to_string) else {
         return (
             None,
@@ -298,7 +309,12 @@ struct Scan {
     artifacts: Vec<StaleArtifact>,
 }
 
-async fn scan(endpoint: &str, org: Option<&str>, deadline: Instant) -> Result<Scan> {
+async fn scan(
+    endpoint: &str,
+    org: Option<&str>,
+    deadline: Instant,
+    invoke: Invoke,
+) -> Result<Scan> {
     let row = crate::tools::endpoint_db::require(endpoint)?;
     let watermarks = Watermarks::from_endpoint(&row)?;
     let cfg = crate::tools::resolve_config(endpoint).await?;
@@ -309,7 +325,7 @@ async fn scan(endpoint: &str, org: Option<&str>, deadline: Instant) -> Result<Sc
         unreached: rest,
     } = list_stale(&cfg, &repos, i64::MAX, None, deadline).await?;
     unreached.splice(0..0, rest);
-    let (disk, disk_error) = host_disk(row.host_system.as_deref()).await;
+    let (disk, disk_error) = host_disk(row.host_system.as_deref(), invoke).await;
     let artifact_bytes: i64 = artifacts.iter().map(|a| a.bytes).sum();
     let uploaded_24h = artifacts
         .iter()
@@ -359,12 +375,22 @@ pub struct StorageDetailArgs {
 
 /// Actions artifact count and bytes per repo, disk usage of the host running
 /// Gitea, watermark pressure and the artifact retention check.
-#[orca_tool(domain = "gitea", verb = "storage.detail", role = "admin")]
+#[orca_tool(
+    domain = "gitea",
+    verb = "storage.detail",
+    role = "admin",
+    tool_calls = ["system.health"]
+)]
 pub async fn gitea_storage_detail(args: StorageDetailArgs, ctx: &ToolCtx) -> Result<StorageReport> {
     authorize_execute("gitea.storage.detail", ctx.caller().as_ref())?;
-    Ok(scan(&args.endpoint, args.org.as_deref(), deadline())
-        .await?
-        .report)
+    Ok(scan(
+        &args.endpoint,
+        args.org.as_deref(),
+        deadline(),
+        Invoke::User,
+    )
+    .await?
+    .report)
 }
 
 #[derive(clap::Args, Serialize, Deserialize, JsonSchema)]
@@ -585,14 +611,18 @@ pub struct StorageRemediateOutput {
     pub cleanup: ArtifactPruneOutput,
 }
 
-async fn remediate(endpoint: &str, dry_run: bool) -> Result<StorageRemediateOutput> {
+async fn remediate(
+    endpoint: &str,
+    dry_run: bool,
+    invoke: Invoke,
+) -> Result<StorageRemediateOutput> {
     const TOOL: &str = "gitea.storage.remediate";
     let deadline = deadline();
     let Scan {
         cfg,
         report,
         artifacts,
-    } = scan(endpoint, None, deadline).await?;
+    } = scan(endpoint, None, deadline, invoke).await?;
     let need = bytes_to_free(
         report.disk.as_ref(),
         report.artifact_bytes,
@@ -662,14 +692,15 @@ async fn remediate(endpoint: &str, dry_run: bool) -> Result<StorageRemediateOutp
     verb = "storage.remediate",
     data_mutation = true,
     role = "admin",
-    execute_gated = false
+    execute_gated = false,
+    tool_calls = ["system.health"]
 )]
 pub async fn gitea_storage_remediate(
     args: StorageRemediateArgs,
     ctx: &ToolCtx,
 ) -> Result<StorageRemediateOutput> {
     authorize_execute("gitea.storage.remediate", ctx.caller().as_ref())?;
-    remediate(&args.endpoint, args.dry_run).await
+    remediate(&args.endpoint, args.dry_run, Invoke::User).await
 }
 
 fn gb(bytes: i64) -> String {
@@ -759,7 +790,7 @@ async fn diagnose() -> Vec<Finding> {
     };
     let mut out = Vec::new();
     for ep in endpoints.into_iter().filter(|e| e.enabled) {
-        match scan(&ep.name, None, deadline()).await {
+        match scan(&ep.name, None, deadline(), Invoke::Background).await {
             Ok(s) => {
                 out.push(pressure_finding(&s.report));
                 out.push(retention_finding(&s.report));
@@ -791,7 +822,7 @@ async fn repair(args: RepairArgs) -> RepairOutcome {
     else {
         return fail(format!("unknown gitea repair '{}'", args.repair_id));
     };
-    match remediate(endpoint, false).await {
+    match remediate(endpoint, false, Invoke::Background).await {
         Ok(o) => RepairOutcome {
             id: args.repair_id.clone(),
             provider: PROVIDER.to_string(),
@@ -829,6 +860,13 @@ impl DiagnosticsProvider for GiteaDiagnostics {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_disk_callers_declare_the_system_health_tool_call() {
+        use plugin_toolkit::contract::OrcaToolDef;
+        assert_eq!(GiteaStorageDetail::TOOL_CALLS, ["system.health"]);
+        assert_eq!(GiteaStorageRemediate::TOOL_CALLS, ["system.health"]);
+    }
 
     fn disk(used_pct: u8, total_gb: u64, avail_gb: u64) -> DiskUsage {
         DiskUsage {
@@ -982,16 +1020,23 @@ mod tests {
 
     #[tokio::test]
     async fn disk_is_unknown_without_a_host_system() {
-        let (d, e) = host_disk(None).await;
+        let (d, e) = host_disk(None, Invoke::User).await;
         assert!(d.is_none());
         assert!(e.unwrap().contains("host_system"));
     }
 
     #[tokio::test]
     async fn disk_probe_outside_orca_reports_why() {
-        let (d, e) = host_disk(Some("sys")).await;
+        let (d, e) = host_disk(Some("sys"), Invoke::User).await;
         assert!(d.is_none());
         assert!(e.unwrap().contains("system.health"));
+    }
+
+    #[tokio::test]
+    async fn background_diagnostics_skip_the_tool_call_and_say_so() {
+        let (d, e) = host_disk(Some("sys"), Invoke::Background).await;
+        assert!(d.is_none());
+        assert_eq!(e.as_deref(), Some(DISK_UNAVAILABLE_IN_BACKGROUND));
     }
 
     fn report(pressure: Pressure, flagged: bool) -> StorageReport {
