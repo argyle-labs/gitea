@@ -23,6 +23,5 @@ fn main() -> plugin_toolkit::anyhow::Result<()> {
             Box::new(gitea::release_watch::dispatcher),
         )
         .diagnostics(gitea::storage::GiteaDiagnostics)
-        .tool_calls(&["system.health"])
         .serve()
 }
