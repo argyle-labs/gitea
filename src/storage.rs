@@ -359,7 +359,12 @@ pub struct StorageDetailArgs {
 
 /// Actions artifact count and bytes per repo, disk usage of the host running
 /// Gitea, watermark pressure and the artifact retention check.
-#[orca_tool(domain = "gitea", verb = "storage.detail", role = "admin")]
+#[orca_tool(
+    domain = "gitea",
+    verb = "storage.detail",
+    role = "admin",
+    tool_calls = ["system.health"]
+)]
 pub async fn gitea_storage_detail(args: StorageDetailArgs, ctx: &ToolCtx) -> Result<StorageReport> {
     authorize_execute("gitea.storage.detail", ctx.caller().as_ref())?;
     Ok(scan(&args.endpoint, args.org.as_deref(), deadline())
@@ -662,7 +667,8 @@ async fn remediate(endpoint: &str, dry_run: bool) -> Result<StorageRemediateOutp
     verb = "storage.remediate",
     data_mutation = true,
     role = "admin",
-    execute_gated = false
+    execute_gated = false,
+    tool_calls = ["system.health"]
 )]
 pub async fn gitea_storage_remediate(
     args: StorageRemediateArgs,
@@ -829,6 +835,13 @@ impl DiagnosticsProvider for GiteaDiagnostics {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_disk_callers_declare_the_system_health_tool_call() {
+        use plugin_toolkit::contract::OrcaToolDef;
+        assert_eq!(GiteaStorageDetail::TOOL_CALLS, ["system.health"]);
+        assert_eq!(GiteaStorageRemediate::TOOL_CALLS, ["system.health"]);
+    }
 
     fn disk(used_pct: u8, total_gb: u64, avail_gb: u64) -> DiskUsage {
         DiskUsage {
